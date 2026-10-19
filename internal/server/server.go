@@ -682,7 +682,8 @@ func (s *Server) serveReady(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, profile := range s.config.Profiles {
-		connection, err := net.DialTimeout("tcp", profile.Backend, s.config.Timeouts.BackendDial.Value())
+		network, address := profile.BackendNetworkAndAddress()
+		connection, err := net.DialTimeout(network, address, s.config.Timeouts.BackendDial.Value())
 		if err != nil {
 			http.Error(w, "backend unavailable", http.StatusServiceUnavailable)
 			return

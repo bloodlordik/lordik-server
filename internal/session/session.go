@@ -9,9 +9,9 @@ import (
 	"io"
 	"math"
 	"net"
+	"strings"
 	"sync"
 	"time"
-
 	"github.com/telegramdesktop/tproxy-server/internal/config"
 	"github.com/telegramdesktop/tproxy-server/internal/frame"
 )
@@ -1499,8 +1499,23 @@ func (s *backendStream) run() {
 	defer close(s.finished)
 	defer s.session.backendClosed(s.id, s)
 
+	network := "tcp"
+	target := s.address
+	if s.session.profile != nil {
+		network, target = s.session.profile.BackendNetworkAndAddress()
+	} else if strings.HasPrefix(s.address, "unix://") {
+		network = "unix"
+		target = strings.TrimPrefix(s.address, "unix://")
+	} else if strings.HasPrefix(s.address, "unix:") {
+		network = "unix"
+		target = strings.TrimPrefix(s.address, "unix:")
+	} else if strings.HasPrefix(s.address, "/") {
+		network = "unix"
+		target = s.address
+	}
+
 	dialer := net.Dialer{Timeout: s.session.timeouts.BackendDial.Value()}
-	connection, err := dialer.DialContext(s.ctx, "tcp", s.address)
+	connection, err := dialer.DialContext(s.ctx, network, target)
 	s.session.backendDialFinished(err != nil && s.ctx.Err() == nil)
 	if err != nil {
 		return
@@ -1514,6 +1529,17 @@ func (s *backendStream) run() {
 	s.conn = connection
 	s.connMu.Unlock()
 
+	if s.session.profile != nil && s.session.profile.BackendProxyProtocol != config.BackendProxyNone {
+		header := buildProxyHeader(s.session.profile.BackendProxyProtocol, s.session.clientIP, s.address)
+		if len(header) > 0 {
+			_ = connection.SetWriteDeadline(time.Now().Add(s.session.timeouts.BackendDial.Value()))
+			if _, err := connection.Write(header); err != nil {
+				s.close()
+				return
+			}
+			_ = connection.SetWriteDeadline(time.Time{})
+		}
+	}
 	writeDone := make(chan struct{})
 	go func() {
 		defer close(writeDone)

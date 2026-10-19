@@ -1,9 +1,10 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
-	"strconv"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -217,6 +218,9 @@ func TestProfileLimitsCannotExceedGlobalCeilings(t *testing.T) {
 }
 
 func TestLoadAcceptsSystemdCredentialReadPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping POSIX permission test on Windows")
+	}
 	directory := t.TempDir()
 	public := filepath.Join(directory, "public")
 	if err := os.Mkdir(public, 0700); err != nil {
@@ -263,8 +267,19 @@ func TestCarrierBatchMustFitDesktopLoopbackCap(t *testing.T) {
 	}
 	write := func(batch, body int) string {
 		path := filepath.Join(directory, "config.json")
-		content := `{"public_hostname":"proxy.example.com","public_dir":"` + directory + `","profiles_file":"` + profiles + `","limits":{"carrier_batch_bytes":` + strconv.Itoa(batch) + `,"max_body_bytes":` + strconv.Itoa(body) + `}}`
-		if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		cfgData, err := json.Marshal(map[string]any{
+			"public_hostname": "proxy.example.com",
+			"public_dir":      directory,
+			"profiles_file":   profiles,
+			"limits": map[string]any{
+				"carrier_batch_bytes": batch,
+				"max_body_bytes":      body,
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, cfgData, 0600); err != nil {
 			t.Fatal(err)
 		}
 		return path
@@ -280,5 +295,82 @@ func TestCarrierBatchMustFitDesktopLoopbackCap(t *testing.T) {
 func TestDefaultReconnectGraceIsShort(t *testing.T) {
 	if Defaults().Timeouts.ReconnectGrace.Value() != 2*time.Minute {
 		t.Fatal("reconnect_grace default is not 2m")
+	}
+}
+
+func TestTelemtBackendConfiguration(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(directory, "index.html"), []byte("index"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	writeConfig := func(profilesContent string, globalBackendType string, globalPP string) (Config, error) {
+		profPath := filepath.Join(directory, "profiles.json")
+		if err := os.WriteFile(profPath, []byte(profilesContent), 0600); err != nil {
+			t.Fatal(err)
+		}
+		cfgMap := map[string]any{
+			"public_hostname": "proxy.example.com",
+			"public_dir":      directory,
+			"profiles_file":   profPath,
+		}
+		if globalBackendType != "" {
+			cfgMap["backend_type"] = globalBackendType
+		}
+		if globalPP != "" {
+			cfgMap["backend_proxy_protocol"] = globalPP
+		}
+		cfgBytes, err := json.Marshal(cfgMap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfgPath := filepath.Join(directory, "config.json")
+		if err := os.WriteFile(cfgPath, cfgBytes, 0600); err != nil {
+			t.Fatal(err)
+		}
+		return Load(cfgPath)
+	}
+
+	// 1. Valid telemt profile with TCP
+	validTelemt := `{"profiles":[{"name":"telemt1","secret":"000102030405060708090a0b0c0d0e0f","backend":"127.0.0.1:8443","backend_type":"telemt","backend_proxy_protocol":"v2"}]}`
+	loaded, err := writeConfig(validTelemt, "", "")
+	if err != nil {
+		t.Fatalf("valid telemt config was rejected: %v", err)
+	}
+	if loaded.Profiles[0].BackendType != BackendTelemt || loaded.Profiles[0].BackendProxyProtocol != BackendProxyV2 {
+		t.Fatalf("unexpected telemt profile settings: %#v", loaded.Profiles[0])
+	}
+
+	// 2. Valid telemt profile with unix socket
+	sockPath := "/run/telemt/telemt.sock"
+	if runtime.GOOS == "windows" {
+		sockPath = "C:/run/telemt/telemt.sock"
+	}
+	validUnix := `{"profiles":[{"name":"telemt_unix","secret":"000102030405060708090a0b0c0d0e0f","backend":"unix:` + sockPath + `","backend_type":"telemt"}]}`
+	loaded, err = writeConfig(validUnix, "", "")
+	if err != nil {
+		t.Fatalf("valid telemt unix socket was rejected: %v", err)
+	}
+	netw, addr := loaded.Profiles[0].BackendNetworkAndAddress()
+	if netw != "unix" || addr != sockPath {
+		t.Fatalf("unexpected network/addr: %s, %s", netw, addr)
+	}
+
+	// 3. Official mtproxy with unix socket rejected
+	invalidUnixMT := `{"profiles":[{"name":"mt_unix","secret":"000102030405060708090a0b0c0d0e0f","backend":"unix:` + sockPath + `","backend_type":"mtproxy"}]}`
+	if _, err := writeConfig(invalidUnixMT, "", ""); err == nil {
+		t.Fatal("accepted unix socket for official mtproxy")
+	}
+
+	// 4. Official mtproxy with PROXY protocol rejected
+	invalidPPMT := `{"profiles":[{"name":"mt_pp","secret":"000102030405060708090a0b0c0d0e0f","backend":"127.0.0.1:2398","backend_type":"mtproxy","backend_proxy_protocol":"v1"}]}`
+	if _, err := writeConfig(invalidPPMT, "", ""); err == nil {
+		t.Fatal("accepted PROXY protocol for official mtproxy")
+	}
+
+	// 5. Invalid backend_type rejected
+	invalidType := `{"profiles":[{"name":"bad","secret":"000102030405060708090a0b0c0d0e0f","backend":"127.0.0.1:2398","backend_type":"unknown"}]}`
+	if _, err := writeConfig(invalidType, "", ""); err == nil {
+		t.Fatal("accepted unknown backend_type")
 	}
 }

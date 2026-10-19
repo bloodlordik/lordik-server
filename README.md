@@ -5,8 +5,8 @@ Telegram. A Telegram app keeps its normal MTProxy framing and encryption, but se
 all of its proxy TCP connections through one app-owned WebView transport. The
 WebView carries a multiplexed session over a server-selected same-origin HTTPS or
 WebSocket carrier.
-The relay separates the logical streams again and connects each one to a stock
-official MTProxy on the server.
+The relay separates the logical streams again and connects each one to a local MTProxy
+backend on the server — either the official C MTProxy or high-performance [Telemt](https://github.com/telemt/telemt).
 
 The design is not tied to one Telegram client or operating system. Any Telegram
 app that can host a WebView and connect its MTProxy sockets to a small local adapter
@@ -34,7 +34,7 @@ Telegram app
   multiplexed frames in the selected HTTPS/WebSocket carrier
           |
           v
-  tproxy-server -> one local TCP connection per stream -> official MTProxy
+  tproxy-server -> one local connection per stream (TCP / Unix socket) -> official MTProxy or Telemt
 ```
 
 The app configures only a hostname and an MTProxy secret. It derives the bridge
@@ -59,16 +59,17 @@ operator-owned website extension points.
 The reference deployment layout is:
 
 ```text
-Internet :80/:443 -> Caddy -> 127.0.0.1:8080 tproxy-server -> operator site
-                                              |                (memory or loopback app)
-                                              \-> 127.0.0.1:2398 official MTProxy
+Internet :80/:443 -> Caddy or Nginx -> 127.0.0.1:8080 tproxy-server -> operator site
+                                                    |                (memory or loopback app)
+                                                    +-> 127.0.0.1:2398 official MTProxy
+                                                    \-> 127.0.0.1:8443 / unix socket Telemt
 ```
 
-Only Caddy listens on external interfaces. The relay, its admin endpoints, the
+Only Caddy or Nginx listens on external interfaces. The relay, its admin endpoints, the
 official MTProxy client port, and MTProxy statistics remain local. The relay never
 receives a client-selected backend address and never decrypts the MTProxy stream.
 
-Caddy proxies **every** path to the relay. In static mode the relay serves the
+The reverse proxy (Caddy or Nginx) proxies **every** path to the relay. In static mode the relay serves the
 whole site from memory using standard Go conditional and range handling. In application
 mode it delegates ordinary and unauthenticated requests to one private loopback
 web application. A request that proves knowledge of a bridge or session token is
@@ -76,7 +77,6 @@ intercepted before that application. In either mode there is no separately hoste
 relay path for an unauthenticated prober to compare with the public site, and only
 `GET /?bridge=<valid capability>` reveals the bridge. Restart the relay after
 changing files under `public_dir`; the static site is read once at start-up.
-
 ## What you need
 
 - a dedicated lowercase hostname such as `proxy.example.com` that you control;
@@ -465,6 +465,101 @@ Keep the bridge response headers produced by the Go relay intact; `PROTOCOL.md`
 lists the complete execution policy and explains which restrictions clients must
 also enforce independently.
 
+## Manual integration on an existing Nginx server
+
+If your server already uses Nginx, or if you prefer Nginx over Caddy, you can run `tproxy-server` behind Nginx. A ready-to-use site configuration is provided in `deploy/nginx-tproxy.conf`.
+
+### 1. Build and install the backend and relay
+
+Follow the steps from the manual Caddy section to build `tproxy-server`, provision `token.key`, and build MTProxy:
+
+```bash
+go test ./...
+go build -trimpath -o tproxy-server ./cmd/tproxy-server
+sudo install -m 0755 tproxy-server /usr/local/bin/tproxy-server
+sudo bash deploy/ensure-token-key.sh
+sudo bash deploy/install-mtproxy.sh
+```
+
+Set up `/etc/tproxy-server/config.json` and `/etc/tproxy-server/profiles.json` (as described in `config.example.json` and `profiles.example.json`), and install the systemd service units for `tproxy-firewall`, `mtproxy`, and `tproxy-server`.
+
+### 2. Configure Nginx
+
+Create `/etc/nginx/sites-available/proxy.example.com.conf` (or adapt your existing configuration):
+
+```nginx
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      "";
+}
+
+upstream tproxy_backend {
+    server 127.0.0.1:8080;
+    keepalive 32;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name proxy.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    # For Nginx >= 1.25.1: http2 on;
+
+    server_name proxy.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/proxy.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/proxy.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    # Carrier batches reach up to 2 MiB; Nginx defaults to 1 MiB (would return 413).
+    client_max_body_size 4m;
+
+    # Disable access logs to avoid recording capability tokens and WebSocket auth.
+    access_log off;
+
+    proxy_hide_header Via;
+
+    location / {
+        proxy_pass http://tproxy_backend;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+
+        # CRITICAL: Relay enforces single client IP and rejects comma-separated lists.
+        # Do NOT use $proxy_add_x_forwarded_for.
+        proxy_set_header X-Forwarded-For $remote_addr;
+
+        # WebSocket upgrade support
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+
+        # Relay long-poll is 25s; keep timeouts well above it.
+        proxy_read_timeout 90s;
+        proxy_send_timeout 90s;
+
+        # Immediate delivery for real-time streams
+        proxy_buffering off;
+        proxy_request_buffering off;
+    }
+}
+```
+
+### 3. Key Nginx requirements and pitfalls
+
+- **Single client IP (`X-Forwarded-For`)**: The relay inspects `X-Forwarded-For` for capacity accounting and brute-force mitigation. It requires **exactly one** IP address and rejects comma-separated lists with an error. Using `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` will append to existing headers, causing valid requests to be rejected. **Always use** `proxy_set_header X-Forwarded-For $remote_addr;`.
+- **Uplink batch size (`client_max_body_size`)**: The desktop and mobile clients batch uplink frames up to 2 MiB. Nginx's default `client_max_body_size` is 1 MiB and will fail uploads with `413 Request Entity Too Large`. Set `client_max_body_size 4m;` (or at least `2m`).
+- **Timeouts (`proxy_read_timeout`)**: The `/api/v1/down` carrier long-poll waits up to 25s for server downlink frames. Set `proxy_read_timeout 90s;` and `proxy_send_timeout 90s;` so parked long polls are not terminated prematurely.
+- **Buffering (`proxy_buffering off`)**: Streaming carriers (and WebSocket upgrades) require immediate, unbuffered delivery.
+- **Framing and CSP (`X-Frame-Options`)**: Do not configure `X-Frame-Options: DENY` or restrict `frame-ancestors` in Nginx for the proxy domain. The bridge page runs in an app WebView and provides its own strict loopback CSP.
+- **Logging (`access_log off`)**: Do not record access logs with query strings or headers: capability tokens travel in `GET /?bridge=...` and carrier session tokens travel in `Sec-WebSocket-Protocol`.
+
 ## Running alongside an existing website
 
 The layout above gives the relay a hostname of its own and routes every path to
@@ -596,6 +691,39 @@ passed to official MTProxy's per-worker `-C` limit. Keep the relay's
 `max_streams_global` at or below the intended aggregate backend capacity and increase
 workers only after one worker is CPU-bound; extra MTProxy workers do not accelerate
 Caddy, the WebView bridge, or the Go relay.
+
+### Telemt backend alternative
+
+As an alternative to the official C MTProxy, `tproxy-server` supports [Telemt](https://github.com/telemt/telemt) (Rust + Tokio) with full backward compatibility:
+
+- **Backend type selector**: configure `"backend_type": "telemt"` in `config.json` (globally) or inside individual profiles in `profiles.json`. Defaults to `"mtproxy"`.
+- **UNIX domain sockets**: Telemt supports `listen_unix_sock`. In `tproxy-server`, configure `backend: "unix:/run/telemt/telemt.sock"` or `"unix:///run/telemt/telemt.sock"` to eliminate loopback TCP overhead and port exposure.
+- **Client IP preservation (PROXY protocol)**: configure `"backend_proxy_protocol": "v1"` or `"v2"` in Telemt profiles. `tproxy-server` automatically forwards the real client IP (extracted from `X-Forwarded-For`) via the HAProxy PROXY protocol header upon stream connection. In Telemt, enable `proxy_protocol = true`.
+
+Example profile for Telemt with PROXY protocol v2:
+
+```json
+{
+  "name": "telemt",
+  "secret": "000102030405060708090a0b0c0d0e0f",
+  "backend": "127.0.0.1:8443",
+  "backend_type": "telemt",
+  "backend_proxy_protocol": "v2",
+  "carrier_mode": "https-lanes"
+}
+```
+
+Example profile for Telemt with UNIX domain socket:
+
+```json
+{
+  "name": "telemt-unix",
+  "secret": "000102030405060708090a0b0c0d0e0f",
+  "backend": "unix:/run/telemt/telemt.sock",
+  "backend_type": "telemt",
+  "carrier_mode": "websocket-lanes"
+}
+```
 
 Restarting `tproxy-server` invalidates active carrier sessions:
 

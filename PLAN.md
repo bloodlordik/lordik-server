@@ -722,6 +722,14 @@ not tell the relay which secret was used, so separate per-profile accounting can
 be maintained. A dedicated backend listener preserves the selected profile without
 teaching the Go relay MTProxy internals.
 
+### 9.2 Telemt backend support
+
+In addition to official MTProxy, `tproxy-server` supports [Telemt](https://github.com/telemt/telemt) (Rust + Tokio MTProxy implementation):
+
+1. **Transport Flexibility**: Telemt can be connected via local TCP (`127.0.0.1:port`) or UNIX domain sockets (`unix:/path/to/telemt.sock`). Using UNIX domain sockets removes TCP loopback serialization overhead and relies on standard OS filesystem permissions.
+2. **Real Client IP Preservation**: When `backend_proxy_protocol` is configured (`v1` or `v2`), `tproxy-server` prefixes newly opened stream connections with an HAProxy PROXY protocol header containing the genuine client IP (from `X-Forwarded-For`). This allows Telemt to perform accurate DC routing, logging, and per-user limits without exposing MTProxy to public networks.
+3. **Strict Compatibility**: Profiles without `backend_type` continue to use official MTProxy defaults (`"mtproxy"`), guaranteeing zero behavioral breakage.
+
 ## 10. Resource and operational limits
 
 V1 is intended for controlled deployment but must be bounded before public testing.

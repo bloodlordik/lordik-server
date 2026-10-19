@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"runtime"
 	"time"
 )
 
@@ -55,6 +56,85 @@ func (m CarrierMode) WithDefault() CarrierMode {
 	return m
 }
 
+type BackendType string
+
+const (
+	BackendMTProxy BackendType = "mtproxy"
+	BackendTelemt  BackendType = "telemt"
+)
+
+func (b BackendType) Valid() bool {
+	return b == "" || b == BackendMTProxy || b == BackendTelemt
+}
+
+func (b BackendType) WithDefault() BackendType {
+	if b == "" {
+		return BackendMTProxy
+	}
+	return b
+}
+
+func (b *BackendType) UnmarshalJSON(input []byte) error {
+	var str string
+	if err := json.Unmarshal(input, &str); err != nil {
+		return err
+	}
+	normalized := BackendType(strings.ToLower(strings.TrimSpace(str)))
+	if normalized == "" {
+		*b = BackendMTProxy
+		return nil
+	}
+	if !normalized.Valid() {
+		return fmt.Errorf("backend_type must be %q or %q, got %q", BackendMTProxy, BackendTelemt, str)
+	}
+	*b = normalized
+	return nil
+}
+
+type BackendProxyProtocol string
+
+const (
+	BackendProxyNone BackendProxyProtocol = "none"
+	BackendProxyV1   BackendProxyProtocol = "v1"
+	BackendProxyV2   BackendProxyProtocol = "v2"
+)
+
+func (p BackendProxyProtocol) Valid() bool {
+	return p == "" || p == BackendProxyNone || p == BackendProxyV1 || p == BackendProxyV2
+}
+
+func (p BackendProxyProtocol) WithDefault() BackendProxyProtocol {
+	if p == "" {
+		return BackendProxyNone
+	}
+	return p
+}
+
+func (p *BackendProxyProtocol) UnmarshalJSON(input []byte) error {
+	var boolVal bool
+	if err := json.Unmarshal(input, &boolVal); err == nil {
+		if boolVal {
+			*p = BackendProxyV1
+		} else {
+			*p = BackendProxyNone
+		}
+		return nil
+	}
+	var str string
+	if err := json.Unmarshal(input, &str); err != nil {
+		return err
+	}
+	normalized := BackendProxyProtocol(strings.ToLower(strings.TrimSpace(str)))
+	if normalized == "" {
+		*p = BackendProxyNone
+		return nil
+	}
+	if !normalized.Valid() {
+		return fmt.Errorf("backend_proxy_protocol must be %q, %q, or %q, got %q", BackendProxyNone, BackendProxyV1, BackendProxyV2, str)
+	}
+	*p = normalized
+	return nil
+}
 type Duration time.Duration
 
 func (d *Duration) UnmarshalJSON(input []byte) error {
@@ -111,20 +191,22 @@ type Timeouts struct {
 }
 
 type Config struct {
-	PublicHostname   string    `json:"public_hostname"`
-	BasePath         string    `json:"base_path"`
-	Listen           string    `json:"listen"`
-	AdminListen      string    `json:"admin_listen"`
-	PublicDir        string    `json:"public_dir"`
-	PublicUpstream   string    `json:"public_upstream"`
-	StaticRoutes     string    `json:"static_routes"`
-	TokenKeyFile     string    `json:"token_key_file"`
-	ProfilesFile     string    `json:"profiles_file"`
-	EnablePprof      bool      `json:"enable_pprof"`
-	Limits           Limits    `json:"limits"`
-	Timeouts         Timeouts  `json:"timeouts"`
-	Profiles         []Profile `json:"-"`
-	LegacyTokenDrain bool      `json:"-"`
+	PublicHostname       string               `json:"public_hostname"`
+	BasePath             string               `json:"base_path"`
+	Listen               string               `json:"listen"`
+	AdminListen          string               `json:"admin_listen"`
+	BackendType          BackendType          `json:"backend_type,omitempty"`
+	BackendProxyProtocol BackendProxyProtocol `json:"backend_proxy_protocol,omitempty"`
+	PublicDir            string               `json:"public_dir"`
+	PublicUpstream       string               `json:"public_upstream"`
+	StaticRoutes         string               `json:"static_routes"`
+	TokenKeyFile         string               `json:"token_key_file"`
+	ProfilesFile         string               `json:"profiles_file"`
+	EnablePprof          bool                 `json:"enable_pprof"`
+	Limits               Limits               `json:"limits"`
+	Timeouts             Timeouts             `json:"timeouts"`
+	Profiles             []Profile            `json:"-"`
+	LegacyTokenDrain     bool                 `json:"-"`
 }
 
 type profileFile struct {
@@ -132,11 +214,13 @@ type profileFile struct {
 }
 
 type profileInput struct {
-	Name        string        `json:"name"`
-	Secret      string        `json:"secret"`
-	Backend     string        `json:"backend"`
-	CarrierMode CarrierMode   `json:"carrier_mode"`
-	Limits      ProfileLimits `json:"limits"`
+	Name                 string               `json:"name"`
+	Secret               string               `json:"secret"`
+	Backend              string               `json:"backend"`
+	BackendType          BackendType          `json:"backend_type,omitempty"`
+	BackendProxyProtocol BackendProxyProtocol `json:"backend_proxy_protocol,omitempty"`
+	CarrierMode          CarrierMode          `json:"carrier_mode"`
+	Limits               ProfileLimits        `json:"limits"`
 }
 
 type ProfileLimits struct {
@@ -152,11 +236,24 @@ type ProfileLimits struct {
 }
 
 type Profile struct {
-	Name        string
-	Backend     string
-	CarrierMode CarrierMode
-	Capability  [sha256.Size]byte
-	Limits      ProfileLimits
+	Name                 string
+	Secret               string
+	Backend              string
+	BackendType          BackendType
+	BackendProxyProtocol BackendProxyProtocol
+	CarrierMode          CarrierMode
+	Capability           [sha256.Size]byte
+	Limits               ProfileLimits
+}
+
+func (p Profile) BackendNetworkAndAddress() (string, string) {
+	if strings.HasPrefix(p.Backend, "unix:") {
+		return "unix", strings.TrimPrefix(p.Backend, "unix:")
+	}
+	if strings.HasPrefix(p.Backend, "/") {
+		return "unix", p.Backend
+	}
+	return "tcp", p.Backend
 }
 
 func (limits ProfileLimits) WithDefaults(global Limits) ProfileLimits {
@@ -197,10 +294,12 @@ func (limits ProfileLimits) WithDefaults(global Limits) ProfileLimits {
 
 func Defaults() Config {
 	return Config{
-		Listen:       "127.0.0.1:8080",
-		AdminListen:  "127.0.0.1:8081",
-		StaticRoutes: "legacy",
-		TokenKeyFile: "token.key",
+		BackendType:          BackendMTProxy,
+		BackendProxyProtocol: BackendProxyNone,
+		Listen:               "127.0.0.1:8080",
+		AdminListen:          "127.0.0.1:8081",
+		StaticRoutes:         "legacy",
+		TokenKeyFile:         "token.key",
 		Limits: Limits{
 			MaxHeaderBytes:            16 * 1024,
 			MaxBodyBytes:              2 * 1024 * 1024,
@@ -270,7 +369,7 @@ func Load(path string, profilesOverride ...string) (Config, error) {
 	if err := result.validate(); err != nil {
 		return Config{}, err
 	}
-	profiles, err := loadProfiles(result.ProfilesFile, result.PublicHostname, result.BasePath, result.Limits)
+	profiles, err := loadProfiles(result.ProfilesFile, result.PublicHostname, result.BasePath, result.Limits, result.BackendType)
 	if err != nil {
 		return Config{}, err
 	}
@@ -279,6 +378,15 @@ func Load(path string, profilesOverride ...string) (Config, error) {
 }
 
 func (c Config) validate() error {
+	if !c.BackendType.Valid() {
+		return fmt.Errorf("backend_type must be %q or %q", BackendMTProxy, BackendTelemt)
+	}
+	if !c.BackendProxyProtocol.Valid() {
+		return fmt.Errorf("backend_proxy_protocol must be %q, %q, or %q", BackendProxyNone, BackendProxyV1, BackendProxyV2)
+	}
+	if c.BackendType.WithDefault() == BackendMTProxy && c.BackendProxyProtocol.WithDefault() != BackendProxyNone {
+		return errors.New("official mtproxy does not support PROXY protocol; use telemt or disable backend_proxy_protocol")
+	}
 	if c.StaticRoutes != "exact" && c.StaticRoutes != "legacy" {
 		return errors.New("static_routes must be exact or legacy")
 	}
@@ -497,6 +605,34 @@ func validateLoopbackAddress(address string) error {
 	return nil
 }
 
+func validateBackendAddress(backend string, backendType BackendType) error {
+	if strings.HasPrefix(backend, "unix://") || strings.HasPrefix(backend, "unix:") || strings.HasPrefix(backend, "/") {
+		if backendType == BackendMTProxy {
+			return errors.New("official mtproxy does not support unix domain sockets; use telemt or loopback tcp")
+		}
+		path := backend
+		if strings.HasPrefix(path, "unix://") {
+			path = strings.TrimPrefix(path, "unix://")
+		} else if strings.HasPrefix(path, "unix:") {
+			path = strings.TrimPrefix(path, "unix:")
+		}
+		if path == "" {
+			return errors.New("empty unix socket path")
+		}
+		if !filepath.IsAbs(path) {
+			return errors.New("unix socket path must be absolute")
+		}
+		if len(path) > 108 {
+			return errors.New("unix socket path exceeds maximum length of 108 characters")
+		}
+		if strings.ContainsRune(path, 0) {
+			return errors.New("unix socket path must not contain null bytes")
+		}
+		return nil
+	}
+	return validateLoopbackAddress(backend)
+}
+
 func validatePublicUpstream(raw string) error {
 	parsed, err := url.Parse(raw)
 	if err != nil {
@@ -514,7 +650,7 @@ func validatePublicUpstream(raw string) error {
 	return nil
 }
 
-func loadProfiles(path, host, basePath string, limits Limits) ([]Profile, error) {
+func loadProfiles(path, host, basePath string, limits Limits, defaultBackendType ...BackendType) ([]Profile, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("profiles_file: %w", err)
@@ -522,7 +658,7 @@ func loadProfiles(path, host, basePath string, limits Limits) ([]Profile, error)
 	extraPermissions := info.Mode().Perm() & 0077
 	credentialReadOnly := isSystemdCredential(path) &&
 		extraPermissions&0033 == 0
-	if extraPermissions != 0 && !credentialReadOnly {
+	if runtime.GOOS != "windows" && extraPermissions != 0 && !credentialReadOnly {
 		return nil, errors.New("profiles_file must not be readable or writable by group or others")
 	}
 	input, err := os.ReadFile(path)
@@ -556,7 +692,22 @@ func loadProfiles(path, host, basePath string, limits Limits) ([]Profile, error)
 		if _, exists := names[input.Name]; exists {
 			return nil, fmt.Errorf("duplicate profile name %q", input.Name)
 		}
-		if err := validateLoopbackAddress(input.Backend); err != nil {
+		backendType := input.BackendType
+		if backendType == "" && len(defaultBackendType) > 0 {
+			backendType = defaultBackendType[0]
+		}
+		backendType = backendType.WithDefault()
+		if !backendType.Valid() {
+			return nil, fmt.Errorf("profile %q backend_type must be %q or %q", input.Name, BackendMTProxy, BackendTelemt)
+		}
+		proxyProtocol := input.BackendProxyProtocol.WithDefault()
+		if !proxyProtocol.Valid() {
+			return nil, fmt.Errorf("profile %q backend_proxy_protocol must be %q, %q, or %q", input.Name, BackendProxyNone, BackendProxyV1, BackendProxyV2)
+		}
+		if backendType == BackendMTProxy && proxyProtocol != BackendProxyNone {
+			return nil, fmt.Errorf("profile %q: official mtproxy does not support PROXY protocol; use telemt or disable backend_proxy_protocol", input.Name)
+		}
+		if err := validateBackendAddress(input.Backend, backendType); err != nil {
 			return nil, fmt.Errorf("profile %q backend: %w", input.Name, err)
 		}
 		carrierMode := input.CarrierMode.WithDefault()
@@ -579,11 +730,13 @@ func loadProfiles(path, host, basePath string, limits Limits) ([]Profile, error)
 			return nil, fmt.Errorf("duplicate capability for profile %q", input.Name)
 		}
 		result = append(result, Profile{
-			Name:        input.Name,
-			Backend:     input.Backend,
-			CarrierMode: carrierMode,
-			Capability:  capability,
-			Limits:      profileLimits,
+			Name:                 input.Name,
+			Backend:              input.Backend,
+			BackendType:          backendType,
+			BackendProxyProtocol: proxyProtocol,
+			CarrierMode:          carrierMode,
+			Capability:           capability,
+			Limits:               profileLimits,
 		})
 		names[input.Name] = struct{}{}
 		capabilities[capability] = struct{}{}

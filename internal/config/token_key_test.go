@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -24,10 +25,12 @@ func TestTokenKeyRequiresPrivatePersistentFile(t *testing.T) {
 			t.Fatal("key changed while reading")
 		}
 	}
-	if err := os.Chmod(path, 0640); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ReadTokenKey(path); err == nil {
-		t.Fatal("group-readable key accepted")
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(path, 0640); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ReadTokenKey(path); err == nil {
+			t.Fatal("group-readable key accepted")
+		}
 	}
 }
