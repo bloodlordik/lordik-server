@@ -374,3 +374,79 @@ func TestTelemtBackendConfiguration(t *testing.T) {
 		t.Fatal("accepted unknown backend_type")
 	}
 }
+
+func TestDirectBackendConfiguration(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(directory, "index.html"), []byte("index"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	writeConfig := func(profilesContent string, globalBackendType string, globalPP string) (Config, error) {
+		profPath := filepath.Join(directory, "profiles.json")
+		if err := os.WriteFile(profPath, []byte(profilesContent), 0600); err != nil {
+			t.Fatal(err)
+		}
+		cfgMap := map[string]any{
+			"public_hostname": "proxy.example.com",
+			"public_dir":      directory,
+			"profiles_file":   profPath,
+		}
+		if globalBackendType != "" {
+			cfgMap["backend_type"] = globalBackendType
+		}
+		if globalPP != "" {
+			cfgMap["backend_proxy_protocol"] = globalPP
+		}
+		cfgBytes, err := json.Marshal(cfgMap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfgPath := filepath.Join(directory, "config.json")
+		if err := os.WriteFile(cfgPath, cfgBytes, 0600); err != nil {
+			t.Fatal(err)
+		}
+		return Load(cfgPath)
+	}
+
+	// 1. Valid direct profile (auto DC)
+	autoDirect := `{"profiles":[{"name":"direct_auto","secret":"000102030405060708090a0b0c0d0e0f","backend_type":"direct"}]}`
+	loaded, err := writeConfig(autoDirect, "", "")
+	if err != nil {
+		t.Fatalf("valid direct auto config rejected: %v", err)
+	}
+	if loaded.Profiles[0].BackendType != BackendDirect || loaded.Profiles[0].Backend != "auto" {
+		t.Fatalf("unexpected direct profile: %#v", loaded.Profiles[0])
+	}
+
+	// 2. Valid direct profile with static_dc integer
+	staticDirectInt := `{"profiles":[{"name":"direct_static","secret":"000102030405060708090a0b0c0d0e0f","backend_type":"direct","static_dc":2}]}`
+	loaded, err = writeConfig(staticDirectInt, "", "")
+	if err != nil {
+		t.Fatalf("valid direct static_dc int rejected: %v", err)
+	}
+	if loaded.Profiles[0].BackendType != BackendDirect || loaded.Profiles[0].StaticDC != "2" || loaded.Profiles[0].Backend != "2" {
+		t.Fatalf("unexpected static direct profile: %#v", loaded.Profiles[0])
+	}
+
+	// 3. Valid direct profile with explicit IP:port backend
+	explicitAddr := `{"profiles":[{"name":"direct_addr","secret":"000102030405060708090a0b0c0d0e0f","backend_type":"direct","backend":"149.154.167.51:443"}]}`
+	loaded, err = writeConfig(explicitAddr, "", "")
+	if err != nil {
+		t.Fatalf("valid direct explicit addr rejected: %v", err)
+	}
+	if loaded.Profiles[0].Backend != "149.154.167.51:443" {
+		t.Fatalf("unexpected backend address: %s", loaded.Profiles[0].Backend)
+	}
+
+	// 4. Direct backend with PROXY protocol rejected
+	directWithPP := `{"profiles":[{"name":"direct_pp","secret":"000102030405060708090a0b0c0d0e0f","backend_type":"direct","backend_proxy_protocol":"v1"}]}`
+	if _, err := writeConfig(directWithPP, "", ""); err == nil {
+		t.Fatal("accepted PROXY protocol for direct backend")
+	}
+
+	// 5. Direct backend with unix socket rejected
+	directWithUnix := `{"profiles":[{"name":"direct_unix","secret":"000102030405060708090a0b0c0d0e0f","backend_type":"direct","backend":"unix:/run/tg.sock"}]}`
+	if _, err := writeConfig(directWithUnix, "", ""); err == nil {
+		t.Fatal("accepted unix socket for direct backend")
+	}
+}

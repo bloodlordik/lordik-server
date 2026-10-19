@@ -19,8 +19,21 @@
       "name": "telemt-unix",
       "secret": "202122232425262728292a2b2c2d2e2f",
       "backend": "unix:/run/telemt/telemt.sock",
-      "backend_type": "telemt",
       "carrier_mode": "websocket-lanes"
+    },
+    {
+      "name": "direct-auto",
+      "secret": "303132333435363738393a3b3c3d3e3f",
+      "backend_type": "direct",
+      "backend": "auto",
+      "carrier_mode": "websocket-lanes"
+    },
+    {
+      "name": "direct-static-dc2",
+      "secret": "404142434445464748494a4b4c4d4e4f",
+      "backend_type": "direct",
+      "static_dc": 2,
+      "carrier_mode": "https-lanes"
     }
   ]
 }

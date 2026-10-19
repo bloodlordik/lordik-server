@@ -61,10 +61,11 @@ type BackendType string
 const (
 	BackendMTProxy BackendType = "mtproxy"
 	BackendTelemt  BackendType = "telemt"
+	BackendDirect  BackendType = "direct"
 )
 
 func (b BackendType) Valid() bool {
-	return b == "" || b == BackendMTProxy || b == BackendTelemt
+	return b == "" || b == BackendMTProxy || b == BackendTelemt || b == BackendDirect
 }
 
 func (b BackendType) WithDefault() BackendType {
@@ -85,7 +86,7 @@ func (b *BackendType) UnmarshalJSON(input []byte) error {
 		return nil
 	}
 	if !normalized.Valid() {
-		return fmt.Errorf("backend_type must be %q or %q, got %q", BackendMTProxy, BackendTelemt, str)
+		return fmt.Errorf("backend_type must be %q, %q or %q, got %q", BackendMTProxy, BackendTelemt, BackendDirect, str)
 	}
 	*b = normalized
 	return nil
@@ -135,6 +136,26 @@ func (p *BackendProxyProtocol) UnmarshalJSON(input []byte) error {
 	*p = normalized
 	return nil
 }
+type StaticDC string
+
+func (s *StaticDC) UnmarshalJSON(input []byte) error {
+	var intVal int
+	if err := json.Unmarshal(input, &intVal); err == nil {
+		*s = StaticDC(strconv.Itoa(intVal))
+		return nil
+	}
+	var strVal string
+	if err := json.Unmarshal(input, &strVal); err != nil {
+		return err
+	}
+	*s = StaticDC(strings.TrimSpace(strVal))
+	return nil
+}
+
+func (s StaticDC) String() string {
+	return string(s)
+}
+
 type Duration time.Duration
 
 func (d *Duration) UnmarshalJSON(input []byte) error {
@@ -197,6 +218,8 @@ type Config struct {
 	AdminListen          string               `json:"admin_listen"`
 	BackendType          BackendType          `json:"backend_type,omitempty"`
 	BackendProxyProtocol BackendProxyProtocol `json:"backend_proxy_protocol,omitempty"`
+	StaticDC             StaticDC             `json:"static_dc,omitempty"`
+	PreferIPv6           bool                 `json:"prefer_ipv6,omitempty"`
 	PublicDir            string               `json:"public_dir"`
 	PublicUpstream       string               `json:"public_upstream"`
 	StaticRoutes         string               `json:"static_routes"`
@@ -219,6 +242,8 @@ type profileInput struct {
 	Backend              string               `json:"backend"`
 	BackendType          BackendType          `json:"backend_type,omitempty"`
 	BackendProxyProtocol BackendProxyProtocol `json:"backend_proxy_protocol,omitempty"`
+	StaticDC             StaticDC             `json:"static_dc,omitempty"`
+	PreferIPv6           bool                 `json:"prefer_ipv6,omitempty"`
 	CarrierMode          CarrierMode          `json:"carrier_mode"`
 	Limits               ProfileLimits        `json:"limits"`
 }
@@ -241,12 +266,20 @@ type Profile struct {
 	Backend              string
 	BackendType          BackendType
 	BackendProxyProtocol BackendProxyProtocol
+	StaticDC             StaticDC
+	PreferIPv6           bool
 	CarrierMode          CarrierMode
 	Capability           [sha256.Size]byte
 	Limits               ProfileLimits
 }
 
 func (p Profile) BackendNetworkAndAddress() (string, string) {
+	if p.BackendType == BackendDirect {
+		return "tcp", p.Backend
+	}
+	if strings.HasPrefix(p.Backend, "unix://") {
+		return "unix", strings.TrimPrefix(p.Backend, "unix://")
+	}
 	if strings.HasPrefix(p.Backend, "unix:") {
 		return "unix", strings.TrimPrefix(p.Backend, "unix:")
 	}
@@ -379,13 +412,16 @@ func Load(path string, profilesOverride ...string) (Config, error) {
 
 func (c Config) validate() error {
 	if !c.BackendType.Valid() {
-		return fmt.Errorf("backend_type must be %q or %q", BackendMTProxy, BackendTelemt)
+		return fmt.Errorf("backend_type must be %q, %q or %q", BackendMTProxy, BackendTelemt, BackendDirect)
 	}
 	if !c.BackendProxyProtocol.Valid() {
 		return fmt.Errorf("backend_proxy_protocol must be %q, %q, or %q", BackendProxyNone, BackendProxyV1, BackendProxyV2)
 	}
 	if c.BackendType.WithDefault() == BackendMTProxy && c.BackendProxyProtocol.WithDefault() != BackendProxyNone {
 		return errors.New("official mtproxy does not support PROXY protocol; use telemt or disable backend_proxy_protocol")
+	}
+	if c.BackendType.WithDefault() == BackendDirect && c.BackendProxyProtocol.WithDefault() != BackendProxyNone {
+		return errors.New("direct backend does not support PROXY protocol; disable backend_proxy_protocol")
 	}
 	if c.StaticRoutes != "exact" && c.StaticRoutes != "legacy" {
 		return errors.New("static_routes must be exact or legacy")
@@ -605,7 +641,39 @@ func validateLoopbackAddress(address string) error {
 	return nil
 }
 
+func validateDirectBackendAddress(backend string) error {
+	trimmed := strings.ToLower(strings.TrimSpace(backend))
+	if trimmed == "" || trimmed == "auto" {
+		return nil
+	}
+	cleanVal := strings.TrimPrefix(trimmed, "dc")
+	if dcNum, err := strconv.Atoi(cleanVal); err == nil {
+		if (dcNum >= 1 && dcNum <= 5) || (dcNum >= -5 && dcNum <= -1) {
+			return nil
+		}
+		return fmt.Errorf("direct backend dc index must be between 1 and 5 (or -1 to -5), got %d", dcNum)
+	}
+	host, portStr, err := net.SplitHostPort(trimmed)
+	if err != nil {
+		return fmt.Errorf("direct backend must be \"auto\", DC index (1-5), or host:port: %w", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return errors.New("invalid port")
+	}
+	if host == "" {
+		return errors.New("empty host in direct backend address")
+	}
+	return nil
+}
+
 func validateBackendAddress(backend string, backendType BackendType) error {
+	if backendType == BackendDirect {
+		if strings.HasPrefix(backend, "unix://") || strings.HasPrefix(backend, "unix:") || strings.HasPrefix(backend, "/") {
+			return errors.New("direct backend does not support unix domain sockets")
+		}
+		return validateDirectBackendAddress(backend)
+	}
 	if strings.HasPrefix(backend, "unix://") || strings.HasPrefix(backend, "unix:") || strings.HasPrefix(backend, "/") {
 		if backendType == BackendMTProxy {
 			return errors.New("official mtproxy does not support unix domain sockets; use telemt or loopback tcp")
@@ -698,7 +766,7 @@ func loadProfiles(path, host, basePath string, limits Limits, defaultBackendType
 		}
 		backendType = backendType.WithDefault()
 		if !backendType.Valid() {
-			return nil, fmt.Errorf("profile %q backend_type must be %q or %q", input.Name, BackendMTProxy, BackendTelemt)
+			return nil, fmt.Errorf("profile %q backend_type must be %q, %q or %q", input.Name, BackendMTProxy, BackendTelemt, BackendDirect)
 		}
 		proxyProtocol := input.BackendProxyProtocol.WithDefault()
 		if !proxyProtocol.Valid() {
@@ -707,7 +775,20 @@ func loadProfiles(path, host, basePath string, limits Limits, defaultBackendType
 		if backendType == BackendMTProxy && proxyProtocol != BackendProxyNone {
 			return nil, fmt.Errorf("profile %q: official mtproxy does not support PROXY protocol; use telemt or disable backend_proxy_protocol", input.Name)
 		}
-		if err := validateBackendAddress(input.Backend, backendType); err != nil {
+		if backendType == BackendDirect && proxyProtocol != BackendProxyNone {
+			return nil, fmt.Errorf("profile %q: direct backend does not support PROXY protocol; disable backend_proxy_protocol", input.Name)
+		}
+		backendAddress := input.Backend
+		if backendType == BackendDirect {
+			if backendAddress == "" {
+				if input.StaticDC != "" {
+					backendAddress = input.StaticDC.String()
+				} else {
+					backendAddress = "auto"
+				}
+			}
+		}
+		if err := validateBackendAddress(backendAddress, backendType); err != nil {
 			return nil, fmt.Errorf("profile %q backend: %w", input.Name, err)
 		}
 		carrierMode := input.CarrierMode.WithDefault()
@@ -731,9 +812,11 @@ func loadProfiles(path, host, basePath string, limits Limits, defaultBackendType
 		}
 		result = append(result, Profile{
 			Name:                 input.Name,
-			Backend:              input.Backend,
+			Backend:              backendAddress,
 			BackendType:          backendType,
 			BackendProxyProtocol: proxyProtocol,
+			StaticDC:             input.StaticDC,
+			PreferIPv6:           input.PreferIPv6,
 			CarrierMode:          carrierMode,
 			Capability:           capability,
 			Limits:               profileLimits,

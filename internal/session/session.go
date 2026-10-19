@@ -1499,6 +1499,10 @@ func (s *backendStream) run() {
 	defer close(s.finished)
 	defer s.session.backendClosed(s.id, s)
 
+	if s.session.profile != nil && s.session.profile.BackendType == config.BackendDirect {
+		s.runDirect()
+		return
+	}
 	network := "tcp"
 	target := s.address
 	if s.session.profile != nil {
