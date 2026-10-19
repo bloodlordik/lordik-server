@@ -77,3 +77,15 @@ lordik-server/
    - **Транспорт (`backend`)**: для Telemt поддерживается как TCP-loopback (`127.0.0.1:port`), так и UNIX domain сокеты (`unix:/path/to/telemt.sock` или `unix:///path/to/telemt.sock`), что устраняет накладные расходы TCP-стека и повышает изоляцию.
    - **Передача реального IP клиента (`backend_proxy_protocol`)**: `"none"` (по умолчанию), `"v1"` (текстовый) или `"v2"` (бинарный HAProxy PROXY protocol). При создании логического потока в Telemt автоматически отправляется PROXY-заголовок с реальным IP клиента (`clientIP`, полученным из `X-Forwarded-For`), что позволяет Telemt осуществлять точную привязку к DC Telegram и сбор метрик.
    - **Защита от некорректной конфигурации**: официальный MTProxy не поддерживает PROXY protocol и UNIX-сокеты; при попытке указать их для `mtproxy` конфигуратор возвращает явную ошибку валидации.
+6. **Модульная фабрика и HTML-шаблоны Bridge-страниц**:
+   - **Компоненты**: `internal/bridge/page.go`, `internal/bridge/factory.go`, `internal/bridge/templates/`.
+   - **Суть изменения**: Ранее runtime bridge-страницы находился в единственной монолитной переменной `document` в Go-коде `page.go`. Он вынесен в отдельные файлы шаблонов в директории `internal/bridge/templates/`, встроенные в бинарник через `embed.FS`:
+     - `bridge.html`: универсальный полнофункциональный шаблон для обратной совместимости.
+     - `https.html`: оптимизированный шаблон для HTTP-поллинга без WebSocket.
+     - `https_lanes.html`: шаблон для HTTP с мультиплексированием по логическим линиям (lanes).
+     - `websocket.html`: оптимизированный шаблон для единого WebSocket-соединения.
+     - `websocket_lanes.html`: шаблон для индивидуальных WebSocket-соединений на каждую логическую линию.
+   - **Архитектура фабрики (`Factory`)**:
+     - Реализован компонент `Factory` с методом `Render(Options)` и иерархическим разрешением шаблонов: сначала проверяется наличие платформо-специфичного шаблона для режима (`platform_carrierMode.html`), затем платформенного (`platform.html`), затем carrier-режима (`carrierMode.html`), с откатом к `bridge.html`.
+     - Поддерживается динамическая регистрация и переопределение шаблонов (`RegisterTemplate`).
+     - Сохранена полная обратная совместимость: функция `bridge.Render(hostname, basePath, bootstrapToken, carrierMode, batchBytes)` работает прозрачно через синглтон `DefaultFactory()`. Добавлена функция `bridge.RenderWithOptions(opts)` для расширенной генерации.

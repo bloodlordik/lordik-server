@@ -126,13 +126,20 @@ func TestRenderRejectsInvalidBatch(t *testing.T) {
 }
 
 func TestRenderIncludesSelectableCarrierImplementations(t *testing.T) {
+	// Test that universal bridge.html template contains all carrier implementations.
 	for _, mode := range []string{
 		"https",
 		"https-lanes",
 		"websocket",
 		"websocket-lanes",
 	} {
-		page, err := Render("proxy.example.com", "", "bootstrap-token", mode, 2*1024*1024)
+		page, err := DefaultFactory().RenderTemplate("bridge.html", Options{
+			Hostname:       "proxy.example.com",
+			BasePath:       "",
+			BootstrapToken: "bootstrap-token",
+			CarrierMode:    mode,
+			BatchBytes:     2 * 1024 * 1024,
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -153,6 +160,47 @@ func TestRenderIncludesSelectableCarrierImplementations(t *testing.T) {
 		} {
 			if !strings.Contains(body, implementation) {
 				t.Fatalf("rendered %s bridge omitted %q", mode, implementation)
+			}
+		}
+	}
+
+	// Test that each carrier-specific page contains its required implementation.
+	carrierChecks := map[string][]string{
+		"https": {
+			"function queueUp(data)",
+			"async function runUp()",
+			"async function poll()",
+		},
+		"https-lanes": {
+			"async function runLaneUp(lane)",
+			"async function pollLane(lane)",
+			"function queueLane(value)",
+		},
+		"websocket": {
+			"function openWebSocket()",
+			"function runWebSocketUp()",
+			"function queueWebSocket(data)",
+		},
+		"websocket-lanes": {
+			"function openWebSocketLane(lane)",
+			"function runWebSocketLaneUp(lane)",
+			"function finishWebSocketLane(lane,notify)",
+			"finishWebSocketLane(lane,!lane.localClosed&&!lane.remoteClosed)",
+			"new WebSocket(target,'tproxy-lane-v1.'+sessionToken+'.'+lane.id)",
+		},
+	}
+	for mode, checks := range carrierChecks {
+		page, err := Render("proxy.example.com", "", "bootstrap-token", mode, 2*1024*1024)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := string(page.Body)
+		if !strings.Contains(body, `carrierMode="`+mode+`"`) {
+			t.Fatalf("rendered bridge omitted carrier mode %q", mode)
+		}
+		for _, impl := range checks {
+			if !strings.Contains(body, impl) {
+				t.Fatalf("rendered %s carrier bridge omitted %q", mode, impl)
 			}
 		}
 	}
