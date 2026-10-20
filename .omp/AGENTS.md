@@ -138,3 +138,12 @@ lordik-server/
       - Упаковывает бинарник `tproxy-server` вместе с примерами конфигураций `config.example.json`, `profiles.example.json` и документацией `README.md` в архив `.tar.gz`.
       - Автоматически рассчитывает контрольную сумму SHA-256 (`.tar.gz.sha256`).
       - Публикует официальный GitHub Release через `softprops/action-gh-release@v2` с автогенерацией release notes и прикреплением архива и контрольной суммы.
+11. **Схема развертывания tproxy-server с Nginx и Telemt**:
+    - **Компоненты**: `tproxy-server`, `Nginx`, `Telemt`.
+    - **Архитектурная связка**:
+      - Внешний трафик по портам 80/443 принимает `Nginx`.
+      - `Nginx` для домена проксирует все запросы на HTTP-порт `tproxy-server` (например, `127.0.0.1:18081`).
+      - Неавторизованные запросы (без capability-токена или валидного заголовка сессии) `tproxy-server` бесшовно перенаправляет на `public_upstream` (например, `http://127.0.0.1:18080`, где крутится decoy-сайт `Telemt` или внешний сайт).
+      - При наличии capability-токена `tproxy-server` отдает защищенную bridge-страницу для Telegram WebView (`carrier_mode: "https"`).
+      - Потоки данных MTProxy транслируются в локальный listener `Telemt` с `transport = "mtproxy"` (например, `127.0.0.1:9090`).
+      - **Режимы секретов Telemt (`[general.modes]`)**: при подключении через `tproxy-server` со стандартным 16-байтным MTProto-секретом (без префикса `dd`) в `telemt` обязательно должен быть разрешен классический режим (`classic = true`). При `classic = false` Telemt отклоняет рукопожатие клиента на стадии дешифрования фреймов.
