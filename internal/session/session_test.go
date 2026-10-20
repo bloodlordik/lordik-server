@@ -786,6 +786,7 @@ func TestGlobalBootstrapPoolEvictsOldestUnusedEntry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	time.Sleep(2 * time.Millisecond)
 	if _, err := manager.IssueBootstrap(profile, "198.51.100.13"); err != nil {
 		t.Fatal(err)
 	}

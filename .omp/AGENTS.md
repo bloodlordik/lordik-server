@@ -9,7 +9,7 @@ Telegram-клиент сохраняет стандартное обрамлен
 Внешний входящий трафик маскируется под обычный веб-сайт (через reverse proxy Caddy или Nginx). Доступ к bridge-странице осуществляется через capability-токен, вычисляемый из секрета MTProxy и имени хоста.
 
 ### Стек технологий
-- **Язык**: Go (1.20+)
+- **Язык**: Go (1.21+) — пакет `log/slog` требует версию Go не ниже 1.21
 - **Зависимости**: `github.com/gorilla/websocket`
 - **Фронтенд/Bridge**: HTML/JS встроенный runtime для WebView (`internal/bridge/`)
 - **Инфраструктура/Развертывание**: Caddy / Nginx (обратный прокси/HTTPS), systemd, nftables (firewall), официальный MTProxy
@@ -133,6 +133,7 @@ lordik-server/
     - **Компоненты**: `.github/workflows/release.yml`.
     - **Архитектура**:
       - Workflow запускается по событию `push` тегов с маской `v*.*.*`.
+      - Требует Go 1.21+ (`log/slog`), версия извлекается из `go.mod`.
       - Выполняет чистую статическую кросс-компиляцию бинарника под `linux/amd64` с флагами оптимизации (`CGO_ENABLED=0`, `-trimpath`, `-ldflags="-s -w"`).
       - Упаковывает бинарник `tproxy-server` вместе с примерами конфигураций `config.example.json`, `profiles.example.json` и документацией `README.md` в архив `.tar.gz`.
       - Автоматически рассчитывает контрольную сумму SHA-256 (`.tar.gz.sha256`).
