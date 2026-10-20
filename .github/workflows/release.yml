@@ -1,0 +1,50 @@
+name: Release
+
+'on':
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Release (linux/amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          check-latest: true
+
+      - name: Build binary
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          go build -trimpath -ldflags="-s -w" -o tproxy-server ./cmd/tproxy-server
+
+      - name: Package artifacts
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          ARCHIVE_NAME="tproxy-server-${TAG}-linux-amd64.tar.gz"
+          tar -czvf "${ARCHIVE_NAME}" tproxy-server config.example.json profiles.example.json README.md
+          sha256sum "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256"
+          ls -lh "${ARCHIVE_NAME}" "${ARCHIVE_NAME}.sha256"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            tproxy-server-*-linux-amd64.tar.gz
+            tproxy-server-*-linux-amd64.tar.gz.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

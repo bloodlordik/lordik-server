@@ -1,0 +1,7 @@
+.git
+.github
+.omp
+*.exe
+*.test
+*.out
+site/

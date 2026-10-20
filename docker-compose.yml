@@ -1,0 +1,74 @@
+services:
+  # 1. tproxy-server: Central Telegram Web Proxy relay
+  tproxy-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tproxy-server:latest
+    container_name: tproxy-server
+    restart: unless-stopped
+    # Ports 80 and 443 are bound here and shared with the Caddy reverse-proxy service
+    # via network_mode: "service:tproxy-server".
+    ports:
+      - "80:80"
+      - "443:443"
+      # Admin/metrics endpoint (healthz, readyz, metrics) bound to host loopback
+      - "127.0.0.1:8081:8081"
+    environment:
+      - TPROXY_HOSTNAME=${TPROXY_HOSTNAME:-proxy.example.com}
+    volumes:
+      - ./docker/config.json:/etc/tproxy-server/config.json:ro
+      - ./docker/profiles.json:/etc/tproxy-server/profiles.json:ro
+      # Persistent token key storage
+      - tproxy_data:/etc/tproxy-server
+      # Public website root
+      - ./site:/srv/tproxy-site:ro
+      # Shared UNIX domain socket directory for high-performance Telemt communication
+      - telemt_socket:/run/telemt
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8081/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # 2. Caddy: TLS-terminating front reverse proxy with automated ACME
+  caddy:
+    image: caddy:alpine
+    container_name: tproxy-caddy
+    restart: unless-stopped
+    # Shares network namespace with tproxy-server. Caddy communicates with
+    # tproxy-server on loopback (127.0.0.1:8080), satisfying the peer.IsLoopback security check.
+    network_mode: "service:tproxy-server"
+    depends_on:
+      tproxy-server:
+        condition: service_healthy
+    environment:
+      - TPROXY_HOSTNAME=${TPROXY_HOSTNAME:-proxy.example.com}
+      - ACME_EMAIL=${ACME_EMAIL:-admin@example.com}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+  # 3. Optional Backend: Telemt (Rust MTProxy)
+  # Uncomment to run high-performance Telemt as a container within the same network namespace.
+  # telemt:
+  #   image: raylabpro/telemt:latest
+  #   container_name: tproxy-telemt
+  #   restart: unless-stopped
+  #   network_mode: "service:tproxy-server"
+  #   volumes:
+  #     - ./telemt.toml:/etc/telemt.toml:ro
+  #     - telemt_socket:/run/telemt
+  #   command: ["-c", "/etc/telemt.toml"]
+
+volumes:
+  tproxy_data:
+    name: tproxy_data
+  caddy_data:
+    name: caddy_data
+  caddy_config:
+    name: caddy_config
+  telemt_socket:
+    name: telemt_socket
