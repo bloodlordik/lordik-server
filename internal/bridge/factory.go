@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	"github.com/telegramdesktop/tproxy-server/internal/config"
+	"github.com/telegramdesktop/tproxy-server/internal/logger"
 )
 
 //go:embed templates/*.html
@@ -197,6 +198,8 @@ func (f *Factory) RenderTemplate(templateName string, opts Options) (Page, error
 	if err != nil {
 		return Page{}, err
 	}
+	logger.Debug("rendering bridge template", "template", templateName, "carrier", opts.CarrierMode, "platform", opts.Platform)
+
 
 	nonceBytes := make([]byte, 18)
 	if _, err := rand.Read(nonceBytes); err != nil {

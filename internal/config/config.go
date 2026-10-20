@@ -18,6 +18,7 @@ import (
 	"strings"
 	"runtime"
 	"time"
+	"github.com/telegramdesktop/tproxy-server/internal/logger"
 )
 
 const (
@@ -210,6 +211,32 @@ type Timeouts struct {
 	Idle              Duration `json:"idle"`
 	Shutdown          Duration `json:"shutdown"`
 }
+type LoggingConfig struct {
+	Enabled bool   `json:"enabled"`
+	Level   string `json:"level"`
+	Format  string `json:"format"`
+	Output  string `json:"output"`
+	Dir     string `json:"dir"`
+	Prefix  string `json:"prefix"`
+	MaxDays int    `json:"max_days"`
+}
+func (l LoggingConfig) ToLoggerOptions() logger.Options {
+	prefix := l.Prefix
+	if prefix == "" {
+		prefix = "tproxy"
+	}
+	return logger.Options{
+		Enabled: l.Enabled,
+		Level:   l.Level,
+		Format:  l.Format,
+		Output:  l.Output,
+		Dir:     l.Dir,
+		Prefix:  prefix,
+		MaxDays: l.MaxDays,
+	}
+}
+
+
 
 type Config struct {
 	PublicHostname       string               `json:"public_hostname"`
@@ -228,6 +255,7 @@ type Config struct {
 	EnablePprof          bool                 `json:"enable_pprof"`
 	Limits               Limits               `json:"limits"`
 	Timeouts             Timeouts             `json:"timeouts"`
+	Logging              LoggingConfig        `json:"logging"`
 	Profiles             []Profile            `json:"-"`
 	LegacyTokenDrain     bool                 `json:"-"`
 }
@@ -367,6 +395,15 @@ func Defaults() Config {
 			Idle:              Duration(75 * time.Second),
 			Shutdown:          Duration(15 * time.Second),
 		},
+		Logging: LoggingConfig{
+			Enabled: true,
+			Level:   "info",
+			Format:  "text",
+			Output:  "stdout",
+			Dir:     "logs",
+			Prefix:  "tproxy",
+			MaxDays: 7,
+		},
 	}
 }
 
@@ -392,6 +429,9 @@ func Load(path string, profilesOverride ...string) (Config, error) {
 	}
 	if !filepath.IsAbs(result.TokenKeyFile) {
 		result.TokenKeyFile = filepath.Join(filepath.Dir(path), result.TokenKeyFile)
+	}
+	if result.Logging.Dir != "" && !filepath.IsAbs(result.Logging.Dir) {
+		result.Logging.Dir = filepath.Join(filepath.Dir(path), result.Logging.Dir)
 	}
 	if len(profilesOverride) > 1 {
 		return Config{}, errors.New("only one profiles override is allowed")
@@ -503,6 +543,23 @@ func (c Config) validate() error {
 	for _, value := range durations {
 		if value <= 0 {
 			return errors.New("all timeouts must be positive")
+		}
+	}
+	if c.Logging.Enabled {
+		lvl := strings.ToLower(strings.TrimSpace(c.Logging.Level))
+		if lvl != "" && lvl != "debug" && lvl != "info" && lvl != "warn" && lvl != "warning" && lvl != "error" {
+			return fmt.Errorf("invalid logging.level %q: must be debug, info, warn, or error", c.Logging.Level)
+		}
+		fmtStr := strings.ToLower(strings.TrimSpace(c.Logging.Format))
+		if fmtStr != "" && fmtStr != "text" && fmtStr != "json" {
+			return fmt.Errorf("invalid logging.format %q: must be text or json", c.Logging.Format)
+		}
+		out := strings.ToLower(strings.TrimSpace(c.Logging.Output))
+		if out != "" && out != "stdout" && out != "file" && out != "both" {
+			return fmt.Errorf("invalid logging.output %q: must be stdout, file, or both", c.Logging.Output)
+		}
+		if (out == "file" || out == "both") && c.Logging.MaxDays < 0 {
+			return errors.New("logging.max_days must be non-negative")
 		}
 	}
 	return nil

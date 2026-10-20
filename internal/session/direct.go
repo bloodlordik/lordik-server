@@ -15,6 +15,7 @@ import (
 
 	"github.com/telegramdesktop/tproxy-server/internal/config"
 	"github.com/telegramdesktop/tproxy-server/internal/frame"
+	"github.com/telegramdesktop/tproxy-server/internal/logger"
 )
 
 // Known Telegram DC IP addresses (standard port 443).
@@ -294,6 +295,7 @@ func (s *backendStream) runDirect() {
 	}
 	hsRes, err := ParseClientHandshake(firstData[:64], secretBytes)
 	if err != nil {
+		logger.Warn("direct client handshake failed", "stream_id", s.id, "err", err)
 		return
 	}
 
@@ -307,6 +309,7 @@ func (s *backendStream) runDirect() {
 	}
 	targetAddress, err := ResolveTelegramDC(backendStr, staticDCStr, hsRes.DCIdx, preferIPv6, nil)
 	if err != nil {
+		logger.Warn("direct telegram dc resolve failed", "stream_id", s.id, "dc", hsRes.DCIdx, "err", err)
 		return
 	}
 
@@ -315,8 +318,12 @@ func (s *backendStream) runDirect() {
 	connection, err := dialer.DialContext(s.ctx, "tcp", targetAddress)
 	s.session.backendDialFinished(err != nil && s.ctx.Err() == nil)
 	if err != nil {
+		if s.ctx.Err() == nil {
+			logger.Warn("direct telegram dc dial failed", "stream_id", s.id, "target", targetAddress, "dc", hsRes.DCIdx, "err", err)
+		}
 		return
 	}
+	logger.Debug("direct telegram dc connected", "stream_id", s.id, "target", targetAddress, "dc", hsRes.DCIdx)
 	s.connMu.Lock()
 	if s.ctx.Err() != nil {
 		s.connMu.Unlock()

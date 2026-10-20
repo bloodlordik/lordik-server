@@ -104,3 +104,16 @@ lordik-server/
      - PROXY protocol не поддерживается протоколом Telegram DC; при попытке указать `backend_proxy_protocol` для `direct` валидатор возвращает явную ошибку.
      - UNIX domain сокеты для `direct` запрещены (только TCP).
    - **Сохранность функционала**: поведение существующих бэкендов `mtproxy` и `telemt` полностью сохранено.
+8. **Система структурированного логирования и ротации (`logger`)**:
+   - **Компоненты**: `internal/logger/logger.go`, `internal/logger/rotator.go`, `internal/config/config.go`, `cmd/tproxy-server/main.go`, `internal/server/server.go`, `internal/session/session.go`, `internal/session/direct.go`, `internal/bridge/factory.go`.
+   - **Архитектура**:
+     - Реализована на базе стандартного пакета Go `log/slog` без сторонних зависимостей.
+     - Поддерживает уровни логирования (`debug`, `info`, `warn`, `error`) и форматы вывода (`text`, `json`).
+     - Поддерживает вывод в `stdout`, `file` или `both` (одновременно в консоль и файл).
+     - Реализован компонент `DailyRotatingWriter` с ежедневной ротацией по дате (`YYYY-MM-DD`) и автоматической очисткой файлов старше `max_days`.
+   - **Конфигурация в `config.json`**:
+     - Секция `logging`: `enabled` (bool), `level` ("debug"|"info"|"warn"|"error"), `format` ("text"|"json"), `output` ("stdout"|"file"|"both"), `dir` (каталог для логов), `prefix` (префикс файлов, по умолчанию "tproxy"), `max_days` (хранение в днях).
+   - **Приватность и безопасность**:
+     - Категорически исключена утечка MTProxy-секретов и capability-токенов в логах.
+     - Точки логирования оперируют именами профилей, числовыми stream_id, IP клиентов и сетевыми статусами без дампа тела секретных рукопожатий и авторизационных заголовков.
+     - Предусмотрен хелпер `logger.MaskToken` для безопасного вывода токенов при необходимости.

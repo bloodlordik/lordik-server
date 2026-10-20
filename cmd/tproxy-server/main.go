@@ -15,6 +15,7 @@ import (
 	"github.com/telegramdesktop/tproxy-server/internal/config"
 	appserver "github.com/telegramdesktop/tproxy-server/internal/server"
 	"github.com/telegramdesktop/tproxy-server/internal/session"
+	"github.com/telegramdesktop/tproxy-server/internal/logger"
 )
 
 func main() {
@@ -27,12 +28,21 @@ func main() {
 	if err != nil {
 		log.Fatalf("configuration error: %v", err)
 	}
+
+	_, logCloser, err := logger.Setup(value.Logging.ToLoggerOptions())
+	if err != nil {
+		log.Fatalf("logger initialization error: %v", err)
+	}
+	defer logCloser.Close()
+
 	value.LegacyTokenDrain = os.Getenv("TPROXY_LEGACY_TOKEN_DRAIN") == "1"
 	if err := session.ValidateBudget(value); err != nil {
+		logger.Error("budget validation failed", "err", err)
 		log.Fatalf("configuration error: %v", err)
 	}
 	application, err := appserver.New(value)
 	if err != nil {
+		logger.Error("server initialization failed", "err", err)
 		log.Fatalf("server initialization error: %v", err)
 	}
 	if *check {
@@ -42,11 +52,13 @@ func main() {
 	}
 	publicListener, err := net.Listen("tcp", value.Listen)
 	if err != nil {
+		logger.Error("public listener failed", "listen", value.Listen, "err", err)
 		log.Fatalf("public listener error: %v", err)
 	}
 	adminListener, err := net.Listen("tcp", value.AdminListen)
 	if err != nil {
 		_ = publicListener.Close()
+		logger.Error("admin listener failed", "admin_listen", value.AdminListen, "err", err)
 		log.Fatalf("admin listener error: %v", err)
 	}
 
@@ -73,16 +85,16 @@ func main() {
 	errors := make(chan error, 2)
 	go func() { errors <- publicHTTP.Serve(publicListener) }()
 	go func() { errors <- adminHTTP.Serve(adminListener) }()
-	log.Printf("event=started public=%s admin=%s profiles=%d legacy_token_drain=%t", value.Listen, value.AdminListen, len(value.Profiles), value.LegacyTokenDrain)
+	logger.Info("server started", "public", value.Listen, "admin", value.AdminListen, "profiles", len(value.Profiles), "legacy_token_drain", value.LegacyTokenDrain)
 
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	select {
 	case signal := <-signals:
-		log.Printf("event=shutdown signal=%s", signal)
+		logger.Info("shutdown requested", "signal", signal.String())
 	case serveErr := <-errors:
 		if serveErr != nil && serveErr != http.ErrServerClosed {
-			log.Printf("event=listener_failed class=http")
+			logger.Error("listener failed", "class", "http", "err", serveErr)
 		}
 	}
 
@@ -91,5 +103,5 @@ func main() {
 	_ = publicHTTP.Shutdown(ctx)
 	_ = adminHTTP.Shutdown(ctx)
 	application.Shutdown()
-	log.Printf("event=stopped")
+	logger.Info("server stopped")
 }

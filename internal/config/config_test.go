@@ -450,3 +450,61 @@ func TestDirectBackendConfiguration(t *testing.T) {
 		t.Fatal("accepted unix socket for direct backend")
 	}
 }
+
+func TestLoggingConfiguration(t *testing.T) {
+	directory := t.TempDir()
+	tokenPath := filepath.Join(directory, "token.key")
+	if err := os.WriteFile(tokenPath, []byte("0123456789abcdef0123456789abcdef"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	profilesPath := filepath.Join(directory, "profiles.json")
+	if err := os.WriteFile(profilesPath, []byte(`{"profiles":[{"name":"default","secret":"000102030405060708090a0b0c0d0e0f","backend":"127.0.0.1:443"}]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	writeMainConfig := func(loggingJSON string) error {
+		cfgJSON := `{
+			"public_hostname": "proxy.example.com",
+			"public_upstream": "http://127.0.0.1:3000",
+			"token_key_file": "` + filepath.ToSlash(tokenPath) + `",
+			"profiles_file": "` + filepath.ToSlash(profilesPath) + `",
+			"logging": ` + loggingJSON + `
+		}`
+		configPath := filepath.Join(directory, "config.json")
+		if err := os.WriteFile(configPath, []byte(cfgJSON), 0600); err != nil {
+			return err
+		}
+		_, err := Load(configPath)
+		return err
+	}
+
+	// Valid logging config
+	validLogging := `{"enabled": true, "level": "debug", "format": "json", "output": "both", "dir": "custom_logs", "max_days": 14}`
+	if err := writeMainConfig(validLogging); err != nil {
+		t.Fatalf("valid logging config rejected: %v", err)
+	}
+
+	// Invalid level
+	invalidLevel := `{"enabled": true, "level": "verbose", "format": "json", "output": "stdout"}`
+	if err := writeMainConfig(invalidLevel); err == nil {
+		t.Fatal("accepted invalid log level")
+	}
+
+	// Invalid format
+	invalidFormat := `{"enabled": true, "level": "info", "format": "xml", "output": "stdout"}`
+	if err := writeMainConfig(invalidFormat); err == nil {
+		t.Fatal("accepted invalid log format")
+	}
+
+	// Invalid output
+	invalidOutput := `{"enabled": true, "level": "info", "format": "text", "output": "syslog"}`
+	if err := writeMainConfig(invalidOutput); err == nil {
+		t.Fatal("accepted invalid log output")
+	}
+
+	// Negative max_days
+	negativeDays := `{"enabled": true, "output": "file", "max_days": -5}`
+	if err := writeMainConfig(negativeDays); err == nil {
+		t.Fatal("accepted negative max_days")
+	}
+}

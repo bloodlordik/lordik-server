@@ -21,6 +21,7 @@ import (
 	"github.com/telegramdesktop/tproxy-server/internal/config"
 	"github.com/telegramdesktop/tproxy-server/internal/frame"
 	"github.com/telegramdesktop/tproxy-server/internal/session"
+	"github.com/telegramdesktop/tproxy-server/internal/logger"
 )
 
 const (
@@ -166,11 +167,13 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) serveBridge(w http.ResponseWriter, r *http.Request, profile *config.Profile) {
 	clientIP, err := s.clientIP(r)
 	if err != nil {
+		logger.Debug("bridge request rejected: invalid client IP", "err", err)
 		s.serveNotFound(w, r)
 		return
 	}
 	token, err := s.manager.IssueBootstrap(profile, clientIP)
 	if err != nil {
+		logger.Warn("bridge bootstrap issuance failed", "client_ip", clientIP, "profile", profile.Name, "err", err)
 		s.serveNotFound(w, r)
 		return
 	}
@@ -181,9 +184,11 @@ func (s *Server) serveBridge(w http.ResponseWriter, r *http.Request, profile *co
 		string(profile.CarrierMode.WithDefault()),
 		s.config.Limits.CarrierBatchBytes)
 	if err != nil {
+		logger.Error("bridge render failed", "client_ip", clientIP, "profile", profile.Name, "err", err)
 		s.serveNotFound(w, r)
 		return
 	}
+	logger.Debug("bridge page served", "client_ip", clientIP, "profile", profile.Name, "carrier", profile.CarrierMode)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Content-Security-Policy", page.CSP)
 	w.Header().Set("Cache-Control", "no-store")
@@ -242,10 +247,11 @@ func (s *Server) serveSession(
 			return
 		}
 		if err := s.manager.CloseToken(token); err != nil {
+			logger.Debug("session delete failed", "err", err)
 			s.serveNotFound(w, r)
 			return
 		}
-		w.Header().Set("Cache-Control", "no-store")
+		logger.Info("session closed via delete request")
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -265,15 +271,17 @@ func (s *Server) serveSession(
 	result, err := s.manager.Create(token, clientIP, body)
 	if err != nil {
 		if errors.Is(err, session.ErrLimit) {
+			logger.Warn("session create limit reached", "client_ip", clientIP)
 			w.Header().Set("Cache-Control", "no-store")
 			w.Header().Set("Retry-After", "1")
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
+		logger.Warn("session create failed", "client_ip", clientIP, "err", err)
 		s.serveNotFound(w, r)
 		return
 	}
-	w.Header().Set("Content-Type", "application/octet-stream")
+	logger.Info("session created", "client_ip", clientIP, "carrier", result.Session.CarrierMode())
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Session-Token", result.Token)
 	w.Header().Set("X-Carrier-Mode", string(result.Session.CarrierMode()))
@@ -459,6 +467,7 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	connection, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		logger.Warn("websocket upgrade failed", "err", err)
 		if lanes {
 			value.ReleaseWebSocketLane(laneID)
 		} else {
@@ -466,6 +475,7 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	logger.Info("websocket session connected", "carrier", value.CarrierMode(), "lanes", lanes)
 	if lanes {
 		defer value.ReleaseWebSocketLane(laneID)
 	} else {
@@ -640,6 +650,7 @@ func (s *Server) clientIP(r *http.Request) (string, error) {
 // stripped prefix would expose the whole site a second time under it, which is a
 // far louder signature than the 404 it would replace.
 func (s *Server) servePublic(w http.ResponseWriter, r *http.Request) {
+	logger.Debug("serving public site", "method", r.Method, "host", r.Host, "path", r.URL.Path)
 	if s.publicUpstream != nil {
 		s.publicUpstream.ServeHTTP(w, r)
 		return

@@ -10,6 +10,15 @@
   "static_routes": "exact",
   "profiles_file": "/run/credentials/tproxy-server.service/profiles.json",
   "enable_pprof": false,
+  "logging": {
+    "enabled": true,
+    "level": "info",
+    "format": "text",
+    "output": "stdout",
+    "dir": "logs",
+    "prefix": "tproxy",
+    "max_days": 7
+  },
   "limits": {
     "max_header_bytes": 16384,
     "max_body_bytes": 2097152,

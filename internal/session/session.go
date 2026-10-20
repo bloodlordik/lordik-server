@@ -14,6 +14,7 @@ import (
 	"time"
 	"github.com/telegramdesktop/tproxy-server/internal/config"
 	"github.com/telegramdesktop/tproxy-server/internal/frame"
+	"github.com/telegramdesktop/tproxy-server/internal/logger"
 )
 
 const (
@@ -1522,8 +1523,12 @@ func (s *backendStream) run() {
 	connection, err := dialer.DialContext(s.ctx, network, target)
 	s.session.backendDialFinished(err != nil && s.ctx.Err() == nil)
 	if err != nil {
+		if s.ctx.Err() == nil {
+			logger.Warn("backend dial failed", "network", network, "target", target, "stream_id", s.id, "err", err)
+		}
 		return
 	}
+	logger.Debug("backend connected", "network", network, "target", target, "stream_id", s.id)
 	s.connMu.Lock()
 	if s.ctx.Err() != nil {
 		s.connMu.Unlock()
@@ -1532,7 +1537,6 @@ func (s *backendStream) run() {
 	}
 	s.conn = connection
 	s.connMu.Unlock()
-
 	if s.session.profile != nil && s.session.profile.BackendProxyProtocol != config.BackendProxyNone {
 		header := buildProxyHeader(s.session.profile.BackendProxyProtocol, s.session.clientIP, s.address)
 		if len(header) > 0 {
