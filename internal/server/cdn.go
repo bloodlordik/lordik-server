@@ -1,0 +1,409 @@
+package server
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/telegramdesktop/tproxy-server/internal/session"
+)
+
+const buildIDChars = "abcdefghijklmnopqrstuvwxyz0123456789"
+
+func generateBuildID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return "k9x2m4p1"
+	}
+	for i := range b {
+		b[i] = buildIDChars[int(b[i])%len(buildIDChars)]
+	}
+	return string(b)
+}
+
+func parseCursorFromRequest(r *http.Request) uint64 {
+	if reqID := r.Header.Get("X-Request-ID"); reqID != "" {
+		parts := strings.Split(reqID, ".")
+		if len(parts) >= 2 {
+			if c, err := strconv.ParseUint(parts[1], 10, 64); err == nil {
+				return c
+			}
+		}
+	}
+	if curStr := r.Header.Get("X-Down-Cursor"); curStr != "" {
+		if c, err := strconv.ParseUint(curStr, 10, 64); err == nil {
+			return c
+		}
+	}
+	return 0
+}
+
+func (s *Server) resolveSession(r *http.Request, sessionShortID string) *session.Session {
+	if key := r.Header.Get("X-Client-Key"); key != "" {
+		if sess, err := s.manager.Get(key); err == nil && sess != nil {
+			return sess
+		}
+	}
+	if tok, ok := bearerToken(r.Header.Get("Authorization")); ok {
+		if sess, err := s.manager.Get(tok); err == nil && sess != nil {
+			return sess
+		}
+	}
+	if k := r.URL.Query().Get("k"); k != "" {
+		if sess, err := s.manager.Get(k); err == nil && sess != nil {
+			return sess
+		}
+	}
+	if sessionShortID != "" {
+		if sess, err := s.manager.GetByShortID(sessionShortID); err == nil && sess != nil {
+			return sess
+		}
+	}
+	return nil
+}
+
+func (s *Server) serveCDN(w http.ResponseWriter, r *http.Request, suffix string) {
+	// Anti-probing: client IP must be resolvable
+	if _, err := s.clientIP(r); err != nil {
+		s.servePublic(w, r)
+		return
+	}
+
+	parts := strings.Split(suffix, "/")
+
+	// Route 1: POST _next/data/{build_id}/collect.json?k={prefix}
+	// [0]: "_next", [1]: "data", [2]: build_id, [3]: "collect.json"
+	if len(parts) == 4 && parts[0] == "_next" && parts[1] == "data" && parts[3] == "collect.json" {
+		if r.Method != http.MethodPost {
+			s.servePublic(w, r)
+			return
+		}
+		s.serveCDNCollect(w, r)
+		return
+	}
+
+	// Route 2: GET _next/data/{build_id}/init/{bootstrap_token}/{hello_b64}.json
+	// [0]: "_next", [1]: "data", [2]: build_id, [3]: "init", [4]: bootstrap_token, [5]: hello_b64.json
+	if len(parts) == 6 && parts[0] == "_next" && parts[1] == "data" && parts[3] == "init" {
+		if r.Method != http.MethodGet {
+			s.servePublic(w, r)
+			return
+		}
+		s.serveCDNInit(w, r, parts[4], strings.TrimSuffix(parts[5], ".json"))
+		return
+	}
+
+	// Route 3: GET assets/chunks/{session_short_id}/{seq}_{url_payload_b64}.bin
+	// [0]: "assets", [1]: "chunks", [2]: session_short_id, [3]: {seq}_{url_payload_b64}.bin
+	if len(parts) == 4 && parts[0] == "assets" && parts[1] == "chunks" {
+		if r.Method != http.MethodGet {
+			s.servePublic(w, r)
+			return
+		}
+		s.serveCDNChunkGet(w, r, parts[2], parts[3])
+		return
+	}
+
+	// Route 4: POST _next/data/{build_id}/sync/{session_short_id}/{seq}.bin
+	// [0]: "_next", [1]: "data", [2]: build_id, [3]: "sync", [4]: session_short_id, [5]: seq.bin
+	if len(parts) == 6 && parts[0] == "_next" && parts[1] == "data" && parts[3] == "sync" {
+		if r.Method != http.MethodPost {
+			s.servePublic(w, r)
+			return
+		}
+		s.serveCDNSyncPost(w, r, parts[4], strings.TrimSuffix(parts[5], ".bin"))
+		return
+	}
+
+	// Route 5: GET assets/media/{session_short_id}/seg_{cursor}_{rand}.m4s
+	// [0]: "assets", [1]: "media", [2]: session_short_id, [3]: seg_{cursor}_{rand}.m4s
+	if len(parts) == 4 && parts[0] == "assets" && parts[1] == "media" {
+		if r.Method != http.MethodGet {
+			s.servePublic(w, r)
+			return
+		}
+		s.serveCDNMediaPoll(w, r, parts[2], parts[3])
+		return
+	}
+
+	// Route 6: GET _next/data/{build_id}/unload/{session_short_id}.json
+	// [0]: "_next", [1]: "data", [2]: build_id, [3]: "unload", [4]: session_short_id.json
+	if len(parts) == 5 && parts[0] == "_next" && parts[1] == "data" && parts[3] == "unload" {
+		if r.Method != http.MethodGet {
+			s.servePublic(w, r)
+			return
+		}
+		s.serveCDNUnload(w, r, strings.TrimSuffix(parts[4], ".json"))
+		return
+	}
+
+	// Fallback to public site for unrecognized endpoints
+	s.servePublic(w, r)
+}
+
+func (s *Server) serveCDNCollect(w http.ResponseWriter, r *http.Request) {
+	token := r.Header.Get("X-Client-Key")
+	if token == "" {
+		token = r.URL.Query().Get("k")
+	}
+	if token == "" || !s.manager.HasBootstrap(token) {
+		s.servePublic(w, r)
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxCreateBodyBytes+1))
+	if err != nil || len(body) > maxCreateBodyBytes {
+		s.servePublic(w, r)
+		return
+	}
+	clientIP, err := s.clientIP(r)
+	if err != nil {
+		s.servePublic(w, r)
+		return
+	}
+	res, err := s.manager.Create(token, clientIP, body)
+	if err != nil {
+		s.servePublic(w, r)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("X-Session-Token", res.Token)
+	w.Header().Set("X-Carrier-Mode", "cdn-body")
+	w.Header().Set("X-Down-Cursor", "0")
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Content-Length", strconv.Itoa(len(res.Welcome)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(res.Welcome)
+}
+
+func (s *Server) serveCDNInit(w http.ResponseWriter, r *http.Request, bootstrapToken, helloFile string) {
+	if !s.manager.HasBootstrap(bootstrapToken) {
+		s.servePublic(w, r)
+		return
+	}
+
+	helloBytes, err := base64.RawURLEncoding.DecodeString(helloFile)
+	if err != nil {
+		if pad := len(helloFile) % 4; pad != 0 {
+			helloBytes, err = base64.URLEncoding.DecodeString(helloFile + strings.Repeat("=", 4-pad))
+		}
+	}
+	if err != nil || len(helloBytes) > maxCreateBodyBytes {
+		s.servePublic(w, r)
+		return
+	}
+
+	clientIP, err := s.clientIP(r)
+	if err != nil {
+		s.servePublic(w, r)
+		return
+	}
+	res, err := s.manager.Create(bootstrapToken, clientIP, helloBytes)
+	if err != nil {
+		s.servePublic(w, r)
+		return
+	}
+
+	shortID := res.Token
+	if len(res.Token) >= 12 {
+		shortID = res.Token[:12]
+	}
+	welcomeB64 := base64.RawURLEncoding.EncodeToString(res.Welcome)
+	resp := map[string]string{
+		"token":    res.Token,
+		"short_id": shortID,
+		"welcome":  welcomeB64,
+		"mode":     "cdn-get",
+	}
+	respJSON, _ := json.Marshal(resp)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Content-Length", strconv.Itoa(len(respJSON)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(respJSON)
+}
+
+func (s *Server) serveCDNChunkGet(w http.ResponseWriter, r *http.Request, sessionShortID, file string) {
+	cleanFile := strings.TrimSuffix(file, ".bin")
+	idx := strings.Index(cleanFile, "_")
+	if idx <= 0 {
+		s.servePublic(w, r)
+		return
+	}
+	seqStr := cleanFile[:idx]
+	urlPayloadB64 := cleanFile[idx+1:]
+	seq, err := strconv.ParseUint(seqStr, 10, 64)
+	if err != nil {
+		s.servePublic(w, r)
+		return
+	}
+
+	var headerParts []string
+	for i := 0; i < 8; i++ {
+		val := r.Header.Get(fmt.Sprintf("X-Client-Data-%d", i))
+		if val != "" {
+			headerParts = append(headerParts, val)
+		}
+	}
+
+	chunk, err := session.DecodeCDNPayload(urlPayloadB64, headerParts)
+	if err != nil {
+		s.servePublic(w, r)
+		return
+	}
+
+	sess := s.resolveSession(r, sessionShortID)
+	if sess == nil {
+		s.servePublic(w, r)
+		return
+	}
+
+	_, err = sess.ProcessUpCDN(seq, chunk)
+	if err != nil {
+		s.handleCDNSessionError(w, r, err)
+		return
+	}
+
+	cursor := parseCursorFromRequest(r)
+	downBytes, nextCursor, err := sess.PiggybackDown(cursor)
+	if err != nil {
+		s.handleCDNSessionError(w, r, err)
+		return
+	}
+
+	s.writeCDNDownlinkResponse(w, downBytes, nextCursor)
+}
+
+func (s *Server) serveCDNSyncPost(w http.ResponseWriter, r *http.Request, sessionShortID, seqStr string) {
+	seq, err := strconv.ParseUint(seqStr, 10, 64)
+	if err != nil {
+		s.servePublic(w, r)
+		return
+	}
+
+	sess := s.resolveSession(r, sessionShortID)
+	if sess == nil {
+		s.servePublic(w, r)
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, int64(s.config.Limits.MaxBodyBytes+1)))
+	if err != nil || len(body) > s.config.Limits.MaxBodyBytes {
+		s.servePublic(w, r)
+		return
+	}
+
+	_, err = sess.ProcessUpCDN(seq, body)
+	if err != nil {
+		s.handleCDNSessionError(w, r, err)
+		return
+	}
+
+	cursor := parseCursorFromRequest(r)
+	downBytes, nextCursor, err := sess.PiggybackDown(cursor)
+	if err != nil {
+		s.handleCDNSessionError(w, r, err)
+		return
+	}
+
+	s.writeCDNDownlinkResponse(w, downBytes, nextCursor)
+}
+
+func (s *Server) serveCDNMediaPoll(w http.ResponseWriter, r *http.Request, sessionShortID, file string) {
+	cleanFile := strings.TrimSuffix(file, ".m4s")
+	if !strings.HasPrefix(cleanFile, "seg_") {
+		s.servePublic(w, r)
+		return
+	}
+	parts := strings.Split(strings.TrimPrefix(cleanFile, "seg_"), "_")
+	if len(parts) == 0 {
+		s.servePublic(w, r)
+		return
+	}
+	cursor, err := strconv.ParseUint(parts[0], 10, 64)
+	if err != nil {
+		s.servePublic(w, r)
+		return
+	}
+
+	sess := s.resolveSession(r, sessionShortID)
+	if sess == nil {
+		s.servePublic(w, r)
+		return
+	}
+
+	pollTimeout := time.Duration(s.config.Limits.CDNPollTimeoutSecs) * time.Second
+	if pollTimeout <= 0 {
+		pollTimeout = 12 * time.Second
+	}
+
+	batch, nextCursor, err := sess.PollCDN(r.Context(), cursor, pollTimeout)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
+		s.handleCDNSessionError(w, r, err)
+		return
+	}
+
+	s.writeCDNDownlinkResponse(w, batch, nextCursor)
+}
+
+func (s *Server) serveCDNUnload(w http.ResponseWriter, r *http.Request, sessionShortID string) {
+	if key := r.Header.Get("X-Client-Key"); key != "" {
+		_ = s.manager.CloseToken(key)
+	}
+	if sess, err := s.manager.GetByShortID(sessionShortID); err == nil && sess != nil {
+		sess.Close()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("{\"s\":1}"))
+}
+
+func (s *Server) writeCDNDownlinkResponse(w http.ResponseWriter, batch []byte, cursor uint64) {
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	if len(batch) > 0 {
+		gltf := session.WrapGLTF(batch, cursor)
+		sum := sha256.Sum256(batch)
+		etag := fmt.Sprintf("\"%x-%d\"", sum[:8], cursor)
+		w.Header().Set("Content-Type", "model/gltf-binary")
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Content-Length", strconv.Itoa(len(gltf)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(gltf)
+		return
+	}
+	resp := fmt.Sprintf("{\"s\":1,\"c\":%d}", cursor)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(resp)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, resp)
+}
+
+func (s *Server) handleCDNSessionError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, session.ErrBackpressure) || errors.Is(err, session.ErrConcurrent) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	s.servePublic(w, r)
+}

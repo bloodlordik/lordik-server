@@ -178,6 +178,11 @@ func TestProfileCarrierModeDefaultsAndValidation(t *testing.T) {
 		CarrierHTTPSLanes,
 		CarrierWebSocket,
 		CarrierWebSocketLanes,
+		CarrierCDN,
+		CarrierCDNAdaptive,
+		CarrierCDNGet,
+		CarrierCDNBody,
+		CarrierCDNWS,
 	} {
 		writeProfiles(`,"carrier_mode":"` + string(carrier) + `"`)
 		loaded, err := Load(configPath)

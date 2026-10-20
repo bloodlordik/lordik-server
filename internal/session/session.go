@@ -134,6 +134,7 @@ type Session struct {
 	budgetNotify          chan struct{}
 	done                  chan struct{}
 	carrierLanes          map[uint32]*carrierLane
+	cdnReassembly         *ReassemblyBuffer
 	finishOnce            sync.Once
 	backendWG             sync.WaitGroup
 	onFinished            func(*Session)
@@ -172,6 +173,13 @@ func newSession(options sessionOptions) *Session {
 	}
 	if carrier == config.CarrierHTTPSLanes {
 		result.carrierLanes[0] = newCarrierLane()
+	}
+	if carrier.IsCDN() {
+		windowSize := uint64(options.limits.CDNUplinkWindowSize)
+		if windowSize == 0 {
+			windowSize = 16
+		}
+		result.cdnReassembly = NewReassemblyBuffer(windowSize, options.limits.MaxFramePayload)
 	}
 	return result
 }
@@ -690,6 +698,267 @@ func (s *Session) PollLane(ctx context.Context, laneID uint32, cursor uint64) ([
 		}
 	}
 }
+// ProcessUpCDN processes a numbered uplink chunk for CDN carriers using ReassemblyBuffer.
+// Returns readyFramesCount (number of complete frames applied), or an error.
+func (s *Session) ProcessUpCDN(sequence uint64, chunk []byte) (int, error) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return 0, ErrClosed
+	}
+	s.lastActivity = time.Now()
+	if s.cdnReassembly == nil {
+		windowSize := uint64(s.limits.CDNUplinkWindowSize)
+		if windowSize == 0 {
+			windowSize = 16
+		}
+		s.cdnReassembly = NewReassemblyBuffer(windowSize, s.limits.MaxFramePayload)
+	}
+	frames, duplicate, err := s.cdnReassembly.Push(sequence, chunk)
+	if err != nil {
+		s.mu.Unlock()
+		s.protocolFailure()
+		return 0, err
+	}
+	if duplicate {
+		s.mu.Unlock()
+		return 0, nil
+	}
+	if len(frames) == 0 {
+		s.mu.Unlock()
+		return 0, nil
+	}
+
+	if !s.validateBatchLocked(frames) {
+		s.mu.Unlock()
+		s.protocolFailure()
+		return 0, ErrProtocol
+	}
+	reservedCost, reservedItems := s.backendWriteReservationLocked(frames)
+	if (reservedCost != 0 || reservedItems != 0) &&
+		!s.reservePendingLocked(reservedCost, reservedItems, pendingUplink) {
+		s.mu.Unlock()
+		return 0, ErrBackpressure
+	}
+	opened, closed, unusedCost, unusedItems, applied := s.applyBatchLocked(
+		frames,
+		reservedCost,
+		reservedItems)
+	if unusedCost != 0 || unusedItems != 0 {
+		s.releasePendingLocked(unusedCost, unusedItems)
+	}
+	s.backendWG.Add(len(opened))
+	s.mu.Unlock()
+
+	for _, value := range closed {
+		value.close()
+	}
+	for _, value := range opened {
+		go s.runBackend(value)
+	}
+	if !applied {
+		s.Close()
+		return 0, ErrClosed
+	}
+	if s.onUp != nil {
+		s.onUp(len(chunk))
+	}
+	return len(frames), nil
+}
+
+// PiggybackDown attempts a non-blocking harvest of available downlink frames to bundle
+// in an uplink response.
+func (s *Session) PiggybackDown(cursor uint64) ([]byte, uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, cursor, ErrClosed
+	}
+	s.lastActivity = time.Now()
+	if len(s.unacked) != 0 {
+		if cursor == s.unackedBase {
+			return s.unacked, s.downCursor, nil
+		}
+		if cursor != s.downCursor {
+			s.protocolFailure()
+			return nil, cursor, ErrProtocol
+		}
+		s.releasePendingLocked(s.unackedCost, s.unackedItems)
+		s.unacked = nil
+		s.unackedCost = 0
+		s.unackedItems = 0
+	} else if cursor != s.downCursor {
+		s.protocolFailure()
+		return nil, cursor, ErrProtocol
+	}
+
+	if len(s.pendingFrames) == 0 {
+		return nil, s.downCursor, nil
+	}
+
+	maxBatch := s.limits.CDNMaxDownBatchBytes
+	if maxBatch <= 0 {
+		maxBatch = 524288
+	}
+	batch := s.takeDownBatchLimitLocked(maxBatch)
+	s.downCursor++
+	s.unackedBase = cursor
+	s.unacked = batch.body
+	s.unackedCost = batch.cost
+	s.unackedItems = batch.items
+	next := s.downCursor
+	if s.onDown != nil {
+		s.onDown(len(batch.body))
+	}
+	return batch.body, next, nil
+}
+
+// PollCDN waits for downlink frames up to timeout duration for CDN carriers.
+func (s *Session) PollCDN(ctx context.Context, cursor uint64, timeout time.Duration) ([]byte, uint64, error) {
+	if timeout <= 0 {
+		timeout = 12 * time.Second
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, cursor, ErrClosed
+	}
+	s.lastActivity = time.Now()
+	if len(s.unacked) != 0 {
+		if cursor == s.unackedBase {
+			result := s.unacked
+			next := s.downCursor
+			s.mu.Unlock()
+			return result, next, nil
+		}
+		if cursor != s.downCursor {
+			s.mu.Unlock()
+			s.protocolFailure()
+			return nil, cursor, ErrProtocol
+		}
+		s.releasePendingLocked(s.unackedCost, s.unackedItems)
+		s.unacked = nil
+		s.unackedCost = 0
+		s.unackedItems = 0
+	} else if cursor != s.downCursor {
+		s.mu.Unlock()
+		s.protocolFailure()
+		return nil, cursor, ErrProtocol
+	}
+
+	if s.downActive && s.superseded != nil {
+		close(s.superseded)
+	}
+	mine := make(chan struct{})
+	s.superseded = mine
+	s.downActive = true
+
+	maxBatch := s.limits.CDNMaxDownBatchBytes
+	if maxBatch <= 0 {
+		maxBatch = 524288
+	}
+
+	for {
+		if s.superseded != mine {
+			s.mu.Unlock()
+			return nil, cursor, nil
+		}
+		if len(s.pendingFrames) != 0 {
+			batch := s.takeDownBatchLimitLocked(maxBatch)
+			s.downCursor++
+			s.unackedBase = cursor
+			s.unacked = batch.body
+			s.unackedCost = batch.cost
+			s.unackedItems = batch.items
+			s.downActive = false
+			s.superseded = nil
+			next := s.downCursor
+			s.mu.Unlock()
+			if s.onDown != nil {
+				s.onDown(len(batch.body))
+			}
+			return batch.body, next, nil
+		}
+		if s.closed {
+			s.downActive = false
+			s.superseded = nil
+			s.mu.Unlock()
+			return nil, cursor, ErrClosed
+		}
+		s.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			s.mu.Lock()
+			if s.superseded == mine {
+				s.downActive = false
+				s.superseded = nil
+			}
+			s.mu.Unlock()
+			return nil, cursor, ctx.Err()
+		case <-mine:
+			s.mu.Lock()
+			signal(s.notify)
+			s.mu.Unlock()
+			return nil, cursor, nil
+		case <-deadline.C:
+			s.mu.Lock()
+			if s.superseded != mine {
+				signal(s.notify)
+				s.mu.Unlock()
+				return nil, cursor, nil
+			}
+			if len(s.pendingFrames) != 0 {
+				continue
+			}
+			s.downActive = false
+			s.superseded = nil
+			s.lastActivity = time.Now()
+			s.mu.Unlock()
+			return nil, cursor, nil
+		case <-s.notify:
+			s.mu.Lock()
+			if s.superseded != mine {
+				signal(s.notify)
+			}
+		}
+	}
+}
+
+func (s *Session) takeDownBatchLimitLocked(maxBytes int) downBatch {
+	size := 0
+	cost := 0
+	count := 0
+	for count < len(s.pendingFrames) && count < frame.MaxBatchFrames {
+		next := len(s.pendingFrames[count].encoded)
+		if count != 0 && size+next > maxBytes {
+			break
+		}
+		size += next
+		cost += s.pendingFrames[count].cost
+		count++
+	}
+	result := make([]byte, 0, size)
+	for index := 0; index != count; index++ {
+		if s.pendingFrames[index].typeCode == frame.Window &&
+			s.pendingWindows[s.pendingFrames[index].streamID] == index {
+			delete(s.pendingWindows, s.pendingFrames[index].streamID)
+		}
+		result = append(result, s.pendingFrames[index].encoded...)
+		s.pendingFrames[index] = queuedFrame{}
+	}
+	s.pendingFrames = s.pendingFrames[count:]
+	for id, index := range s.pendingWindows {
+		s.pendingWindows[id] = index - count
+	}
+	if len(s.pendingFrames) == 0 {
+		s.pendingFrames = nil
+	}
+	return downBatch{body: result, cost: cost, items: count}
+}
+
 
 func (s *Session) LastActivity() time.Time {
 	s.mu.Lock()

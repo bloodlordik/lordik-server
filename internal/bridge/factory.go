@@ -28,8 +28,8 @@ type Options struct {
 	BatchBytes     int
 	Platform       string // Optional platform: e.g. "android", "ios", "desktop"
 	Template       string // Optional explicit template name override
+	BuildID        string // Optional build ID for CDN routing
 }
-
 // Factory manages bridge page templates and generates Page instances based on carrier mode and platform conditions.
 type Factory struct {
 	mu        sync.RWMutex
@@ -150,6 +150,9 @@ func (f *Factory) ResolveTemplateName(opts Options) string {
 			modeUnder + ".html",
 			modeHyphen + ".html",
 		}
+		if strings.HasPrefix(mode, "cdn") {
+			candidates = append(candidates, "cdn.html")
+		}
 		for _, candidate := range candidates {
 			if f.HasTemplate(candidate) {
 				return candidate
@@ -215,12 +218,18 @@ func (f *Factory) RenderTemplate(templateName string, opts Options) (Page, error
 	body = strings.ReplaceAll(body, "__BOOTSTRAP__", string(tokenJSON))
 	body = strings.ReplaceAll(body, "__CARRIER_MODE__", string(carrierJSON))
 	body = strings.ReplaceAll(body, "__BATCH_LIMIT__", strconv.Itoa(opts.BatchBytes))
+	buildID := opts.BuildID
+	if buildID == "" {
+		buildID = "k9x2m4p1"
+	}
+	body = strings.ReplaceAll(body, "__BUILD_ID__", buildID)
 
 	if strings.Contains(body, "__NONCE__") ||
 		strings.Contains(body, "__RELAY_BASE__") ||
 		strings.Contains(body, "__BOOTSTRAP__") ||
 		strings.Contains(body, "__CARRIER_MODE__") ||
-		strings.Contains(body, "__BATCH_LIMIT__") {
+		strings.Contains(body, "__BATCH_LIMIT__") ||
+		strings.Contains(body, "__BUILD_ID__") {
 		return Page{}, errors.New("bridge template replacement failed")
 	}
 

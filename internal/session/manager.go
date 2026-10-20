@@ -78,6 +78,7 @@ type Manager struct {
 	bootstraps           map[[sha256.Size]byte]*bootstrap
 	bootstrapsPerIP      map[string]int
 	sessions             map[[sha256.Size]byte]*Session
+	shortSessions        map[string]*Session
 	closedTokens         map[[sha256.Size]byte]time.Time
 	sessionsPerIP        map[string]int
 	sessionsPerProfile   map[string]int
@@ -119,6 +120,7 @@ func NewManager(value config.Config, tokenKey [sha256.Size]byte) *Manager {
 		bootstraps:          make(map[[sha256.Size]byte]*bootstrap),
 		bootstrapsPerIP:     make(map[string]int),
 		sessions:            make(map[[sha256.Size]byte]*Session),
+		shortSessions:       make(map[string]*Session),
 		closedTokens:        make(map[[sha256.Size]byte]time.Time),
 		sessionsPerIP:       make(map[string]int),
 		sessionsPerProfile:  make(map[string]int),
@@ -277,6 +279,9 @@ func (m *Manager) Create(token, clientIP string, body []byte) (CreateResult, err
 		onDown: func(count int) { m.bytesDown.Add(uint64(count)) },
 	})
 	m.sessions[sessionHash] = created
+	if len(sessionToken) >= 12 {
+		m.shortSessions[sessionToken[:12]] = created
+	}
 	m.sessionsPerIP[clientIP]++
 	m.sessionsPerProfile[entry.profile.Name]++
 	m.releaseUnusedBootstrapLocked(entry)
@@ -317,6 +322,19 @@ func (m *Manager) Get(token string) (*Session, error) {
 	}
 	return result, nil
 }
+func (m *Manager) GetByShortID(shortID string) (*Session, error) {
+	if shortID == "" {
+		return nil, ErrAuthentication
+	}
+	m.mu.Lock()
+	result := m.shortSessions[shortID]
+	m.mu.Unlock()
+	if result == nil {
+		return nil, ErrAuthentication
+	}
+	return result, nil
+}
+
 
 func (m *Manager) CloseToken(token string) error {
 	hash, err := tokenHash(token)
@@ -390,6 +408,11 @@ func (m *Manager) sessionFinished(value *Session) {
 	for hash, current := range m.sessions {
 		if current == value {
 			delete(m.sessions, hash)
+			for shortID, currentSession := range m.shortSessions {
+				if currentSession == value {
+					delete(m.shortSessions, shortID)
+				}
+			}
 			if len(m.closedTokens) >= m.config.Limits.MaxSessionsGlobal*16 {
 				var oldestHash [sha256.Size]byte
 				var oldest time.Time

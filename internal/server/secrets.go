@@ -53,6 +53,11 @@ func (s *Server) hasInternalSecret(r *http.Request) bool {
 // page sends one: any such token while draining, otherwise a signed one, with
 // or without the filter tag.
 func (scan *secretScan) carrierCredential(r *http.Request, drain bool) bool {
+	for _, val := range r.Header.Values("X-Client-Key") {
+		if drain || scan.signed(val) {
+			return true
+		}
+	}
 	for _, value := range r.Header.Values("Authorization") {
 		if token, ok := bearerToken(value); ok && (drain || scan.signed(token)) {
 			return true

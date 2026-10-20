@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Connection</title>
+</head>
+<body>
+<script nonce="__NONCE__">
+(()=>{
+'use strict';
+const relayBase=__RELAY_BASE__,bootstrap=__BOOTSTRAP__,carrierMode=__CARRIER_MODE__;
+const buildId="__BUILD_ID__";
+const fragment=location.hash,androidNonce=/^#android=([A-Za-z0-9_-]{43})$/.exec(fragment)?.[1]||'';
+history.replaceState(null,'',location.pathname);
+let initialized=false,closed=false,port=null,sessionToken='',shortId='',createStarted=false;
+let queuedBytes=0,queuedItems=0,pollController=null;
+let activeMode='cdn-adaptive'; // cdn-adaptive, cdn-get, cdn-body
+const pending=[],upPending=[];
+const queueLimit=33554432,queueItemLimit=16384,batchLimit=__BATCH_LIMIT__;
+let upSeq=1,downCursor=0,upInflight=0,maxInflight=6;
+let debounceTimer=0;
+
+const status=state=>{if(port&&!closed)port.postMessage({t:'status',state})};
+const pause=ms=>new Promise(res=>setTimeout(res,ms));
+
+function toBase64Url(buf){
+ let binary='';const bytes=new Uint8Array(buf),len=bytes.byteLength;
+ for(let i=0;i<len;i++)binary+=String.fromCharCode(bytes[i]);
+ return btoa(binary).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+
+function fromBase64Url(str){
+ let base64=str.replace(/-/g,'+').replace(/_/g,'/');
+ while(base64.length%4)base64+='=';
+ const binary=atob(base64),len=binary.length,bytes=new Uint8Array(len);
+ for(let i=0;i<len;i++)bytes[i]=binary.charCodeAt(i);
+ return bytes.buffer;
+}
+
+function fail(){
+ status('error');
+ close(true);
+}
+
+function deliver(batchBuf){
+ if(!batchBuf||!batchBuf.byteLength||closed)return;
+ if(port)port.postMessage(batchBuf);
+}
+
+function parseGLTF(buf){
+ if(buf.byteLength<12)return null;
+ const view=new DataView(buf);
+ if(view.getUint8(0)!==0x67||view.getUint8(1)!==0x6c||view.getUint8(2)!==0x54||view.getUint8(3)!==0x46)return null;
+ const ver=view.getUint32(4,true);
+ if(ver!==2)return null;
+ const cur=view.getUint32(8,false);
+ return {cursor:cur,payload:buf.slice(12)};
+}
+
+function processDownlink(resBuf,ct){
+ if(ct&&ct.includes('model/gltf-binary')){
+  const parsed=parseGLTF(resBuf);
+  if(parsed){
+   downCursor=parsed.cursor;
+   deliver(parsed.payload);
+  }
+ }else{
+  try{
+   const dec=new TextDecoder().decode(resBuf);
+   const obj=JSON.parse(dec);
+   if(obj&&typeof obj.c==='number')downCursor=obj.c;
+  }catch(e){}
+ }
+}
+
+async function createSession(helloBuf){
+ status('connecting');
+ const timeoutCtrl=new AbortController();
+ const timer=setTimeout(()=>timeoutCtrl.abort(),1500);
+ let ok=false;
+
+ if(carrierMode!=='cdn-get'){
+  try{
+   const postUrl=relayBase+'_next/data/'+buildId+'/collect.json?k='+encodeURIComponent(bootstrap.slice(0,8));
+   const res=await fetch(postUrl,{
+    method:'POST',
+    body:helloBuf,
+    signal:timeoutCtrl.signal,
+    mode:'same-origin',credentials:'omit',cache:'no-store',
+    headers:{'Content-Type':'application/octet-stream','X-Client-Key':bootstrap}
+   });
+   clearTimeout(timer);
+   if(res.ok){
+    const tok=res.headers.get('X-Session-Token');
+    if(tok){
+     sessionToken=tok;
+     shortId=tok.slice(0,12);
+     activeMode='cdn-body';
+     ok=true;
+    }
+   }
+  }catch(e){}
+ }
+ clearTimeout(timer);
+
+ if(!ok){
+  try{
+   const helloB64=toBase64Url(helloBuf);
+   const getUrl=relayBase+'_next/data/'+buildId+'/init/'+encodeURIComponent(bootstrap)+'/'+helloB64+'.json';
+   const res=await fetch(getUrl,{
+    method:'GET',
+    mode:'same-origin',credentials:'omit',cache:'no-store',
+    headers:{'X-Client-Key':bootstrap}
+   });
+   if(!res.ok)throw new Error('init failed');
+   const json=await res.json();
+   sessionToken=json.token;
+   shortId=json.short_id||json.token.slice(0,12);
+   activeMode='cdn-get';
+   ok=true;
+  }catch(e){
+   fail();
+   return;
+  }
+ }
+
+ status('connected');
+ startPollLoop();
+ scheduleFlush();
+}
+
+function queueCarrier(buf){
+ if(closed)return;
+ upPending.push(buf);
+ scheduleFlush();
+}
+
+function scheduleFlush(){
+ if(debounceTimer||closed||!sessionToken)return;
+ debounceTimer=setTimeout(()=>{
+  debounceTimer=0;
+  flushUplink();
+ },3);
+}
+
+function flushUplink(){
+ if(closed||!sessionToken||!upPending.length||upInflight>=maxInflight)return;
+ let total=0,count=0;
+ while(count<upPending.length&&count<64){
+  if(count>0&&total+upPending[count].byteLength>12288)break;
+  total+=upPending[count].byteLength;
+  count++;
+ }
+ const chunkItems=upPending.splice(0,count);
+ const merged=new Uint8Array(total);
+ let off=0;
+ for(const item of chunkItems){
+  merged.set(new Uint8Array(item),off);
+  off+=item.byteLength;
+ }
+ const seq=upSeq++;
+ upInflight++;
+ sendChunkWithBackoff(seq,merged.buffer,0);
+ if(upPending.length&&upInflight<maxInflight)scheduleFlush();
+}
+
+async function sendChunkWithBackoff(seq,buf,retry){
+ if(closed)return;
+ const cur=downCursor;
+ const reqId=seq+'.'+cur+'.0';
+ let success=false;
+
+ try{
+  if(activeMode==='cdn-body'){
+   const postUrl=relayBase+'_next/data/'+buildId+'/sync/'+shortId+'/'+seq+'.bin';
+   const res=await fetch(postUrl,{
+    method:'POST',
+    body:buf,
+    mode:'same-origin',credentials:'omit',cache:'no-store',
+    headers:{
+     'Content-Type':'application/octet-stream',
+     'X-Client-Key':sessionToken,
+     'X-Request-ID':reqId,
+     'X-Down-Cursor':String(cur)
+    }
+   });
+   if(res.ok){
+    const ct=res.headers.get('Content-Type');
+    const resBuf=await res.arrayBuffer();
+    processDownlink(resBuf,ct);
+    success=true;
+   }else if(res.status===404){
+    fail();return;
+   }
+  }else{
+   const b64=toBase64Url(buf);
+   const urlPart=b64.slice(0,2048);
+   const remaining=b64.slice(2048);
+   const headers={
+    'X-Client-Key':sessionToken,
+    'X-Request-ID':reqId,
+    'X-Down-Cursor':String(cur)
+   };
+   let roff=0,hidx=0;
+   while(roff<remaining.length&&hidx<8){
+    headers['X-Client-Data-'+hidx]=remaining.slice(roff,roff+3584);
+    roff+=3584;hidx++;
+   }
+   const getUrl=relayBase+'assets/chunks/'+shortId+'/'+seq+'_'+urlPart+'.bin';
+   const res=await fetch(getUrl,{
+    method:'GET',
+    mode:'same-origin',credentials:'omit',cache:'no-store',
+    headers
+   });
+   if(res.ok){
+    const ct=res.headers.get('Content-Type');
+    const resBuf=await res.arrayBuffer();
+    processDownlink(resBuf,ct);
+    success=true;
+   }else if(res.status===404){
+    fail();return;
+   }
+  }
+ }catch(e){}
+
+ upInflight--;
+ if(!success){
+  if(retry<5){
+   const delay=Math.min(1000,50*(1<<retry))+(Math.random()*20|0);
+   await pause(delay);
+   upInflight++;
+   sendChunkWithBackoff(seq,buf,retry+1);
+   return;
+  }
+ }
+ if(upPending.length)scheduleFlush();
+}
+
+async function startPollLoop(){
+ while(!closed&&sessionToken){
+  try{
+   pollController=new AbortController();
+   const randHex=(Math.random()*0xffffffff>>>0).toString(16);
+   const pollUrl=relayBase+'assets/media/'+shortId+'/seg_'+downCursor+'_'+randHex+'.m4s';
+   const res=await fetch(pollUrl,{
+    method:'GET',
+    signal:pollController.signal,
+    mode:'same-origin',credentials:'omit',cache:'no-store',
+    headers:{'X-Client-Key':sessionToken}
+   });
+   if(res.ok){
+    const ct=res.headers.get('Content-Type');
+    const resBuf=await res.arrayBuffer();
+    processDownlink(resBuf,ct);
+   }else if(res.status===404){
+    fail();break;
+   }else{
+    await pause(500);
+   }
+  }catch(e){
+   if(closed)break;
+   await pause(500);
+  }
+ }
+}
+
+function close(notifyServer){
+ if(closed)return;
+ closed=true;
+ if(pollController)pollController.abort();
+ if(notifyServer&&sessionToken&&shortId){
+  const unloadUrl=relayBase+'_next/data/'+buildId+'/unload/'+shortId+'.json?t='+Date.now();
+  if(navigator.sendBeacon)navigator.sendBeacon(unloadUrl);
+  else fetch(unloadUrl,{method:'GET',keepalive:true,mode:'same-origin',credentials:'omit'}).catch(()=>{});
+ }
+ if(port)port.close();
+}
+
+function activatePort(nextPort){
+ initialized=true;port=nextPort;
+ port.onmessage=message=>{
+  if(message.data instanceof ArrayBuffer){
+   if(!createStarted){createStarted=true;createSession(message.data)}
+   else queueCarrier(message.data);
+  }else if(message.data&&message.data.t==='close')close(true);
+ };
+ port.start();status('connecting');
+}
+
+addEventListener('message',event=>{
+ if(initialized||event.source!==parent||event.data===null||typeof event.data!=='object')return;
+ const keys=Object.keys(event.data).sort();
+ if(keys.length!==2||keys[0]!=='t'||keys[1]!=='v'||event.data.t!=='tproxy-init'||event.data.v!==1||event.ports.length!==1)return;
+ let source;try{source=new URL(event.origin)}catch(error){return}
+ if(source.protocol!=='http:'||source.hostname!=='127.0.0.1'||!source.port||source.origin!==event.origin)return;
+ activatePort(event.ports[0]);
+},{once:false});
+
+const androidBridge=globalThis.TelegramWebProxy;
+if(!initialized&&androidNonce&&androidBridge&&typeof androidBridge.postMessage==='function'){
+ const androidPort={onmessage:null,start(){},close(){androidBridge.onmessage=null},postMessage(value){
+  if(value instanceof ArrayBuffer){
+   androidBridge.postMessage(value);
+  }else androidBridge.postMessage(JSON.stringify(value));
+ }};
+ androidBridge.onmessage=event=>{
+  let data=event.data;if(typeof data==='string'){try{data=JSON.parse(data)}catch(error){return}}
+  if(androidPort.onmessage)androidPort.onmessage({data});
+ };
+ activatePort(androidPort);androidBridge.postMessage(JSON.stringify({t:'tproxy-android-init',v:1,nonce:androidNonce}));
+}
+
+addEventListener('pagehide',()=>close(true),{once:true});
+})();
+</script>
+</body>
+</html>

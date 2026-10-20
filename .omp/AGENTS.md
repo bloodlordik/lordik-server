@@ -159,3 +159,23 @@ lordik-server/
       - При ошибках доступа (отсутствие прав sudo/root) возвращается понятная ошибка без повреждения работающего сервера.
       - Перед перемещением создается резервная копия (`.tproxy-bak-<pid>`). Если подмена файла срывается, выполняется автоматический откат к оригинальному файлу.
       - Проверка целостности по SHA-256 обязательна перед любыми операциями замены на диске.
+13. **Транспортный режим CDN Adaptive (`cdn`, `cdn-adaptive`, `cdn-get`, `cdn-body`, `cdn-ws`)**:
+    - **Компоненты**: `internal/config/config.go`, `internal/session/cdn.go`, `internal/session/session.go`, `internal/session/manager.go`, `internal/server/cdn.go`, `internal/server/server.go`, `internal/server/secrets.go`, `internal/bridge/factory.go`, `internal/bridge/templates/cdn.html`.
+    - **Архитектура и назначение**:
+      - Новый режим сетевого транспорта поверх жестких облачных CDN (Cloudflare, CloudFront, Gcore, Fastly) и корпоративных L7-прокси.
+      - Мимикрия трафика под SPA-запросы Next.js / Webpack chunks / HLS-сегменты:
+        - `_next/data/{build_id}/collect.json` (POST-рукопожатие).
+        - `_next/data/{build_id}/init/{token}/{hello}.json` (GET-рукопожатие для сред с блокировкой POST).
+        - `assets/chunks/{short_id}/{seq}_{payload}.bin` (GET конвейер uplink с Header Sharding).
+        - `_next/data/{build_id}/sync/{short_id}/{seq}.bin` (POST uplink для CDN с разрешенным POST).
+        - `assets/media/{short_id}/seg_{cursor}_{rand}.m4s` (GET downlink long-poll).
+        - `_next/data/{build_id}/unload/{short_id}.json` (GET-закрытие сессии).
+    - **Сборка потока и буферизация (`ReassemblyBuffer`, `FrameStreamParser`)**:
+      - `ReassemblyBuffer` обеспечивает скользящее окно упорядочивания внеочередных HTTP-запросов (по умолчанию 16), предотвращает дублирование (идемпотентность ретраев) и пресекает переполнение окна (`ErrProtocol`).
+      - `FrameStreamParser` выполняет потоковую склейку байтовых фрагментов в цельные кадры протокола с защитой от переполнения памяти (`maxPayload + HeaderSize`).
+    - **Downlink Piggybacking и MIME-sniffing Resistance (`glTF` 2.0 binary)**:
+      - Исходящие кадры прикрепляются прямо в ответы на Uplink (`PiggybackDown`) без задержек.
+      - Кадры упаковываются с 12-байтовым заголовком `glTF` 2.0 binary (`magic: 0x676C5446`, `version: 2 (LE)`, `cursor: downCursor (BE)`) с `Content-Type: model/gltf-binary`, что предотвращает эвристический MIME-sniffing и L7-инспекцию CDN.
+    - **Защита от активного зондирования (Active Probing Resistance)**:
+      - Любые некорректные или неавторизованные запросы мгновенно перенаправляются на Decoy-сайт (`servePublic`) с кодом 404, исключая утечку серверных заголовков прокси.
+      - Заголовок `X-Client-Key` мгновенно классифицируется в `carrierCredential`, исключая переборные коллизии.

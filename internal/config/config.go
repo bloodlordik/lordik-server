@@ -41,13 +41,31 @@ const (
 	CarrierHTTPSLanes     CarrierMode = "https-lanes"
 	CarrierWebSocket      CarrierMode = "websocket"
 	CarrierWebSocketLanes CarrierMode = "websocket-lanes"
+	CarrierCDN            CarrierMode = "cdn"
+	CarrierCDNAdaptive    CarrierMode = "cdn-adaptive"
+	CarrierCDNGet         CarrierMode = "cdn-get"
+	CarrierCDNBody        CarrierMode = "cdn-body"
+	CarrierCDNWS          CarrierMode = "cdn-ws"
 )
 
 func (m CarrierMode) Valid() bool {
 	return m == CarrierHTTPS ||
 		m == CarrierHTTPSLanes ||
 		m == CarrierWebSocket ||
-		m == CarrierWebSocketLanes
+		m == CarrierWebSocketLanes ||
+		m == CarrierCDN ||
+		m == CarrierCDNAdaptive ||
+		m == CarrierCDNGet ||
+		m == CarrierCDNBody ||
+		m == CarrierCDNWS
+}
+
+func (m CarrierMode) IsCDN() bool {
+	return m == CarrierCDN ||
+		m == CarrierCDNAdaptive ||
+		m == CarrierCDNGet ||
+		m == CarrierCDNBody ||
+		m == CarrierCDNWS
 }
 
 func (m CarrierMode) WithDefault() CarrierMode {
@@ -200,6 +218,9 @@ type Limits struct {
 	NewBootstrapsPerMinute    int `json:"new_bootstraps_per_minute"`
 	NewBootstrapsBurst        int `json:"new_bootstraps_burst"`
 	MaxProfiles               int `json:"max_profiles"`
+	CDNPollTimeoutSecs        int `json:"cdn_poll_timeout_secs"`
+	CDNMaxDownBatchBytes      int `json:"cdn_max_down_batch_bytes"`
+	CDNUplinkWindowSize       int `json:"cdn_uplink_window_size"`
 }
 
 type Timeouts struct {
@@ -286,6 +307,9 @@ type ProfileLimits struct {
 	NewStreamsBurst         int `json:"new_streams_burst"`
 	MaxStreamsPerSession    int `json:"max_streams_per_session"`
 	MaxPendingPerSession    int `json:"max_pending_per_session"`
+	CDNPollTimeoutSecs      int `json:"cdn_poll_timeout_secs"`
+	CDNMaxDownBatchBytes    int `json:"cdn_max_down_batch_bytes"`
+	CDNUplinkWindowSize     int `json:"cdn_uplink_window_size"`
 }
 
 type Profile struct {
@@ -350,6 +374,15 @@ func (limits ProfileLimits) WithDefaults(global Limits) ProfileLimits {
 	if result.MaxPendingPerSession == 0 {
 		result.MaxPendingPerSession = global.MaxPendingPerSession
 	}
+	if result.CDNPollTimeoutSecs == 0 {
+		result.CDNPollTimeoutSecs = global.CDNPollTimeoutSecs
+	}
+	if result.CDNMaxDownBatchBytes == 0 {
+		result.CDNMaxDownBatchBytes = global.CDNMaxDownBatchBytes
+	}
+	if result.CDNUplinkWindowSize == 0 {
+		result.CDNUplinkWindowSize = global.CDNUplinkWindowSize
+	}
 	return result
 }
 
@@ -385,6 +418,9 @@ func Defaults() Config {
 			NewBootstrapsPerMinute:    1200,
 			NewBootstrapsBurst:        256,
 			MaxProfiles:               32,
+			CDNPollTimeoutSecs:        12,
+			CDNMaxDownBatchBytes:      524288,
+			CDNUplinkWindowSize:       16,
 		},
 		Timeouts: Timeouts{
 			BackendDial:       Duration(5 * time.Second),
@@ -506,6 +542,15 @@ func (c Config) validate() error {
 	}
 	if c.Limits.CarrierBatchBytes > MaxCarrierBatchBytes {
 		return errors.New("carrier_batch_bytes must not exceed the 2 MiB desktop loopback message cap")
+	}
+	if c.Limits.CDNPollTimeoutSecs <= 0 {
+		return errors.New("cdn_poll_timeout_secs must be positive")
+	}
+	if c.Limits.CDNMaxDownBatchBytes <= 0 || c.Limits.CDNMaxDownBatchBytes > c.Limits.MaxBodyBytes {
+		return errors.New("cdn_max_down_batch_bytes must be positive and not exceed max_body_bytes")
+	}
+	if c.Limits.CDNUplinkWindowSize <= 0 || c.Limits.CDNUplinkWindowSize > 64 {
+		return errors.New("cdn_uplink_window_size must be between 1 and 64")
 	}
 	values := []int{
 		c.Limits.MaxStreamsPerSession, c.Limits.MaxClosedStreamIDs,
@@ -850,7 +895,7 @@ func loadProfiles(path, host, basePath string, limits Limits, defaultBackendType
 		}
 		carrierMode := input.CarrierMode.WithDefault()
 		if !carrierMode.Valid() {
-			return nil, fmt.Errorf("profile %q carrier_mode must be https, https-lanes, websocket, or websocket-lanes", input.Name)
+			return nil, fmt.Errorf("profile %q carrier_mode must be https, https-lanes, websocket, websocket-lanes, cdn, cdn-adaptive, cdn-get, cdn-body, or cdn-ws", input.Name)
 		}
 		if err := validateProfileLimits(input.Limits, limits); err != nil {
 			return nil, fmt.Errorf("profile %q: %w", input.Name, err)
@@ -905,6 +950,15 @@ func validateProfileLimits(value ProfileLimits, global Limits) error {
 		if check.value < 0 || check.value > check.limit {
 			return fmt.Errorf("%s must be between 0 and %d", check.name, check.limit)
 		}
+	}
+	if value.CDNPollTimeoutSecs < 0 {
+		return errors.New("cdn_poll_timeout_secs must be non-negative")
+	}
+	if value.CDNMaxDownBatchBytes < 0 || value.CDNMaxDownBatchBytes > global.MaxBodyBytes {
+		return fmt.Errorf("cdn_max_down_batch_bytes must be between 0 and %d", global.MaxBodyBytes)
+	}
+	if value.CDNUplinkWindowSize < 0 || value.CDNUplinkWindowSize > 64 {
+		return errors.New("cdn_uplink_window_size must be between 0 and 64")
 	}
 	resolved := value.WithDefaults(global)
 	if resolved.MaxStreamsPerSession > resolved.MaxStreams {

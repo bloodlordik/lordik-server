@@ -48,6 +48,7 @@ type Server struct {
 	publicUpstream   http.Handler
 	publicTransport  *http.Transport
 	bodyReadDeadline time.Duration
+	buildID          string
 }
 
 func New(value config.Config) (*Server, error) {
@@ -103,7 +104,12 @@ func New(value config.Config) (*Server, error) {
 		publicUpstream:   publicUpstream,
 		publicTransport:  publicTransport,
 		bodyReadDeadline: bodyReadDeadline,
+		buildID:          generateBuildID(),
 	}, nil
+}
+
+func (s *Server) BuildID() string {
+	return s.buildID
 }
 
 func (s *Server) Handler() http.Handler {
@@ -154,6 +160,10 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if suffix, ok := s.transportSuffix(r.URL.Path); ok && r.URL.EscapedPath() == r.URL.Path {
+		if strings.HasPrefix(suffix, "_next/data/") || strings.HasPrefix(suffix, "assets/") {
+			s.serveCDN(w, r, suffix)
+			return
+		}
 		s.serveAPI(w, r, suffix)
 		return
 	}
@@ -177,12 +187,14 @@ func (s *Server) serveBridge(w http.ResponseWriter, r *http.Request, profile *co
 		s.serveNotFound(w, r)
 		return
 	}
-	page, err := bridge.Render(
-		s.config.PublicHostname,
-		s.config.BasePath,
-		token,
-		string(profile.CarrierMode.WithDefault()),
-		s.config.Limits.CarrierBatchBytes)
+	page, err := bridge.RenderWithOptions(bridge.Options{
+		Hostname:       s.config.PublicHostname,
+		BasePath:       s.config.BasePath,
+		BootstrapToken: token,
+		CarrierMode:    string(profile.CarrierMode.WithDefault()),
+		BatchBytes:     s.config.Limits.CarrierBatchBytes,
+		BuildID:        s.buildID,
+	})
 	if err != nil {
 		logger.Error("bridge render failed", "client_ip", clientIP, "profile", profile.Name, "err", err)
 		s.serveNotFound(w, r)
@@ -680,8 +692,12 @@ func (s *Server) transportSuffix(requestPath string) (string, bool) {
 	if !strings.HasPrefix(requestPath, s.base) {
 		return "", false
 	}
-	switch suffix := requestPath[len(s.base):]; suffix {
+	suffix := requestPath[len(s.base):]
+	switch suffix {
 	case "api/v1/session", "api/v1/up", "api/v1/down", "api/v1/ws":
+		return suffix, true
+	}
+	if strings.HasPrefix(suffix, "_next/data/") || strings.HasPrefix(suffix, "assets/") {
 		return suffix, true
 	}
 	return "", false
