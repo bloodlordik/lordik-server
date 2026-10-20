@@ -869,6 +869,7 @@ func loadProfiles(path, host, basePath string, limits Limits, defaultBackendType
 		}
 		result = append(result, Profile{
 			Name:                 input.Name,
+			Secret:               input.Secret,
 			Backend:              backendAddress,
 			BackendType:          backendType,
 			BackendProxyProtocol: proxyProtocol,

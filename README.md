@@ -744,6 +744,45 @@ systemctl list-timers refresh-mtproxy-config.timer
 curl --silent http://127.0.0.1:8888/stats
 ```
 
+### CLI management and diagnostics
+
+`tproxy-server` includes diagnostic and management subcommands:
+
+1. **Generate proxy link (`link`)**:
+   ```bash
+   # Generate tg://proxy link using default config.json
+   tproxy-server link
+
+   # Using specific config, host, or link type
+   tproxy-server link -config /etc/tproxy-server/config.json
+   tproxy-server link -host proxy.example.com -port 443 -secret <hex_secret>
+   tproxy-server link -type all # outputs tg://proxy, tg://webproxy, and https links
+   tproxy-server link -h        # display subcommand help
+   ```
+
+2. **View recent logs (`logs`)**:
+   ```bash
+   # View last 50 log lines
+   tproxy-server logs
+
+   # View last N lines from configured log directory or specific file
+   tproxy-server logs -n 100
+   tproxy-server logs -dir /var/log/tproxy -n 25
+   tproxy-server logs -file /var/log/tproxy/tproxy-2026-10-20.log -n 30
+   tproxy-server logs -h
+   ```
+
+3. **Validate configuration (`test` or `-t`)**:
+   ```bash
+   # Validate configuration and profiles without binding ports
+   tproxy-server test
+   tproxy-server test -config /etc/tproxy-server/config.json
+   tproxy-server -t -config /etc/tproxy-server/config.json
+   tproxy-server test -h
+   ```
+
+Running `tproxy-server` without subcommands (or with `-config`) continues to run the relay server as normal.
+
 Go profiling routes are disabled by default. Set `"enable_pprof": true` only for a
 bounded diagnostic window on a host where the loopback admin listener is trusted,
 then disable it and restart the relay.

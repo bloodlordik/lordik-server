@@ -9,19 +9,34 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/telegramdesktop/tproxy-server/internal/config"
 	appserver "github.com/telegramdesktop/tproxy-server/internal/server"
 	"github.com/telegramdesktop/tproxy-server/internal/session"
+	"github.com/telegramdesktop/tproxy-server/internal/cli"
 	"github.com/telegramdesktop/tproxy-server/internal/logger"
 )
 
 func main() {
+	if handled, exitCode := cli.Dispatch(os.Args[1:], os.Stdout, os.Stderr); handled {
+		os.Exit(exitCode)
+	}
+
+	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
+		fmt.Fprintf(os.Stderr, "unknown command %q\nRun 'tproxy-server -h' for usage.\n", os.Args[1])
+		os.Exit(1)
+	}
+
 	configPath := flag.String("config", "config.json", "path to server configuration")
 	profilesPath := flag.String("profiles-file", "", "override profiles file path")
 	check := flag.Bool("check", false, "validate configuration and exit")
+	testFlag := flag.Bool("t", false, "validate configuration and exit (alias for test)")
+	flag.Usage = func() {
+		cli.PrintHelp(os.Stdout)
+	}
 	flag.Parse()
 
 	value, err := config.Load(*configPath, *profilesPath)
@@ -45,11 +60,12 @@ func main() {
 		logger.Error("server initialization failed", "err", err)
 		log.Fatalf("server initialization error: %v", err)
 	}
-	if *check {
+	if *check || *testFlag {
 		application.Shutdown()
 		fmt.Println("configuration is valid")
 		return
 	}
+
 	publicListener, err := net.Listen("tcp", value.Listen)
 	if err != nil {
 		logger.Error("public listener failed", "listen", value.Listen, "err", err)
@@ -57,8 +73,7 @@ func main() {
 	}
 	adminListener, err := net.Listen("tcp", value.AdminListen)
 	if err != nil {
-		_ = publicListener.Close()
-		logger.Error("admin listener failed", "admin_listen", value.AdminListen, "err", err)
+		logger.Error("admin listener failed", "listen", value.AdminListen, "err", err)
 		log.Fatalf("admin listener error: %v", err)
 	}
 
@@ -78,9 +93,9 @@ func main() {
 	}
 	adminHTTP := &http.Server{
 		Handler:           application.AdminHandler(),
-		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       30 * time.Second,
-		MaxHeaderBytes:    4096,
+		ReadHeaderTimeout: value.Timeouts.ReadHeader.Value(),
+		IdleTimeout:       value.Timeouts.Idle.Value(),
+		MaxHeaderBytes:    value.Limits.MaxHeaderBytes,
 	}
 	errors := make(chan error, 2)
 	go func() { errors <- publicHTTP.Serve(publicListener) }()
@@ -90,12 +105,11 @@ func main() {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	select {
-	case signal := <-signals:
-		logger.Info("shutdown requested", "signal", signal.String())
-	case serveErr := <-errors:
-		if serveErr != nil && serveErr != http.ErrServerClosed {
-			logger.Error("listener failed", "class", "http", "err", serveErr)
-		}
+	case err := <-errors:
+		logger.Error("server error", "err", err)
+		log.Fatalf("server error: %v", err)
+	case sig := <-signals:
+		logger.Info("shutting down on signal", "signal", sig.String())
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), value.Timeouts.Shutdown.Value())
