@@ -28,7 +28,7 @@ jobs:
           GOOS: linux
           GOARCH: amd64
         run: |
-          go build -trimpath -ldflags="-s -w" -o tproxy-server ./cmd/tproxy-server
+          go build -trimpath -ldflags="-s -w -X github.com/telegramdesktop/tproxy-server/internal/version.Version=${GITHUB_REF_NAME}" -o tproxy-server ./cmd/tproxy-server
 
       - name: Package artifacts
         run: |

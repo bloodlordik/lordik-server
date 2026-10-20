@@ -16,6 +16,8 @@ func PrintHelp(w io.Writer) {
 	fmt.Fprintln(w, "  link    Generate shareable Telegram proxy links")
 	fmt.Fprintln(w, "  logs    Display recent log entries")
 	fmt.Fprintln(w, "  test    Validate server configuration")
+	fmt.Fprintln(w, "  update  Check for updates and upgrade tproxy-server binary")
+	fmt.Fprintln(w, "  version Show application version and build info")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Flags:")
 	fmt.Fprintln(w, "  -config string")
@@ -24,6 +26,8 @@ func PrintHelp(w io.Writer) {
 	fmt.Fprintln(w, "        override profiles file path")
 	fmt.Fprintln(w, "  -check, -t")
 	fmt.Fprintln(w, "        validate configuration and exit")
+	fmt.Fprintln(w, "  -v, --version")
+	fmt.Fprintln(w, "        print version information and exit")
 	fmt.Fprintln(w, "  -h, --help")
 	fmt.Fprintln(w, "        show this help message")
 	fmt.Fprintln(w)
@@ -48,6 +52,10 @@ func Dispatch(args []string, stdout, stderr io.Writer) (bool, int) {
 		return true, RunTest(args[1:], stdout, stderr)
 	case "-t":
 		return true, RunTest(args[1:], stdout, stderr)
+	case "update":
+		return true, RunUpdate(args[1:], stdout, stderr)
+	case "version", "-v", "--version", "-version":
+		return true, RunVersion(args[1:], stdout, stderr)
 	case "help":
 		PrintHelp(stdout)
 		return true, 0

@@ -780,6 +780,31 @@ curl --silent http://127.0.0.1:8888/stats
    tproxy-server -t -config /etc/tproxy-server/config.json
    tproxy-server test -h
    ```
+4. **Show version information (`version` or `-v`)**:
+   ```bash
+   # Display version and build information
+   tproxy-server version
+   tproxy-server -v
+   tproxy-server --version
+
+   # Print only the version tag
+   tproxy-server version -short
+   ```
+
+5. **Self-update from GitHub Releases (`update`)**:
+   ```bash
+   # Check if a new version is available without updating
+   tproxy-server update -check
+
+   # Upgrade to the latest release
+   tproxy-server update
+
+   # Force upgrade / reinstall current version
+   tproxy-server update -force
+
+   # Update from a custom fork repository
+   tproxy-server update -repo username/repo
+   ```
 
 Running `tproxy-server` without subcommands (or with `-config`) continues to run the relay server as normal.
 

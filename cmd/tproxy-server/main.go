@@ -34,10 +34,17 @@ func main() {
 	profilesPath := flag.String("profiles-file", "", "override profiles file path")
 	check := flag.Bool("check", false, "validate configuration and exit")
 	testFlag := flag.Bool("t", false, "validate configuration and exit (alias for test)")
+	versionFlag := flag.Bool("v", false, "print version information and exit")
+	versionLongFlag := flag.Bool("version", false, "print version information and exit")
 	flag.Usage = func() {
 		cli.PrintHelp(os.Stdout)
 	}
 	flag.Parse()
+	if *versionFlag || *versionLongFlag {
+		cli.RunVersion(nil, os.Stdout, os.Stderr)
+		os.Exit(0)
+	}
+
 
 	value, err := config.Load(*configPath, *profilesPath)
 	if err != nil {
