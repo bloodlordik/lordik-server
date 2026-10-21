@@ -167,15 +167,20 @@ func (b *ReassemblyBuffer) ExpectedUpSeq() uint64 {
 	return b.expectedUpSeq
 }
 
+// FillGLTFHeader writes the 12-byte glTF 2.0 binary header into dst.
+func FillGLTFHeader(dst []byte, cursor uint64) {
+	copy(dst[0:4], GLTFMagic)
+	binary.LittleEndian.PutUint32(dst[4:8], GLTFVersion)
+	binary.BigEndian.PutUint32(dst[8:12], uint32(cursor))
+}
+
 // WrapGLTF wraps batch frames into a glTF 2.0 binary payload with 12-byte header:
 // - bytes 0..3: magic "glTF"
 // - bytes 4..7: version 2 in Little-Endian
 // - bytes 8..11: cursor in Big-Endian
 func WrapGLTF(batch []byte, cursor uint64) []byte {
 	out := make([]byte, GLTFHeaderSize+len(batch))
-	copy(out[0:4], GLTFMagic)
-	binary.LittleEndian.PutUint32(out[4:8], GLTFVersion)
-	binary.BigEndian.PutUint32(out[8:12], uint32(cursor))
+	FillGLTFHeader(out, cursor)
 	copy(out[GLTFHeaderSize:], batch)
 	return out
 }

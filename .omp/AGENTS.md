@@ -218,3 +218,21 @@ lordik-server/
       - В `sessionFinished` сессия и короткий ID удаляются из мап `m.sessions`, `m.shortSessions` и `m.bootstraps` за $O(1)$ без линейных циклов по всем сессиям сервера под блокировкой глобального мьютекса (с сохранением обратной совместимости fallback-перебора для внешних вызовов без хеша).
     - **Усиление авторизации CDN-маршрутов (`resolveSession`)**:
       - В `internal/server/cdn.go` в функции `resolveSession` для всех операций с данными (`chunks`, `sync`, `media`) теперь обязательно требуется валидный токен в заголовке `X-Client-Key`, токене Bearer или параметре `?k=`, а также сверяется соответствие `shortID` из пути URL с идентификатором сессии. Поиск только по `shortID` изолирован исключительно для закрытия сессии в `serveCDNUnload` при выгрузке страницы.
+15. **Комплексная оптимизация производительности и устранение тонких мест CDN/Direct**:
+    - **Компоненты**: `internal/server/server.go`, `internal/server/cdn.go`, `internal/session/session.go`, `internal/session/manager.go`, `internal/session/direct.go`, `internal/session/cdn.go`, `internal/bridge/templates/cdn.html`.
+    - **Защита от IP-лимитов за CDN (`MaxSessionsPerIP` / `MaxBootstrapsPerIP`)**:
+      - В `s.clientIP()` добавлена приоритетная проверка пограничных заголовков CDN и обратных прокси: `CF-Connecting-IP`, `True-Client-IP`, `X-Real-IP`, а также безопасное извлечение первого клиентского IP из списков `X-Forwarded-For`.
+      - Для профилей с CDN-транспортом (`CarrierMode.IsCDN()`) в `manager.IssueBootstrap` и `manager.Create` сняты ограничения `MaxBootstrapsPerIP` и `MaxSessionsPerIP`, предотвращая массовую блокировку пользователей за пограничными узлами Cloudflare/Gcore/CGNAT, при полном сохранении глобальных лимитов емкости и криптографической аутентификации capability-токенов.
+    - **Бесконфликтная координация `PollCDN` и `PiggybackDown`**:
+      - Если для сессии уже активен выделенный long-poll (`s.downActive == true`), `PiggybackDown` не перехватывает кадры из очереди и не закрывает `s.superseded`, позволяя фоновому поллингу мгновенно доставить данные без лишних переподключений и без риска гонки `unackedCost`.
+    - **Защита от переполнения 32-битного курсора glTF в `cdn.html`**:
+      - В `cdn.html` проверка прихода пакетов переведена на модульную арифметику серийных номеров RFC 1982: `((parsed.cursor - downCursor | 0) > 0 || downCursor === 0)`, что гарантирует корректную работу при wrap-around счетчика курсоров батчей.
+    - **Защита от Half-Open сокетов и TCP Keep-Alive в `direct.go`**:
+      - В `net.Dialer` для подключений к дата-центрам Telegram включен `KeepAlive = 30 * time.Second`.
+      - Для сокета установлены активные таймауты `SetDeadline` (5 минут по умолчанию) при чтении и записи, исключающие зависание горутин при сетевых «черных дырах».
+    - **Пулинг буферов (`sync.Pool`) и векторный I/O (`net.Buffers` / `writev`)**:
+      - Внедрен `readBufferPool` (`sync.Pool`) для 64-КиБ буферов чтения в `readLoop` и `directReadLoop`, устраняющий частые аллокации памяти в GC при высоких скоростях трафика.
+      - В `writeLoop` и `directWriteLoop` мелкие пачки кадров передаются через `net.Buffers(chunks).WriteTo(connection)`, что в Linux задействует системный вызов `writev` без промежуточного копирования в пользовательском пространстве.
+      - В `direct.go` потоковая расшифровка клиента и зашифровка для Telegram DC выполняются строго in-place (`XORKeyStream(data, data)`) в L1-кэше процессора.
+    - **Адаптивный Coalescing (Micro-Wait) для Uplink/Piggybacking**:
+      - В `PiggybackDownWait` реализовано адаптивное микро-ожидание (до 25 мс) по заголовку `X-Coalesce: 1` при отсутствии активного поллинга, позволяющее упаковать быстрый ответ дата-центра (рукопожатие/эхо) прямо в ответ на запрос загрузки без дополнительного сетевого RTT.

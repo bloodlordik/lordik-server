@@ -181,7 +181,8 @@ func (m *Manager) IssueBootstrap(profile *config.Profile, clientIP string) (stri
 		return "", ErrClosed
 	}
 	m.removeExpiredBootstrapsLocked(now)
-	if (m.config.Limits.MaxBootstrapsPerIP != 0 &&
+	isCDN := profile != nil && profile.CarrierMode.IsCDN()
+	if (!isCDN && m.config.Limits.MaxBootstrapsPerIP != 0 &&
 		m.bootstrapsPerIP[clientIP] >= m.config.Limits.MaxBootstrapsPerIP) || !allowRateLocked(
 		&m.bootstrapRate,
 		now,
@@ -232,10 +233,11 @@ func (m *Manager) Create(token, clientIP string, body []byte) (CreateResult, err
 		}, nil
 	}
 	profileLimits := entry.profile.Limits
+	isCDN := entry.profile != nil && entry.profile.CarrierMode.IsCDN()
 	if m.closed ||
 		len(m.sessions) >= m.config.Limits.MaxSessionsGlobal ||
 		m.sessionsPerProfile[entry.profile.Name] >= profileLimits.MaxSessions ||
-		(m.config.Limits.MaxSessionsPerIP != 0 &&
+		(!isCDN && m.config.Limits.MaxSessionsPerIP != 0 &&
 			m.sessionsPerIP[clientIP] >= m.config.Limits.MaxSessionsPerIP) {
 		m.limitHits.Add(1)
 		return CreateResult{}, ErrLimit

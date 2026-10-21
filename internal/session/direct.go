@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/telegramdesktop/tproxy-server/internal/config"
-	"github.com/telegramdesktop/tproxy-server/internal/frame"
 	"github.com/telegramdesktop/tproxy-server/internal/logger"
 )
 
@@ -418,7 +417,10 @@ func (s *backendStream) runDirect() {
 	)
 
 	// 4. Dial target DC
-	dialer := net.Dialer{Timeout: s.session.timeouts.BackendDial.Value()}
+	dialer := net.Dialer{
+		Timeout:   s.session.timeouts.BackendDial.Value(),
+		KeepAlive: 30 * time.Second,
+	}
 	connection, err := dialer.DialContext(s.ctx, "tcp", targetAddress)
 	dialAccounted = true
 	s.session.backendDialFinished(err != nil && s.ctx.Err() == nil)
@@ -470,8 +472,11 @@ func (s *backendStream) runDirect() {
 			return
 		}
 	}
-	_ = connection.SetWriteDeadline(time.Time{})
-
+	idleTimeout := s.session.timeouts.Idle.Value()
+	if idleTimeout <= 0 {
+		idleTimeout = 5 * time.Minute
+	}
+	_ = connection.SetDeadline(time.Now().Add(idleTimeout))
 	for i := 0; i < consumedItems; i++ {
 		if !s.session.backendWriteFinished(s.id) {
 			s.close()
@@ -492,34 +497,73 @@ func (s *backendStream) runDirect() {
 }
 
 func (s *backendStream) directWriteLoop(connection net.Conn, clientDec, tgEnc cipher.Stream) {
+	idleTimeout := s.session.timeouts.Idle.Value()
+	if idleTimeout <= 0 {
+		idleTimeout = 5 * time.Minute
+	}
 	for {
-		data, ok := s.session.nextWrite(s.id, s.ctx.Done())
+		chunks, ok := s.session.nextWrites(s.id, s.ctx.Done())
 		if !ok {
 			return
 		}
-		clientDec.XORKeyStream(data, data)
-		tgEnc.XORKeyStream(data, data)
-		_ = connection.SetWriteDeadline(time.Now().Add(s.session.timeouts.Idle.Value()))
-		for len(data) != 0 {
-			written, err := connection.Write(data)
-			if written > 0 {
-				if !s.session.backendDrained(s.id, written) {
+		for _, data := range chunks {
+			clientDec.XORKeyStream(data, data)
+			tgEnc.XORKeyStream(data, data)
+		}
+		_ = connection.SetWriteDeadline(time.Now().Add(idleTimeout))
+		if len(chunks) == 1 {
+			data := chunks[0]
+			for len(data) != 0 {
+				written, err := connection.Write(data)
+				if written > 0 {
+					if !s.session.backendDrained(s.id, written) {
+						return
+					}
+					data = data[written:]
+				}
+				if err != nil || written == 0 {
 					return
 				}
-				data = data[written:]
 			}
-			if err != nil || written == 0 {
+			if !s.session.backendWriteFinished(s.id) {
 				return
 			}
-		}
-		if !s.session.backendWriteFinished(s.id) {
-			return
+		} else {
+			buffers := net.Buffers(chunks)
+			totalLen := 0
+			for _, c := range chunks {
+				totalLen += len(c)
+			}
+			numItems := len(chunks)
+			for totalLen > 0 {
+				n, err := buffers.WriteTo(connection)
+				if n > 0 {
+					if !s.session.backendDrained(s.id, int(n)) {
+						return
+					}
+					totalLen -= int(n)
+				}
+				if err != nil || n == 0 {
+					return
+				}
+			}
+			for i := 0; i < numItems; i++ {
+				if !s.session.backendWriteFinished(s.id) {
+					return
+				}
+			}
 		}
 	}
 }
 
 func (s *backendStream) directReadLoop(connection net.Conn, clientEnc, tgDec cipher.Stream) {
-	buffer := make([]byte, frame.DataChunk)
+	bufPtr := readBufferPool.Get().(*[]byte)
+	defer readBufferPool.Put(bufPtr)
+	buffer := *bufPtr
+	idleTimeout := s.session.timeouts.Idle.Value()
+	if idleTimeout <= 0 {
+		idleTimeout = 5 * time.Minute
+	}
 	for {
 		allowance, ok := s.session.nextReadAllowance(s.id, s.ctx.Done())
 		if !ok {
@@ -529,7 +573,7 @@ func (s *backendStream) directReadLoop(connection net.Conn, clientEnc, tgDec cip
 		if allowance < len(chunk) {
 			chunk = chunk[:allowance]
 		}
-		_ = connection.SetReadDeadline(time.Now().Add(s.session.timeouts.Idle.Value()))
+		_ = connection.SetReadDeadline(time.Now().Add(idleTimeout))
 		count, err := connection.Read(chunk)
 		if count > 0 {
 			payload := chunk[:count]

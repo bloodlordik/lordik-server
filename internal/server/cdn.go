@@ -293,7 +293,8 @@ func (s *Server) serveCDNChunkGet(w http.ResponseWriter, r *http.Request, sessio
 	}
 
 	cursor := parseCursorFromRequest(r)
-	downBytes, nextCursor, err := sess.PiggybackDown(cursor)
+	coalesce := r.Header.Get("X-Coalesce") == "1" || r.URL.Query().Get("coalesce") == "1"
+	downBytes, nextCursor, err := sess.PiggybackDownWait(cursor, coalesce)
 	if err != nil {
 		s.handleCDNSessionError(w, r, err)
 		return
@@ -328,7 +329,8 @@ func (s *Server) serveCDNSyncPost(w http.ResponseWriter, r *http.Request, sessio
 	}
 
 	cursor := parseCursorFromRequest(r)
-	downBytes, nextCursor, err := sess.PiggybackDown(cursor)
+	coalesce := r.Header.Get("X-Coalesce") == "1" || r.URL.Query().Get("coalesce") == "1"
+	downBytes, nextCursor, err := sess.PiggybackDownWait(cursor, coalesce)
 	if err != nil {
 		s.handleCDNSessionError(w, r, err)
 		return

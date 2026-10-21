@@ -83,7 +83,7 @@ function parseGLTF(buf){
 function processDownlink(resBuf,ct){
  if(ct&&ct.includes('model/gltf-binary')){
   const parsed=parseGLTF(resBuf);
-  if(parsed&&parsed.cursor>downCursor){
+  if(parsed&&((parsed.cursor-downCursor|0)>0||downCursor===0)){
    downCursor=parsed.cursor;
    deliver(parsed.payload);
   }
@@ -91,7 +91,7 @@ function processDownlink(resBuf,ct){
   try{
    const dec=new TextDecoder().decode(resBuf);
    const obj=JSON.parse(dec);
-   if(obj&&typeof obj.c==='number'&&obj.c>downCursor)downCursor=obj.c;
+   if(obj&&typeof obj.c==='number'&&((obj.c-downCursor|0)>0||downCursor===0))downCursor=obj.c;
   }catch(e){}
  }
 }
@@ -262,7 +262,8 @@ async function sendChunkWithBackoff(seq,buf,retry){
      'Content-Type':'application/octet-stream',
      'X-Client-Key':sessionToken,
      'X-Request-ID':reqId,
-     'X-Down-Cursor':String(cur)
+     'X-Down-Cursor':String(cur),
+     'X-Coalesce':'1'
     }
    });
    if(res.ok){
@@ -280,7 +281,8 @@ async function sendChunkWithBackoff(seq,buf,retry){
    const headers={
     'X-Client-Key':sessionToken,
     'X-Request-ID':reqId,
-    'X-Down-Cursor':String(cur)
+    'X-Down-Cursor':String(cur),
+    'X-Coalesce':'1'
    };
    let roff=0,hidx=0;
    while(roff<remaining.length&&hidx<8){

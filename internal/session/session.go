@@ -796,6 +796,12 @@ func (s *Session) ProcessUpCDN(sequence uint64, chunk []byte) (int, error) {
 // PiggybackDown attempts a non-blocking harvest of available downlink frames to bundle
 // in an uplink response.
 func (s *Session) PiggybackDown(cursor uint64) ([]byte, uint64, error) {
+	return s.PiggybackDownWait(cursor, false)
+}
+
+// PiggybackDownWait attempts a harvest of downlink frames, optionally micro-waiting up to 5ms
+// if coalesce is true, no poll is active, and no frames are immediately available.
+func (s *Session) PiggybackDownWait(cursor uint64, coalesce bool) ([]byte, uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -823,11 +829,36 @@ func (s *Session) PiggybackDown(cursor uint64) ([]byte, uint64, error) {
 		return nil, s.downCursor, nil
 	}
 
-	// 4. If PollCDN is currently active, supersede it so it doesn't race for downlink frames.
-	if s.downActive && s.superseded != nil {
-		close(s.superseded)
-		s.downActive = false
-		s.superseded = nil
+	// 4. If PollCDN is currently active, leave frames for the dedicated downlink poll.
+	if s.downActive {
+		return nil, s.downCursor, nil
+	}
+
+	// 5. Adaptive micro-wait (coalescing up to 25ms) when requested by client
+	// and no poll is active: wait for backend DATA frame to bundle with WINDOW ack.
+	if coalesce && !s.hasPendingDataLocked() {
+		deadline := time.Now().Add(25 * time.Millisecond)
+		for !s.hasPendingDataLocked() && !s.closed && !s.downActive {
+			rem := time.Until(deadline)
+			if rem <= 0 {
+				break
+			}
+			notify := s.notify
+			done := s.done
+			s.mu.Unlock()
+			select {
+			case <-notify:
+			case <-time.After(rem):
+			case <-done:
+			}
+			s.mu.Lock()
+		}
+		if s.closed {
+			return nil, cursor, ErrClosed
+		}
+		if cursor != s.downCursor || len(s.unacked) != 0 || s.downActive {
+			return nil, s.downCursor, nil
+		}
 	}
 
 	if len(s.pendingFrames) == 0 {
@@ -971,6 +1002,15 @@ func (s *Session) PollCDN(ctx context.Context, cursor uint64, timeout time.Durat
 			}
 		}
 	}
+}
+
+func (s *Session) hasPendingDataLocked() bool {
+	for i := range s.pendingFrames {
+		if s.pendingFrames[i].typeCode == frame.Data {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Session) takeDownBatchLimitLocked(maxBytes int) downBatch {
@@ -1251,6 +1291,36 @@ func (s *Session) nextWrite(id uint32, done <-chan struct{}) ([]byte, bool) {
 		}
 	}
 }
+func (s *Session) nextWrites(id uint32, done <-chan struct{}) ([][]byte, bool) {
+	for {
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			return nil, false
+		}
+		state := s.streams[id]
+		if state == nil {
+			s.mu.Unlock()
+			return nil, false
+		}
+		if len(state.writes) != 0 {
+			result := state.writes
+			state.writes = nil
+			s.mu.Unlock()
+			return result, true
+		}
+		notify := state.writeNotify
+		s.mu.Unlock()
+		select {
+		case <-notify:
+		case <-s.done:
+			return nil, false
+		case <-done:
+			return nil, false
+		}
+	}
+}
+
 
 func (s *Session) backendDrained(id uint32, amount int) bool {
 	s.mu.Lock()
@@ -1838,7 +1908,10 @@ func (s *backendStream) run() {
 		target = s.address
 	}
 
-	dialer := net.Dialer{Timeout: s.session.timeouts.BackendDial.Value()}
+	dialer := net.Dialer{
+		Timeout:   s.session.timeouts.BackendDial.Value(),
+		KeepAlive: 30 * time.Second,
+	}
 	connection, err := dialer.DialContext(s.ctx, network, target)
 	s.session.backendDialFinished(err != nil && s.ctx.Err() == nil)
 	if err != nil {
@@ -1878,32 +1951,68 @@ func (s *backendStream) run() {
 	<-writeDone
 }
 
+var readBufferPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, frame.DataChunk)
+		return &b
+	},
+}
+
 func (s *backendStream) writeLoop(connection net.Conn) {
 	for {
-		data, ok := s.session.nextWrite(s.id, s.ctx.Done())
+		chunks, ok := s.session.nextWrites(s.id, s.ctx.Done())
 		if !ok {
 			return
 		}
-		for len(data) != 0 {
-			written, err := connection.Write(data)
-			if written > 0 {
-				if !s.session.backendDrained(s.id, written) {
+		if len(chunks) == 1 {
+			data := chunks[0]
+			for len(data) != 0 {
+				written, err := connection.Write(data)
+				if written > 0 {
+					if !s.session.backendDrained(s.id, written) {
+						return
+					}
+					data = data[written:]
+				}
+				if err != nil || written == 0 {
 					return
 				}
-				data = data[written:]
 			}
-			if err != nil || written == 0 {
+			if !s.session.backendWriteFinished(s.id) {
 				return
 			}
-		}
-		if !s.session.backendWriteFinished(s.id) {
-			return
+		} else {
+			buffers := net.Buffers(chunks)
+			totalLen := 0
+			for _, c := range chunks {
+				totalLen += len(c)
+			}
+			numItems := len(chunks)
+			for totalLen > 0 {
+				n, err := buffers.WriteTo(connection)
+				if n > 0 {
+					if !s.session.backendDrained(s.id, int(n)) {
+						return
+					}
+					totalLen -= int(n)
+				}
+				if err != nil || n == 0 {
+					return
+				}
+			}
+			for i := 0; i < numItems; i++ {
+				if !s.session.backendWriteFinished(s.id) {
+					return
+				}
+			}
 		}
 	}
 }
 
 func (s *backendStream) readLoop(connection net.Conn) {
-	buffer := make([]byte, frame.DataChunk)
+	bufPtr := readBufferPool.Get().(*[]byte)
+	defer readBufferPool.Put(bufPtr)
+	buffer := *bufPtr
 	for {
 		allowance, ok := s.session.nextReadAllowance(s.id, s.ctx.Done())
 		if !ok {

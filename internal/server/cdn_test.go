@@ -366,3 +366,96 @@ func TestCDNChunkGetWithQueryParamPayload(t *testing.T) {
 		t.Fatalf("missing CDN-Cache-Control header")
 	}
 }
+
+func TestCDNReverseProxyHeadersAndCoalescing(t *testing.T) {
+	backend := startEchoBackend(t)
+	application, _ := newConfiguredTestServer(t, backend, func(value *config.Config) {
+		value.Profiles[0].CarrierMode = config.CarrierCDNAdaptive
+	})
+	defer application.Shutdown()
+
+	hosted := httptest.NewServer(application.Handler())
+	defer hosted.Close()
+
+	buildID := application.BuildID()
+	clientIP := "198.51.100.99"
+
+	// 1. Issue bootstrap
+	bootstrap, err := application.manager.IssueBootstrap(&application.config.Profiles[0], clientIP)
+	if err != nil {
+		t.Fatalf("IssueBootstrap failed: %v", err)
+	}
+
+	// 2. Init session with CF-Connecting-IP and comma-separated X-Forwarded-For
+	helloBytes := frame.Encode(frame.Hello, 0, []byte{1})
+	helloB64 := base64.RawURLEncoding.EncodeToString(helloBytes)
+	initURL := hosted.URL + "/_next/data/" + buildID + "/init/" + bootstrap + "/" + helloB64 + ".json"
+
+	initReq, err := http.NewRequest(http.MethodGet, initURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initReq.Host = testHost
+	initReq.Header.Set("X-Client-Key", bootstrap)
+	initReq.Header.Set("CF-Connecting-IP", clientIP)
+	initReq.Header.Set("X-Forwarded-For", "203.0.113.195, 198.51.100.1")
+	initRes := perform(t, hosted.Client(), initReq)
+	if initRes.StatusCode != http.StatusOK {
+		t.Fatalf("init GET failed: %d", initRes.StatusCode)
+	}
+	var initJSON struct {
+		Token   string `json:"token"`
+		ShortID string `json:"short_id"`
+	}
+	_ = json.Unmarshal(readResponse(t, initRes), &initJSON)
+
+	// 3. Test Coalescing with X-Coalesce: 1
+	streamID := uint32(303)
+	openFrame := frame.Encode(frame.Open, streamID, nil)
+	payloadMsg := []byte("echo with coalesce")
+	dataFrame := frame.Encode(frame.Data, streamID, payloadMsg)
+	batch := append(openFrame, dataFrame...)
+
+	syncURL := hosted.URL + "/_next/data/" + buildID + "/sync/" + initJSON.ShortID + "/1.bin"
+	syncReq, err := http.NewRequest(http.MethodPost, syncURL, bytes.NewReader(batch))
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncReq.Host = testHost
+	syncReq.Header.Set("X-Client-Key", initJSON.Token)
+	syncReq.Header.Set("X-Request-ID", "1.0.0")
+	syncReq.Header.Set("X-Down-Cursor", "0")
+	syncReq.Header.Set("X-Coalesce", "1")
+	syncReq.Header.Set("CF-Connecting-IP", clientIP)
+
+	syncRes := perform(t, hosted.Client(), syncReq)
+	syncBody := readResponse(t, syncRes)
+	if syncRes.StatusCode != http.StatusOK {
+		t.Fatalf("sync POST failed: %d, body: %s", syncRes.StatusCode, string(syncBody))
+	}
+
+	// Because X-Coalesce was set to 1, the response immediately bundled the echoed downlink frame!
+	if syncRes.Header.Get("Content-Type") != "model/gltf-binary" {
+		t.Fatalf("expected Content-Type model/gltf-binary for coalesced response, got %s", syncRes.Header.Get("Content-Type"))
+	}
+	cursor, demuxedBatch, err := session.UnwrapGLTF(syncBody)
+	if err != nil {
+		t.Fatalf("UnwrapGLTF failed: %v", err)
+	}
+	if cursor != 1 {
+		t.Fatalf("expected cursor 1, got %d", cursor)
+	}
+	recvFrames, err := frame.ParseAll(demuxedBatch, 1024*1024)
+	if err != nil {
+		t.Fatalf("ParseAll failed: %v", err)
+	}
+	var echoed []byte
+	for _, f := range recvFrames {
+		if f.StreamID == streamID && f.Type == frame.Data {
+			echoed = append(echoed, f.Payload...)
+		}
+	}
+	if !bytes.Equal(echoed, payloadMsg) {
+		t.Fatalf("expected echoed %q, got %q", payloadMsg, echoed)
+	}
+}

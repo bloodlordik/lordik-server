@@ -644,14 +644,25 @@ func (s *Server) clientIP(r *http.Request) (string, error) {
 	if peer == nil || !peer.IsLoopback() {
 		return "", errors.New("request did not arrive through loopback proxy")
 	}
+	// Prioritize CDN and reverse proxy client IP headers
+	for _, headerName := range []string{"CF-Connecting-IP", "True-Client-IP", "X-Real-IP"} {
+		if val := strings.TrimSpace(r.Header.Get(headerName)); val != "" {
+			if parsed := net.ParseIP(val); parsed != nil {
+				return parsed.String(), nil
+			}
+		}
+	}
 	forwarded := r.Header.Get("X-Forwarded-For")
 	if forwarded == "" {
 		return peer.String(), nil
 	}
-	if strings.Contains(forwarded, ",") || strings.TrimSpace(forwarded) != forwarded {
-		return "", errors.New("invalid forwarding address")
+	// Support comma-separated X-Forwarded-For (take the first client IP)
+	target := forwarded
+	if idx := strings.IndexByte(forwarded, ','); idx != -1 {
+		target = forwarded[:idx]
 	}
-	parsed := net.ParseIP(forwarded)
+	target = strings.TrimSpace(target)
+	parsed := net.ParseIP(target)
 	if parsed == nil {
 		return "", errors.New("invalid forwarding address")
 	}

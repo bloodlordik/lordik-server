@@ -232,3 +232,42 @@ func TestPiggybackAndPollStaleCursorGraceful(t *testing.T) {
 		t.Fatalf("expected ErrProtocol on future cursor, got %v", err)
 	}
 }
+
+func TestCDNPerIPLimitsBypass(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Profiles[0].CarrierMode = config.CarrierCDNAdaptive
+	configuration.Limits.MaxBootstrapsPerIP = 1
+	configuration.Limits.MaxSessionsPerIP = 1
+	configuration.Limits.MaxBootstrapsGlobal = 10
+	configuration.Limits.MaxSessionsGlobal = 10
+	manager := NewManager(configuration, [32]byte{1})
+	defer manager.Shutdown()
+
+	clientIP := "198.51.100.42"
+	// 1. Issue first bootstrap
+	b1, err := manager.IssueBootstrap(&configuration.Profiles[0], clientIP)
+	if err != nil {
+		t.Fatalf("first IssueBootstrap failed: %v", err)
+	}
+
+	// 2. Issue second bootstrap from SAME IP - MUST succeed because carrier is CDN!
+	b2, err := manager.IssueBootstrap(&configuration.Profiles[0], clientIP)
+	if err != nil {
+		t.Fatalf("second IssueBootstrap failed for CDN carrier: %v", err)
+	}
+
+	// 3. Create first session
+	hello := frame.Encode(frame.Hello, 0, []byte{1})
+	res1, err := manager.Create(b1, clientIP, hello)
+	if err != nil {
+		t.Fatalf("first Create failed: %v", err)
+	}
+	defer res1.Session.Close()
+
+	// 4. Create second session from SAME IP - MUST succeed because carrier is CDN!
+	res2, err := manager.Create(b2, clientIP, hello)
+	if err != nil {
+		t.Fatalf("second Create failed for CDN carrier: %v", err)
+	}
+	defer res2.Session.Close()
+}
