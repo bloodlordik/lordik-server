@@ -182,12 +182,16 @@ func CreateTelegramHandshake(protoTag uint32, dcIdx int16) ([]byte, cipher.Strea
 		if _, err := rand.Read(tgNonce); err != nil {
 			return nil, nil, nil, fmt.Errorf("generate nonce: %w", err)
 		}
-		if tgNonce[0] == 0xef {
+		if tgNonce[0] == 0xef || tgNonce[0] == 0x16 {
 			continue
 		}
 		val0 := binary.BigEndian.Uint32(tgNonce[0:4])
 		// Avoid clash with HTTP methods: HEAD, POST, GET , OPTI
 		if val0 == 0x48454144 || val0 == 0x504f5354 || val0 == 0x47455420 || val0 == 0x4f505449 {
+			continue
+		}
+		// Avoid clash with MTProto tags in big-endian
+		if val0 == TagIntermediate || val0 == TagPaddedIntermediate || val0 == TagAbridged {
 			continue
 		}
 		val1 := binary.BigEndian.Uint32(tgNonce[4:8])
@@ -354,24 +358,37 @@ func resolveCandidate(val string, preferIPv6 bool) (string, error) {
 }
 
 func (s *backendStream) runDirect() {
-	// 1. Wait for client's initial handshake data (minimum 64 bytes)
+	dialAccounted := false
+	defer func() {
+		if !dialAccounted {
+			s.session.backendDialFinished(false)
+		}
+	}()
+
+	// 1. Wait for client's initial handshake data with timeout (minimum 64 bytes)
+	hsTimer := time.AfterFunc(s.session.timeouts.BackendDial.Value(), func() {
+		s.close()
+	})
 	firstData, ok := s.session.nextWrite(s.id, s.ctx.Done())
 	if !ok {
+		hsTimer.Stop()
 		return
 	}
 	consumedItems := 1
 	for len(firstData) < 64 {
 		nextChunk, ok := s.session.nextWrite(s.id, s.ctx.Done())
 		if !ok {
+			hsTimer.Stop()
 			return
 		}
 		firstData = append(firstData, nextChunk...)
 		consumedItems++
 	}
+	hsTimer.Stop()
 
 	// 2. Parse client handshake
-	var secretBytes []byte
-	if s.session.profile != nil {
+	secretBytes := s.session.RawSecret()
+	if len(secretBytes) == 0 && s.session.profile != nil {
 		secretBytes, _ = config.DecodeSecret(s.session.profile.Secret)
 	}
 	hsRes, err := ParseClientHandshake(firstData[:64], secretBytes)
@@ -393,7 +410,7 @@ func (s *backendStream) runDirect() {
 		logger.Warn("direct telegram dc resolve failed", "stream_id", s.id, "dc", hsRes.DCIdx, "err", err)
 		return
 	}
-	logger.Info("direct stream handshake parsed",
+	logger.Debug("direct stream handshake parsed",
 		"stream_id", s.id,
 		"dc", hsRes.DCIdx,
 		"tag", fmt.Sprintf("0x%08x", hsRes.Tag),
@@ -403,6 +420,7 @@ func (s *backendStream) runDirect() {
 	// 4. Dial target DC
 	dialer := net.Dialer{Timeout: s.session.timeouts.BackendDial.Value()}
 	connection, err := dialer.DialContext(s.ctx, "tcp", targetAddress)
+	dialAccounted = true
 	s.session.backendDialFinished(err != nil && s.ctx.Err() == nil)
 	if err != nil {
 		if s.ctx.Err() == nil {
@@ -420,47 +438,40 @@ func (s *backendStream) runDirect() {
 	s.conn = connection
 	s.connMu.Unlock()
 
-	// 5. Handshake with Telegram DC
+	// 5. Handshake + Initial Payload in one TCP write (Zero-overhead First Packet)
 	tgHandshake, tgEncryptor, tgDecryptor, err := CreateTelegramHandshake(hsRes.Tag, hsRes.DCIdx)
 	if err != nil {
 		s.close()
 		return
 	}
-	_ = connection.SetWriteDeadline(time.Now().Add(s.session.timeouts.BackendDial.Value()))
-	if _, err := connection.Write(tgHandshake); err != nil {
-		s.close()
-		return
-	}
-	_ = connection.SetWriteDeadline(time.Time{})
 
-	// 6. Handle client's first 64 bytes for flow control accounting
-	if !s.session.backendDrained(s.id, 64) {
-		s.close()
-		return
-	}
-
-	// 7. If firstData has remaining bytes beyond 64 bytes, forward them
+	// Re-encrypt trailing payload in-place
 	if len(firstData) > 64 {
 		rem := firstData[64:]
 		hsRes.ClientDecryptor.XORKeyStream(rem, rem)
 		tgEncryptor.XORKeyStream(rem, rem)
-		_ = connection.SetWriteDeadline(time.Now().Add(s.session.timeouts.Idle.Value()))
-		for len(rem) != 0 {
-			written, err := connection.Write(rem)
-			if written > 0 {
-				if !s.session.backendDrained(s.id, written) {
-					s.close()
-					return
-				}
-				rem = rem[written:]
-			}
-			if err != nil || written == 0 {
+	}
+	// Place generated Telegram obfuscated2 handshake in first 64 bytes
+	copy(firstData[:64], tgHandshake)
+
+	_ = connection.SetWriteDeadline(time.Now().Add(s.session.timeouts.BackendDial.Value()))
+	totalToWrite := firstData
+	for len(totalToWrite) != 0 {
+		written, err := connection.Write(totalToWrite)
+		if written > 0 {
+			if !s.session.backendDrained(s.id, written) {
 				s.close()
 				return
 			}
+			totalToWrite = totalToWrite[written:]
 		}
-		_ = connection.SetWriteDeadline(time.Time{})
+		if err != nil || written == 0 {
+			s.close()
+			return
+		}
 	}
+	_ = connection.SetWriteDeadline(time.Time{})
+
 	for i := 0; i < consumedItems; i++ {
 		if !s.session.backendWriteFinished(s.id) {
 			s.close()
@@ -468,7 +479,7 @@ func (s *backendStream) runDirect() {
 		}
 	}
 
-	// 8. Start write loop and read loop
+	// 6. Start write loop and read loop
 	writeDone := make(chan struct{})
 	go func() {
 		defer close(writeDone)

@@ -47,27 +47,27 @@ func parseCursorFromRequest(r *http.Request) uint64 {
 }
 
 func (s *Server) resolveSession(r *http.Request, sessionShortID string) *session.Session {
+	var sess *session.Session
 	if key := r.Header.Get("X-Client-Key"); key != "" {
-		if sess, err := s.manager.Get(key); err == nil && sess != nil {
-			return sess
+		if found, err := s.manager.Get(key); err == nil && found != nil {
+			sess = found
+		}
+	} else if tok, ok := bearerToken(r.Header.Get("Authorization")); ok {
+		if found, err := s.manager.Get(tok); err == nil && found != nil {
+			sess = found
+		}
+	} else if k := r.URL.Query().Get("k"); k != "" {
+		if found, err := s.manager.Get(k); err == nil && found != nil {
+			sess = found
 		}
 	}
-	if tok, ok := bearerToken(r.Header.Get("Authorization")); ok {
-		if sess, err := s.manager.Get(tok); err == nil && sess != nil {
-			return sess
-		}
+	if sess == nil {
+		return nil
 	}
-	if k := r.URL.Query().Get("k"); k != "" {
-		if sess, err := s.manager.Get(k); err == nil && sess != nil {
-			return sess
-		}
+	if sessionShortID != "" && sess.ShortID() != "" && sess.ShortID() != sessionShortID {
+		return nil
 	}
-	if sessionShortID != "" {
-		if sess, err := s.manager.GetByShortID(sessionShortID); err == nil && sess != nil {
-			return sess
-		}
-	}
-	return nil
+	return sess
 }
 
 func (s *Server) serveCDN(w http.ResponseWriter, r *http.Request, suffix string) {
@@ -380,11 +380,11 @@ func (s *Server) serveCDNMediaPoll(w http.ResponseWriter, r *http.Request, sessi
 func (s *Server) serveCDNUnload(w http.ResponseWriter, r *http.Request, sessionShortID string) {
 	if key := r.Header.Get("X-Client-Key"); key != "" {
 		_ = s.manager.CloseToken(key)
-	}
-	if sess, err := s.manager.GetByShortID(sessionShortID); err == nil && sess != nil {
+	} else if k := r.URL.Query().Get("k"); k != "" {
+		_ = s.manager.CloseToken(k)
+	} else if sess, err := s.manager.GetByShortID(sessionShortID); err == nil && sess != nil {
 		sess.Close()
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "private, no-store, no-cache, max-age=0, must-revalidate")
 	w.Header().Set("CDN-Cache-Control", "no-store")

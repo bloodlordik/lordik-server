@@ -278,10 +278,13 @@ func (m *Manager) Create(token, clientIP string, body []byte) (CreateResult, err
 		onUp:   func(count int) { m.bytesUp.Add(uint64(count)) },
 		onDown: func(count int) { m.bytesDown.Add(uint64(count)) },
 	})
-	m.sessions[sessionHash] = created
+	created.tokenHash = sessionHash
+	created.bootstrapHash = tokenHash
 	if len(sessionToken) >= 12 {
-		m.shortSessions[sessionToken[:12]] = created
+		created.shortID = sessionToken[:12]
+		m.shortSessions[created.shortID] = created
 	}
+	m.sessions[sessionHash] = created
 	m.sessionsPerIP[clientIP]++
 	m.sessionsPerProfile[entry.profile.Name]++
 	m.releaseUnusedBootstrapLocked(entry)
@@ -405,40 +408,68 @@ func (m *Manager) Shutdown() {
 
 func (m *Manager) sessionFinished(value *Session) {
 	m.mu.Lock()
-	for hash, current := range m.sessions {
-		if current == value {
+	var hash [sha256.Size]byte
+	var found bool
+	if value.tokenHash != [sha256.Size]byte{} {
+		if m.sessions[value.tokenHash] == value {
+			hash = value.tokenHash
+			found = true
 			delete(m.sessions, hash)
-			for shortID, currentSession := range m.shortSessions {
-				if currentSession == value {
-					delete(m.shortSessions, shortID)
-				}
+			if value.shortID != "" && m.shortSessions[value.shortID] == value {
+				delete(m.shortSessions, value.shortID)
 			}
-			if len(m.closedTokens) >= m.config.Limits.MaxSessionsGlobal*16 {
-				var oldestHash [sha256.Size]byte
-				var oldest time.Time
-				for candidate, expires := range m.closedTokens {
-					if oldest.IsZero() || expires.Before(oldest) {
-						oldestHash = candidate
-						oldest = expires
-					}
-				}
-				delete(m.closedTokens, oldestHash)
-			}
-			m.closedTokens[hash] = time.Now().Add(m.config.Timeouts.BootstrapLifetime.Value())
-			m.sessionsPerIP[value.clientIP]--
-			if m.sessionsPerIP[value.clientIP] == 0 {
-				delete(m.sessionsPerIP, value.clientIP)
-			}
-			m.sessionsPerProfile[value.profile.Name]--
-			if m.sessionsPerProfile[value.profile.Name] == 0 {
-				delete(m.sessionsPerProfile, value.profile.Name)
-			}
-			break
 		}
 	}
-	for hash, current := range m.bootstraps {
-		if current.session == value {
-			m.removeBootstrapLocked(hash, current)
+	if !found {
+		for candidateHash, current := range m.sessions {
+			if current == value {
+				hash = candidateHash
+				found = true
+				delete(m.sessions, candidateHash)
+				for shortID, currentSession := range m.shortSessions {
+					if currentSession == value {
+						delete(m.shortSessions, shortID)
+					}
+				}
+				break
+			}
+		}
+	}
+	if found {
+		if len(m.closedTokens) >= m.config.Limits.MaxSessionsGlobal*16 {
+			var oldestHash [sha256.Size]byte
+			var oldest time.Time
+			for candidate, expires := range m.closedTokens {
+				if oldest.IsZero() || expires.Before(oldest) {
+					oldestHash = candidate
+					oldest = expires
+				}
+			}
+			delete(m.closedTokens, oldestHash)
+		}
+		m.closedTokens[hash] = time.Now().Add(m.config.Timeouts.BootstrapLifetime.Value())
+		if value.clientIP != "" {
+			m.sessionsPerIP[value.clientIP]--
+			if m.sessionsPerIP[value.clientIP] <= 0 {
+				delete(m.sessionsPerIP, value.clientIP)
+			}
+		}
+		if value.profile != nil {
+			m.sessionsPerProfile[value.profile.Name]--
+			if m.sessionsPerProfile[value.profile.Name] <= 0 {
+				delete(m.sessionsPerProfile, value.profile.Name)
+			}
+		}
+	}
+	if value.bootstrapHash != [sha256.Size]byte{} {
+		if current := m.bootstraps[value.bootstrapHash]; current != nil && current.session == value {
+			m.removeBootstrapLocked(value.bootstrapHash, current)
+		}
+	} else {
+		for candidateHash, current := range m.bootstraps {
+			if current.session == value {
+				m.removeBootstrapLocked(candidateHash, current)
+			}
 		}
 	}
 	m.mu.Unlock()

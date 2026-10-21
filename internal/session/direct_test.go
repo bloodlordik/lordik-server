@@ -304,6 +304,7 @@ func TestDirectBackendStreamEndToEnd(t *testing.T) {
 	cfg.Profiles[0].BackendType = config.BackendDirect
 	cfg.Profiles[0].Secret = secretHex
 	cfg.Profiles[0].Backend = dcAddr
+	cfg.Timeouts.BackendDial = config.Duration(5 * time.Second)
 
 	manager := NewManager(cfg, [32]byte{1})
 	defer manager.Shutdown()

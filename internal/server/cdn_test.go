@@ -141,6 +141,13 @@ func TestCDNSessionEndToEnd(t *testing.T) {
 	if chunkRes.StatusCode != http.StatusOK {
 		t.Fatalf("chunk uplink failed: status=%d, body=%s", chunkRes.StatusCode, string(chunkResBody))
 	}
+	// Verify that unauthorized chunk request with valid shortID but no X-Client-Key is rejected
+	unauthChunkReq := request(t, http.MethodGet, chunkURL, nil, clientIP)
+	unauthChunkRes := perform(t, hosted.Client(), unauthChunkReq)
+	if unauthChunkRes.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for unauthenticated chunk GET, got %d", unauthChunkRes.StatusCode)
+	}
+
 
 	// 4. Downlink Long-Poll to receive the echoed data
 	pollURL := hosted.URL + "/assets/media/" + shortID + "/seg_0_rand123.m4s"
@@ -152,6 +159,13 @@ func TestCDNSessionEndToEnd(t *testing.T) {
 	if pollRes.StatusCode != http.StatusOK {
 		t.Fatalf("media poll failed: status=%d, body=%s", pollRes.StatusCode, string(pollBody))
 	}
+	// Verify that unauthorized media poll with valid shortID but no X-Client-Key is rejected
+	unauthPollReq := request(t, http.MethodGet, pollURL, nil, clientIP)
+	unauthPollRes := perform(t, hosted.Client(), unauthPollReq)
+	if unauthPollRes.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for unauthenticated media poll, got %d", unauthPollRes.StatusCode)
+	}
+
 
 	if pollRes.Header.Get("Content-Type") != "model/gltf-binary" {
 		t.Fatalf("expected Content-Type model/gltf-binary, got %s", pollRes.Header.Get("Content-Type"))

@@ -198,3 +198,23 @@ lordik-server/
       - **Immediate First Dispatch**: мгновенная отправка первого пакета (0 мс задержки пинга) при `upInflight == 0`.
       - **Оптимизация Base64URL**: блочное кодирование чанками по 4096 байт с поддержкой нативного `Uint8Array.prototype.toBase64` и быстрым `DecodeCDNPayload` на базе `RawURLEncoding`.
       - **Query String Payload и CDN-кэширование**: поддержка передачи URL-части через `?p=...` в `serveCDNChunkGet` (устранение проблем с `NAME_MAX`), расширенные заголовки запрета кэширования (`CDN-Cache-Control`, `Cloudflare-CDN-Cache-Control`, `Surrogate-Control`, `X-Accel-Buffering`) и легковесный ETag (`W/{cursor}-{len}`).
+14. **Оптимизация и устранение критических ошибок в direct.go, manager.go и cdn.go**:
+    - **Компоненты**: `internal/session/direct.go`, `internal/session/manager.go`, `internal/session/session.go`, `internal/server/cdn.go`.
+    - **Устранение утечки счетчика `backendDialsInFlight` и паники `panic("invalid backend dial accounting")`**:
+      - В `runDirect()` добавлен флаг `dialAccounted` и гарантированный `defer func() { if !dialAccounted { s.session.backendDialFinished(false) } }()`.
+      - При раннем закрытии клиентом потока, ошибке парсинга клиентского рукопожатия (`ParseClientHandshake`) или ошибке резолвинга DC (`ResolveTelegramDC`) счетчик активных попыток подключения гарантированно списывается, исключая блокировку открытия новых потоков на сервере.
+    - **First-Byte Deadline для прямого бэкенда**:
+      - Ожидание первых 64 байт рукопожатия ограничено таймаутом `BackendDial` через `time.AfterFunc`, что предотвращает зависание горутин и удержание слотов `streamsLive` при открытии клиентом пустых потоков (`OPEN` без `DATA`).
+    - **Zero-overhead First Packet (объединение рукопожатия и первого пакета)**:
+      - 64-байтный заголовок `tgHandshake` и перешифрованный полезный трафик клиента (`firstData[64:]`) склеиваются in-place в буфере `firstData` и отправляются в сокет Telegram DC единым системным вызовом `connection.Write`.
+      - Это сокращает сетевой RTT на 30–150 мс при установке каждого потока к дата-центрам Telegram и объединяет учет окон `backendDrained`.
+    - **Защита от запрещенных nonce в `CreateTelegramHandshake`**:
+      - В генератор случайного nonce MTProto Obfuscated2 добавлены строгие проверки на совпадение с протокольными тегами `TagIntermediate` (`0xeeeeeeee`), `TagPaddedIntermediate` (`0xdddddddd`), `TagAbridged` (`0xefefefef`) и префиксом TLS-рукопожатий (`0x16`), исключая конфликт распознавания протокола серверами Telegram DC.
+    - **Кэширование секрета и снижение уровня логирования потоков**:
+      - `s.session.rawSecret` кэшируется при инициализации сессии, исключая повторный парсинг hex/base64-секрета на каждый поток.
+      - Логирование разбора рукопожатия потока переведено с `Info` на `Debug`.
+    - **Ускорение завершения сессий в `Manager` до $O(1)$**:
+      - В структуру `Session` добавлены поля `tokenHash`, `bootstrapHash` и `shortID`.
+      - В `sessionFinished` сессия и короткий ID удаляются из мап `m.sessions`, `m.shortSessions` и `m.bootstraps` за $O(1)$ без линейных циклов по всем сессиям сервера под блокировкой глобального мьютекса (с сохранением обратной совместимости fallback-перебора для внешних вызовов без хеша).
+    - **Усиление авторизации CDN-маршрутов (`resolveSession`)**:
+      - В `internal/server/cdn.go` в функции `resolveSession` для всех операций с данными (`chunks`, `sync`, `media`) теперь обязательно требуется валидный токен в заголовке `X-Client-Key`, токене Bearer или параметре `?k=`, а также сверяется соответствие `shortID` из пути URL с идентификатором сессии. Поиск только по `shortID` изолирован исключительно для закрытия сессии в `serveCDNUnload` при выгрузке страницы.

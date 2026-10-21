@@ -136,6 +136,10 @@ type Session struct {
 	carrierLanes          map[uint32]*carrierLane
 	cdnReassembly         *ReassemblyBuffer
 	cdnPendingFrames      []frame.Frame
+	tokenHash             [sha256.Size]byte
+	bootstrapHash         [sha256.Size]byte
+	shortID               string
+	rawSecret             []byte
 	finishOnce            sync.Once
 	backendWG             sync.WaitGroup
 	onFinished            func(*Session)
@@ -149,8 +153,13 @@ type Session struct {
 
 func newSession(options sessionOptions) *Session {
 	carrier := options.profile.CarrierMode.WithDefault()
+	var rawSecret []byte
+	if options.profile != nil && options.profile.Secret != "" {
+		rawSecret, _ = config.DecodeSecret(options.profile.Secret)
+	}
 	result := &Session{
 		profile:               options.profile,
+		rawSecret:             rawSecret,
 		clientIP:              options.clientIP,
 		limits:                options.limits,
 		timeouts:              options.timeouts,
@@ -187,6 +196,14 @@ func newSession(options sessionOptions) *Session {
 
 func (s *Session) CarrierMode() config.CarrierMode {
 	return s.carrier
+}
+
+func (s *Session) ShortID() string {
+	return s.shortID
+}
+
+func (s *Session) RawSecret() []byte {
+	return s.rawSecret
 }
 
 func (s *Session) AcquireWebSocket() bool {
@@ -1632,17 +1649,19 @@ func (s *Session) rememberClosedLocked(id uint32) {
 		return
 	}
 	s.closedStreams[id] = struct{}{}
-	if len(s.closedOrder) < s.limits.MaxClosedStreamIDs {
-		s.closedOrder = append(s.closedOrder, id)
-	} else {
-		old := s.closedOrder[s.closedStart]
-		delete(s.closedStreams, old)
-		if lane := s.carrierLanes[old]; lane != nil {
-			s.releaseLaneLocked(lane)
-			delete(s.carrierLanes, old)
+	if s.limits.MaxClosedStreamIDs > 0 {
+		if len(s.closedOrder) < s.limits.MaxClosedStreamIDs {
+			s.closedOrder = append(s.closedOrder, id)
+		} else if len(s.closedOrder) > 0 {
+			old := s.closedOrder[s.closedStart]
+			delete(s.closedStreams, old)
+			if lane := s.carrierLanes[old]; lane != nil {
+				s.releaseLaneLocked(lane)
+				delete(s.carrierLanes, old)
+			}
+			s.closedOrder[s.closedStart] = id
+			s.closedStart = (s.closedStart + 1) % len(s.closedOrder)
 		}
-		s.closedOrder[s.closedStart] = id
-		s.closedStart = (s.closedStart + 1) % len(s.closedOrder)
 	}
 	if lane := s.carrierLanes[id]; lane != nil {
 		signal(lane.notify)
