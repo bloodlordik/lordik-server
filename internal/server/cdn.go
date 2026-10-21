@@ -51,13 +51,19 @@ func (s *Server) resolveSession(r *http.Request, sessionShortID string) *session
 	if key := r.Header.Get("X-Client-Key"); key != "" {
 		if found, err := s.manager.Get(key); err == nil && found != nil {
 			sess = found
+		} else if found, err := s.manager.Resume(key, ""); err == nil && found != nil {
+			sess = found
 		}
 	} else if tok, ok := bearerToken(r.Header.Get("Authorization")); ok {
 		if found, err := s.manager.Get(tok); err == nil && found != nil {
 			sess = found
+		} else if found, err := s.manager.Resume(tok, ""); err == nil && found != nil {
+			sess = found
 		}
 	} else if k := r.URL.Query().Get("k"); k != "" {
 		if found, err := s.manager.Get(k); err == nil && found != nil {
+			sess = found
+		} else if found, err := s.manager.Resume(k, ""); err == nil && found != nil {
 			sess = found
 		}
 	}
@@ -177,6 +183,7 @@ func (s *Server) serveCDNCollect(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("X-Session-Token", res.Token)
+	w.Header().Set("X-Resume-Token", res.ResumeToken)
 	w.Header().Set("X-Carrier-Mode", "cdn-body")
 	w.Header().Set("X-Down-Cursor", "0")
 	w.Header().Set("Cache-Control", "private, no-store, no-cache, max-age=0, must-revalidate")
@@ -224,14 +231,16 @@ func (s *Server) serveCDNInit(w http.ResponseWriter, r *http.Request, bootstrapT
 	}
 	welcomeB64 := base64.RawURLEncoding.EncodeToString(res.Welcome)
 	resp := map[string]string{
-		"token":    res.Token,
-		"short_id": shortID,
-		"welcome":  welcomeB64,
-		"mode":     "cdn-get",
+		"token":        res.Token,
+		"resume_token": res.ResumeToken,
+		"short_id":     shortID,
+		"welcome":      welcomeB64,
+		"mode":         "cdn-get",
 	}
 	respJSON, _ := json.Marshal(resp)
 
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Resume-Token", res.ResumeToken)
 	w.Header().Set("Cache-Control", "private, no-store, no-cache, max-age=0, must-revalidate")
 	w.Header().Set("CDN-Cache-Control", "no-store")
 	w.Header().Set("Cloudflare-CDN-Cache-Control", "no-store")

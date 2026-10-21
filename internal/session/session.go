@@ -90,6 +90,7 @@ type carrierLane struct {
 	downCursor      uint64
 	downActive      bool
 	superseded      chan struct{}
+	wsSuperseded    chan struct{}
 	notify          chan struct{}
 }
 
@@ -128,6 +129,9 @@ type Session struct {
 	downActive            bool
 	superseded            chan struct{}
 	websocketActive       bool
+	wsSuperseded          chan struct{}
+	resumeToken           string
+	resumeHash            [sha256.Size]byte
 	closed                bool
 	lastActivity          time.Time
 	notify                chan struct{}
@@ -205,6 +209,178 @@ func (s *Session) ShortID() string {
 func (s *Session) RawSecret() []byte {
 	return s.rawSecret
 }
+func (s *Session) ResumeToken() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.resumeToken
+}
+func (s *Session) IsClosed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
+}
+
+
+func (s *Session) LastUpSequence() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastUpSequence
+}
+
+func (s *Session) DownCursor() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.downCursor
+}
+
+func (s *Session) ReleaseWebSocket() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.websocketActive = false
+	s.lastActivity = time.Now()
+}
+
+func (s *Session) AcquireWebSocketTakeover() (chan struct{}, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.carrier != config.CarrierWebSocket {
+		return nil, false
+	}
+	if s.websocketActive && s.wsSuperseded != nil {
+		select {
+		case <-s.wsSuperseded:
+		default:
+			close(s.wsSuperseded)
+		}
+	}
+	s.wsSuperseded = make(chan struct{})
+	s.websocketActive = true
+	s.lastActivity = time.Now()
+	return s.wsSuperseded, true
+}
+
+func (s *Session) ReleaseWebSocketLaneGraceful(laneID uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.carrier != config.CarrierWebSocketLanes {
+		return
+	}
+	lane := s.carrierLanes[laneID]
+	if lane == nil {
+		return
+	}
+	lane.websocketActive = false
+	s.lastActivity = time.Now()
+}
+
+func (s *Session) AcquireWebSocketLaneTakeover(laneID uint32) (chan struct{}, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed ||
+		s.carrier != config.CarrierWebSocketLanes ||
+		laneID == 0 ||
+		laneID > frame.MaxStreamID {
+		return nil, false
+	}
+	if _, closed := s.closedStreams[laneID]; closed {
+		return nil, false
+	}
+	lane := s.carrierLanes[laneID]
+	if lane == nil {
+		if len(s.carrierLanes) >= s.limits.MaxStreamsPerSession {
+			return nil, false
+		}
+		lane = newCarrierLane()
+		s.carrierLanes[laneID] = lane
+	}
+	if lane.websocketActive && lane.wsSuperseded != nil {
+		select {
+		case <-lane.wsSuperseded:
+		default:
+			close(lane.wsSuperseded)
+		}
+	}
+	lane.wsSuperseded = make(chan struct{})
+	lane.websocketActive = true
+	s.lastActivity = time.Now()
+	return lane.wsSuperseded, true
+}
+
+func (s *Session) Resume(upSeq, downCursor uint64) (serverUpSeq, serverDownCursor uint64, replay []byte, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return 0, 0, nil, ErrClosed
+	}
+	s.lastActivity = time.Now()
+	if len(s.unacked) != 0 {
+		if downCursor == s.unackedBase {
+			replay = s.unacked
+			serverDownCursor = s.downCursor
+		} else if downCursor == s.downCursor {
+			s.releasePendingLocked(s.unackedCost, s.unackedItems)
+			s.unacked = nil
+			s.unackedCost = 0
+			s.unackedItems = 0
+			serverDownCursor = s.downCursor
+		} else if downCursor == 0 {
+			if s.unackedBase == 0 {
+				replay = s.unacked
+			}
+			serverDownCursor = s.downCursor
+		} else {
+			return 0, 0, nil, ErrProtocol
+		}
+	} else {
+		if downCursor == s.downCursor || downCursor == 0 {
+			serverDownCursor = s.downCursor
+		} else {
+			return 0, 0, nil, ErrProtocol
+		}
+	}
+	serverUpSeq = s.lastUpSequence + 1
+	return serverUpSeq, serverDownCursor, replay, nil
+}
+func (s *Session) ResumeLane(laneID uint32, upSeq, downCursor uint64) (serverUpSeq, serverDownCursor uint64, replay []byte, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return 0, 0, nil, ErrClosed
+	}
+	lane := s.carrierLanes[laneID]
+	if lane == nil {
+		return 0, 0, nil, ErrProtocol
+	}
+	s.lastActivity = time.Now()
+	if len(lane.unacked) != 0 {
+		if downCursor == lane.unackedBase {
+			replay = lane.unacked
+			serverDownCursor = lane.downCursor
+		} else if downCursor == lane.downCursor {
+			s.releasePendingLocked(lane.unackedCost, lane.unackedItems)
+			lane.unacked = nil
+			lane.unackedCost = 0
+			lane.unackedItems = 0
+			serverDownCursor = lane.downCursor
+		} else if downCursor == 0 {
+			if lane.unackedBase == 0 {
+				replay = lane.unacked
+			}
+			serverDownCursor = lane.downCursor
+		} else {
+			return 0, 0, nil, ErrProtocol
+		}
+	} else {
+		if downCursor == lane.downCursor || downCursor == 0 {
+			serverDownCursor = lane.downCursor
+		} else {
+			return 0, 0, nil, ErrProtocol
+		}
+	}
+	serverUpSeq = lane.lastUpSequence + 1
+	return serverUpSeq, serverDownCursor, replay, nil
+}
+
 
 func (s *Session) AcquireWebSocket() bool {
 	s.mu.Lock()

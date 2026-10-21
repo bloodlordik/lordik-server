@@ -25,9 +25,10 @@ var (
 )
 
 type CreateResult struct {
-	Token   string
-	Welcome []byte
-	Session *Session
+	Token       string
+	ResumeToken string
+	Welcome     []byte
+	Session     *Session
 }
 
 type bootstrap struct {
@@ -78,6 +79,7 @@ type Manager struct {
 	bootstraps           map[[sha256.Size]byte]*bootstrap
 	bootstrapsPerIP      map[string]int
 	sessions             map[[sha256.Size]byte]*Session
+	resumeSessions       map[[sha256.Size]byte]*Session
 	shortSessions        map[string]*Session
 	closedTokens         map[[sha256.Size]byte]time.Time
 	sessionsPerIP        map[string]int
@@ -120,6 +122,7 @@ func NewManager(value config.Config, tokenKey [sha256.Size]byte) *Manager {
 		bootstraps:          make(map[[sha256.Size]byte]*bootstrap),
 		bootstrapsPerIP:     make(map[string]int),
 		sessions:            make(map[[sha256.Size]byte]*Session),
+		resumeSessions:      make(map[[sha256.Size]byte]*Session),
 		shortSessions:       make(map[string]*Session),
 		closedTokens:        make(map[[sha256.Size]byte]time.Time),
 		sessionsPerIP:       make(map[string]int),
@@ -227,9 +230,10 @@ func (m *Manager) Create(token, clientIP string, body []byte) (CreateResult, err
 			return CreateResult{}, ErrAuthentication
 		}
 		return CreateResult{
-			Token:   entry.sessionToken,
-			Welcome: frame.Encode(frame.Welcome, 0, nil),
-			Session: entry.session,
+			Token:       entry.sessionToken,
+			ResumeToken: entry.session.ResumeToken(),
+			Welcome:     frame.Encode(frame.Welcome, 0, nil),
+			Session:     entry.session,
 		}, nil
 	}
 	profileLimits := entry.profile.Limits
@@ -258,6 +262,10 @@ func (m *Manager) Create(token, clientIP string, body []byte) (CreateResult, err
 	if err != nil {
 		return CreateResult{}, err
 	}
+	resumeToken, resumeHash, err := m.newToken(TokenResume)
+	if err != nil {
+		return CreateResult{}, err
+	}
 	limits := m.config.Limits
 	limits.MaxStreamsPerSession = profileLimits.MaxStreamsPerSession
 	limits.MaxPendingPerSession = profileLimits.MaxPendingPerSession
@@ -281,12 +289,15 @@ func (m *Manager) Create(token, clientIP string, body []byte) (CreateResult, err
 		onDown: func(count int) { m.bytesDown.Add(uint64(count)) },
 	})
 	created.tokenHash = sessionHash
+	created.resumeHash = resumeHash
+	created.resumeToken = resumeToken
 	created.bootstrapHash = tokenHash
 	if len(sessionToken) >= 12 {
 		created.shortID = sessionToken[:12]
 		m.shortSessions[created.shortID] = created
 	}
 	m.sessions[sessionHash] = created
+	m.resumeSessions[resumeHash] = created
 	m.sessionsPerIP[clientIP]++
 	m.sessionsPerProfile[entry.profile.Name]++
 	m.releaseUnusedBootstrapLocked(entry)
@@ -296,9 +307,10 @@ func (m *Manager) Create(token, clientIP string, body []byte) (CreateResult, err
 	entry.session = created
 	m.sessionsCreated.Add(1)
 	return CreateResult{
-		Token:   sessionToken,
-		Welcome: frame.Encode(frame.Welcome, 0, nil),
-		Session: created,
+		Token:       sessionToken,
+		ResumeToken: resumeToken,
+		Welcome:     frame.Encode(frame.Welcome, 0, nil),
+		Session:     created,
 	}, nil
 }
 
@@ -327,6 +339,39 @@ func (m *Manager) Get(token string) (*Session, error) {
 	}
 	return result, nil
 }
+func (m *Manager) Resume(token, clientIP string) (*Session, error) {
+	hash, err := tokenHash(token)
+	if err != nil {
+		return nil, ErrAuthentication
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sess := m.resumeSessions[hash]
+	if sess == nil {
+		sess = m.sessions[hash]
+	}
+	if sess == nil || sess.IsClosed() {
+		return nil, ErrAuthentication
+	}
+	if clientIP != "" && sess.clientIP != clientIP {
+		if sess.profile != nil && !sess.profile.CarrierMode.IsCDN() && m.config.Limits.MaxSessionsPerIP != 0 {
+			if m.sessionsPerIP[clientIP] >= m.config.Limits.MaxSessionsPerIP {
+				m.limitHits.Add(1)
+				return nil, ErrLimit
+			}
+		}
+		if sess.clientIP != "" {
+			m.sessionsPerIP[sess.clientIP]--
+			if m.sessionsPerIP[sess.clientIP] <= 0 {
+				delete(m.sessionsPerIP, sess.clientIP)
+			}
+		}
+		sess.clientIP = clientIP
+		m.sessionsPerIP[clientIP]++
+	}
+	return sess, nil
+}
+
 func (m *Manager) GetByShortID(shortID string) (*Session, error) {
 	if shortID == "" {
 		return nil, ErrAuthentication
@@ -417,6 +462,9 @@ func (m *Manager) sessionFinished(value *Session) {
 			hash = value.tokenHash
 			found = true
 			delete(m.sessions, hash)
+			if value.resumeHash != [sha256.Size]byte{} {
+				delete(m.resumeSessions, value.resumeHash)
+			}
 			if value.shortID != "" && m.shortSessions[value.shortID] == value {
 				delete(m.shortSessions, value.shortID)
 			}
@@ -428,6 +476,16 @@ func (m *Manager) sessionFinished(value *Session) {
 				hash = candidateHash
 				found = true
 				delete(m.sessions, candidateHash)
+				if value.resumeHash != [sha256.Size]byte{} {
+					delete(m.resumeSessions, value.resumeHash)
+				} else {
+					for resHash, resSess := range m.resumeSessions {
+						if resSess == value {
+							delete(m.resumeSessions, resHash)
+							break
+						}
+					}
+				}
 				for shortID, currentSession := range m.shortSessions {
 					if currentSession == value {
 						delete(m.shortSessions, shortID)

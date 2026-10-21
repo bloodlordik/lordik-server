@@ -61,6 +61,13 @@ func TestTokenProvenanceSurvivesExpiryAndRestart(t *testing.T) {
 			decoded[i] ^= 1
 		}
 	}
+	resumeToken, _, err := manager.newToken(TokenResume)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manager.ClassifyToken(resumeToken) != TokenResume {
+		t.Fatal("TokenResume not classified correctly")
+	}
 	if _, err := restarted.Create(bootstrap, "127.0.0.1", frame.Encode(frame.Hello, 0, []byte{1})); err == nil {
 		t.Fatal("authentic but missing bootstrap authorized after restart")
 	}

@@ -12,7 +12,7 @@
 const relayBase=__RELAY_BASE__,bootstrap=__BOOTSTRAP__,carrierMode=__CARRIER_MODE__;
 const fragment=location.hash,androidNonce=/^#android=([A-Za-z0-9_-]{43})$/.exec(fragment)?.[1]||'';
 history.replaceState(null,'',location.pathname);
-let initialized=false,closed=false,port=null,sessionToken='',createStarted=false;
+let initialized=false,closed=false,port=null,sessionToken='',resumeToken='',createStarted=false;
 let queuedBytes=0,queuedItems=0;
 const pending=[],lanes=new Map(),closedLanes=new Set(),closedLaneOrder=[];
 const queueLimit=33554432,queueItemLimit=16384,closedLaneLimit=4096;
@@ -119,6 +119,7 @@ async function createSession(first){
   const response=await request('api/v1/session',()=>options('POST',bootstrap,first));
   if(response.status!==200||response.headers.get('X-Carrier-Mode')!==carrierMode)throw new Error('session creation rejected');
   sessionToken=response.headers.get('X-Session-Token')||'';
+  resumeToken=response.headers.get('X-Resume-Token')||sessionToken;
   if(!sessionToken)throw new Error('missing session token');
   if(closed){fetch(relayBase+'api/v1/session',options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{});return}
   const welcome=await response.arrayBuffer();

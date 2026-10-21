@@ -20,6 +20,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/telegramdesktop/tproxy-server/internal/config"
 	"github.com/telegramdesktop/tproxy-server/internal/frame"
+	"github.com/telegramdesktop/tproxy-server/internal/session"
 )
 
 const testHost = "proxy.example.com"
@@ -39,6 +40,8 @@ func TestWebSocketCredentials(t *testing.T) {
 		{webSocketLaneProtocolPrefix + token + ".017", "", 0, false, false},
 		{webSocketLaneProtocolPrefix + token + ".16777216", "", 0, false, false},
 		{webSocketLaneProtocolPrefix + token + ".17.extra", "", 0, false, false},
+		{webSocketResumeProtocolPrefix + token + ".2.100", token, 0, false, true},
+		{webSocketLaneResumeProtocolPrefix + token + ".17.3.200", token, 17, true, true},
 	}
 	for _, test := range tests {
 		gotToken, gotLane, gotLanes, gotOK := webSocketCredentials(test.protocol)
@@ -938,3 +941,313 @@ func readResponse(t *testing.T, response *http.Response) []byte {
 	}
 	return body
 }
+func TestSessionResumeTokenGeneration(t *testing.T) {
+	backend := startEchoBackend(t)
+	application, _ := newConfiguredTestServer(t, backend, func(value *config.Config) {
+		value.Profiles[0].CarrierMode = config.CarrierWebSocket
+	})
+	defer application.Shutdown()
+	hosted := httptest.NewServer(application.Handler())
+	defer hosted.Close()
+
+	clientIP := "198.51.100.7"
+	bootstrap, err := application.manager.IssueBootstrap(&application.config.Profiles[0], clientIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := apiRequest(t, http.MethodPost, hosted.URL+"/api/v1/session", bootstrap, frame.Encode(frame.Hello, 0, []byte{1}))
+	created := perform(t, hosted.Client(), req)
+	_ = readResponse(t, created)
+	if created.StatusCode != http.StatusOK {
+		t.Fatalf("session create failed: status %d", created.StatusCode)
+	}
+	sessionToken := created.Header.Get("X-Session-Token")
+	resumeToken := created.Header.Get("X-Resume-Token")
+	if sessionToken == "" || resumeToken == "" {
+		t.Fatalf("missing tokens: session=%q resume=%q", sessionToken, resumeToken)
+	}
+	if sessionToken == resumeToken {
+		t.Fatalf("sessionToken and resumeToken must be distinct")
+	}
+	if application.manager.ClassifyToken(resumeToken) != session.TokenResume {
+		t.Fatalf("resumeToken not classified as TokenResume")
+	}
+	sess, err := application.manager.Resume(resumeToken, clientIP)
+	if err != nil || sess == nil {
+		t.Fatalf("manager.Resume with resumeToken failed: %v", err)
+	}
+	sessDual, err := application.manager.Resume(sessionToken, clientIP)
+	if err != nil || sessDual != sess {
+		t.Fatalf("manager.Resume with sessionToken failed: %v", err)
+	}
+}
+
+func TestWebSocketZeroDropRecovery(t *testing.T) {
+	backend := startEchoBackend(t)
+	application, _ := newConfiguredTestServer(t, backend, func(value *config.Config) {
+		value.Profiles[0].CarrierMode = config.CarrierWebSocket
+	})
+	defer application.Shutdown()
+	hosted := httptest.NewServer(application.Handler())
+	defer hosted.Close()
+
+	clientIP1 := "198.51.100.7"
+	bootstrap, err := application.manager.IssueBootstrap(&application.config.Profiles[0], clientIP1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := perform(t, hosted.Client(), apiRequest(
+		t,
+		http.MethodPost,
+		hosted.URL+"/api/v1/session",
+		bootstrap,
+		frame.Encode(frame.Hello, 0, []byte{1})))
+	_ = readResponse(t, created)
+	sessionToken := created.Header.Get("X-Session-Token")
+	resumeToken := created.Header.Get("X-Resume-Token")
+	if created.StatusCode != http.StatusOK || sessionToken == "" || resumeToken == "" {
+		t.Fatalf("session create failed: status=%d", created.StatusCode)
+	}
+
+	hostedAddress := strings.TrimPrefix(hosted.URL, "http://")
+	dialer := websocket.Dialer{
+		Subprotocols: []string{webSocketProtocolPrefix + sessionToken},
+		NetDialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, hostedAddress)
+		},
+	}
+	headers1 := http.Header{
+		"Origin":          []string{"https://" + testHost},
+		"X-Forwarded-For": []string{clientIP1},
+	}
+	conn1, response, err := dialer.Dial("ws://"+testHost+"/api/v1/ws", headers1)
+	if err != nil {
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		t.Fatal(err)
+	}
+
+	streamID := uint32(55)
+	payload1 := []byte("first connection message")
+	body1 := append(frame.Encode(frame.Open, streamID, nil), frame.Encode(frame.Data, streamID, payload1)...)
+	if err := conn1.WriteMessage(websocket.BinaryMessage, body1); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = conn1.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var received1 []byte
+	var batchesReceived uint64
+	for !bytes.Equal(received1, payload1) {
+		messageType, msgBody, err := conn1.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if messageType != websocket.BinaryMessage {
+			t.Fatalf("unexpected message type %d", messageType)
+		}
+		batchesReceived++
+		frames, err := frame.ParseAll(msgBody, frame.MaxPayload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range frames {
+			if f.Type == frame.Data && f.StreamID == streamID {
+				received1 = append(received1, f.Payload...)
+			}
+		}
+	}
+
+	// Abruptly drop WebSocket 1 (simulating network handover from Wi-Fi to LTE)
+	_ = conn1.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	// Verify the session and its backend streams are STILL ALIVE
+	sess, err := application.manager.Resume(resumeToken, clientIP1)
+	if err != nil || sess.IsClosed() {
+		t.Fatalf("session died after websocket 1 disconnect: %v", err)
+	}
+
+	// Connect WebSocket 2 from new IP using resume protocol
+	clientIP2 := "198.51.100.8"
+	resumeProtocol := webSocketResumeProtocolPrefix + resumeToken + ".2." + strconv.FormatUint(batchesReceived, 10)
+	dialer2 := websocket.Dialer{
+		Subprotocols: []string{resumeProtocol},
+		NetDialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, hostedAddress)
+		},
+	}
+	headers2 := http.Header{
+		"Origin":          []string{"https://" + testHost},
+		"X-Forwarded-For": []string{clientIP2},
+	}
+	conn2, response2, err := dialer2.Dial("ws://"+testHost+"/api/v1/ws", headers2)
+	if err != nil {
+		if response2 != nil {
+			_ = response2.Body.Close()
+		}
+		t.Fatalf("websocket 2 resume dial failed: %v", err)
+	}
+	defer conn2.Close()
+
+	// Send more data on the EXISTING stream 55 (WITHOUT sending OPEN frame again!)
+	payload2 := []byte("second connection stream migration")
+	body2 := frame.Encode(frame.Data, streamID, payload2)
+	if err := conn2.WriteMessage(websocket.BinaryMessage, body2); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = conn2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var received2 []byte
+	for !bytes.Equal(received2, payload2) {
+		messageType, msgBody, err := conn2.ReadMessage()
+		if err != nil {
+			t.Fatalf("read from conn2 failed: %v", err)
+		}
+		if messageType != websocket.BinaryMessage {
+			t.Fatalf("unexpected message type %d", messageType)
+		}
+		frames, err := frame.ParseAll(msgBody, frame.MaxPayload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range frames {
+			if f.Type == frame.Data && f.StreamID == streamID {
+				received2 = append(received2, f.Payload...)
+			}
+		}
+	}
+}
+
+func TestWebSocketTakeoverOnNetworkHandover(t *testing.T) {
+	backend := startEchoBackend(t)
+	application, _ := newConfiguredTestServer(t, backend, func(value *config.Config) {
+		value.Profiles[0].CarrierMode = config.CarrierWebSocket
+	})
+	defer application.Shutdown()
+	hosted := httptest.NewServer(application.Handler())
+	defer hosted.Close()
+
+	clientIP := "198.51.100.7"
+	bootstrap, err := application.manager.IssueBootstrap(&application.config.Profiles[0], clientIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := perform(t, hosted.Client(), apiRequest(
+		t,
+		http.MethodPost,
+		hosted.URL+"/api/v1/session",
+		bootstrap,
+		frame.Encode(frame.Hello, 0, []byte{1})))
+	_ = readResponse(t, created)
+	sessionToken := created.Header.Get("X-Session-Token")
+	resumeToken := created.Header.Get("X-Resume-Token")
+
+	hostedAddress := strings.TrimPrefix(hosted.URL, "http://")
+	dialer := websocket.Dialer{
+		Subprotocols: []string{webSocketProtocolPrefix + sessionToken},
+		NetDialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, hostedAddress)
+		},
+	}
+	conn1, _, err := dialer.Dial("ws://"+testHost+"/api/v1/ws", http.Header{"X-Forwarded-For": []string{clientIP}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn1.Close()
+
+	// While conn1 is still connected, connect conn2 with resume token (takeover)
+	resumeProtocol := webSocketResumeProtocolPrefix + resumeToken + ".1.0"
+	dialer2 := websocket.Dialer{
+		Subprotocols: []string{resumeProtocol},
+		NetDialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, hostedAddress)
+		},
+	}
+	conn2, _, err := dialer2.Dial("ws://"+testHost+"/api/v1/ws", http.Header{"X-Forwarded-For": []string{"198.51.100.9"}})
+	if err != nil {
+		t.Fatalf("takeover dial failed: %v", err)
+	}
+	defer conn2.Close()
+
+	// Verify conn1 unblocks and terminates due to takeover
+	_ = conn1.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	_, _, err = conn1.ReadMessage()
+	if err == nil {
+		t.Fatalf("expected conn1 to be superseded and closed")
+	}
+
+	// Verify conn2 functions normally
+	streamID := uint32(66)
+	payload := []byte("takeover active echo")
+	body := append(frame.Encode(frame.Open, streamID, nil), frame.Encode(frame.Data, streamID, payload)...)
+	if err := conn2.WriteMessage(websocket.BinaryMessage, body); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var received []byte
+	for !bytes.Equal(received, payload) {
+		_, msgBody, err := conn2.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		frames, err := frame.ParseAll(msgBody, frame.MaxPayload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range frames {
+			if f.Type == frame.Data && f.StreamID == streamID {
+				received = append(received, f.Payload...)
+			}
+		}
+	}
+}
+
+func TestHTTPResumeEndpoint(t *testing.T) {
+	backend := startEchoBackend(t)
+	application, _ := newConfiguredTestServer(t, backend, func(value *config.Config) {
+		value.Profiles[0].CarrierMode = config.CarrierHTTPS
+	})
+	defer application.Shutdown()
+	hosted := httptest.NewServer(application.Handler())
+	defer hosted.Close()
+
+	clientIP := "198.51.100.7"
+	bootstrap, err := application.manager.IssueBootstrap(&application.config.Profiles[0], clientIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := perform(t, hosted.Client(), apiRequest(
+		t,
+		http.MethodPost,
+		hosted.URL+"/api/v1/session",
+		bootstrap,
+		frame.Encode(frame.Hello, 0, []byte{1})))
+	_ = readResponse(t, created)
+	resumeToken := created.Header.Get("X-Resume-Token")
+	if resumeToken == "" {
+		t.Fatal("missing resume token")
+	}
+
+	// Test valid resume request
+	req := apiRequest(t, http.MethodPost, hosted.URL+"/api/v1/resume", resumeToken, nil)
+	req.Header.Set("X-Up-Seq", "1")
+	req.Header.Set("X-Down-Cursor", "0")
+	res := perform(t, hosted.Client(), req)
+	_ = readResponse(t, res)
+	if res.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204 No Content, got %d", res.StatusCode)
+	}
+	if res.Header.Get("X-Up-Seq") != "1" || res.Header.Get("X-Down-Cursor") != "0" {
+		t.Fatalf("unexpected cursor headers: up=%s down=%s", res.Header.Get("X-Up-Seq"), res.Header.Get("X-Down-Cursor"))
+	}
+
+	// Test unauthenticated resume request
+	fakeReq := apiRequest(t, http.MethodPost, hosted.URL+"/api/v1/resume", strings.Repeat("F", 43), nil)
+	fakeRes := perform(t, hosted.Client(), fakeReq)
+	_ = readResponse(t, fakeRes)
+	if fakeRes.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for fake resume token, got %d", fakeRes.StatusCode)
+	}
+}
+

@@ -25,8 +25,10 @@ import (
 )
 
 const (
-	webSocketProtocolPrefix     = "tproxy-v1."
-	webSocketLaneProtocolPrefix = "tproxy-lane-v1."
+	webSocketProtocolPrefix         = "tproxy-v1."
+	webSocketLaneProtocolPrefix     = "tproxy-lane-v1."
+	webSocketResumeProtocolPrefix     = "tproxy-resume-v1."
+	webSocketLaneResumeProtocolPrefix = "tproxy-lane-resume-v1."
 )
 
 // A create body is a single HELLO frame (8-byte header + 1-byte payload), so a
@@ -214,8 +216,11 @@ func (s *Server) serveBridge(w http.ResponseWriter, r *http.Request, profile *co
 }
 
 func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, suffix string) {
-	if r.URL.RawQuery != "" || r.URL.ForceQuery ||
-		len(r.Header.Values("Authorization")) > 1 ||
+	if (r.URL.RawQuery != "" || r.URL.ForceQuery) && suffix != "api/v1/ws" {
+		s.serveNotFound(w, r)
+		return
+	}
+	if len(r.Header.Values("Authorization")) > 1 ||
 		len(r.Header.Values("Sec-WebSocket-Protocol")) > 1 ||
 		(r.Header.Get("Cookie") != "" && suffix != "api/v1/ws") {
 		s.serveNotFound(w, r)
@@ -228,6 +233,10 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, suffix string)
 	}
 	if suffix == "api/v1/ws" {
 		s.serveWebSocket(w, r)
+		return
+	}
+	if suffix == "api/v1/resume" {
+		s.serveResume(w, r, clientIP)
 		return
 	}
 	token, ok := bearerToken(r.Header.Get("Authorization"))
@@ -296,12 +305,69 @@ func (s *Server) serveSession(
 	logger.Info("session created", "client_ip", clientIP, "carrier", result.Session.CarrierMode())
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Session-Token", result.Token)
+	w.Header().Set("X-Resume-Token", result.ResumeToken)
 	w.Header().Set("X-Carrier-Mode", string(result.Session.CarrierMode()))
 	w.Header().Set("X-Down-Cursor", "0")
 	w.Header().Set("Content-Length", strconv.Itoa(len(result.Welcome)))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(result.Welcome)
 }
+func (s *Server) serveResume(w http.ResponseWriter, r *http.Request, clientIP string) {
+	if r.Method != http.MethodPost || !emptyBody(r) || r.Header.Get("Content-Type") != "" {
+		s.serveNotFound(w, r)
+		return
+	}
+	token, ok := bearerToken(r.Header.Get("Authorization"))
+	if !ok {
+		token = r.Header.Get("X-Resume-Token")
+		if token == "" {
+			token = r.Header.Get("X-Session-Token")
+		}
+	}
+	if token == "" {
+		s.serveNotFound(w, r)
+		return
+	}
+	sess, err := s.manager.Resume(token, clientIP)
+	if err != nil {
+		logger.Warn("session resume failed", "client_ip", clientIP, "err", err)
+		s.serveNotFound(w, r)
+		return
+	}
+	upSeq := uint64(1)
+	if upSeqHeader := r.Header.Get("X-Up-Seq"); upSeqHeader != "" {
+		if val, ok := canonicalUint(upSeqHeader); ok {
+			upSeq = val
+		}
+	}
+	downCursor := uint64(0)
+	if downCursorHeader := r.Header.Get("X-Down-Cursor"); downCursorHeader != "" {
+		if val, ok := canonicalUint(downCursorHeader); ok {
+			downCursor = val
+		}
+	}
+	serverUp, serverDown, replay, err := sess.Resume(upSeq, downCursor)
+	if err != nil {
+		logger.Warn("session resume alignment failed", "client_ip", clientIP, "err", err)
+		s.serveNotFound(w, r)
+		return
+	}
+	logger.Info("session resumed", "client_ip", clientIP, "carrier", sess.CarrierMode(), "up_seq", serverUp, "down_cursor", serverDown)
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Resume-Token", sess.ResumeToken())
+	w.Header().Set("X-Carrier-Mode", string(sess.CarrierMode()))
+	w.Header().Set("X-Up-Seq", strconv.FormatUint(serverUp, 10))
+	w.Header().Set("X-Down-Cursor", strconv.FormatUint(serverDown, 10))
+	if len(replay) > 0 {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", strconv.Itoa(len(replay)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(replay)
+	} else {
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
 
 func (s *Server) serveUp(w http.ResponseWriter, r *http.Request, token string) {
 	if r.Method != http.MethodPost || !binaryContentType(r.Header.Get("Content-Type")) {
@@ -429,29 +495,49 @@ func (s *Server) serveDown(w http.ResponseWriter, r *http.Request, token string)
 	_, _ = w.Write(body)
 }
 
+type wsAuthInfo struct {
+	token      string
+	laneID     uint32
+	lanes      bool
+	isResume   bool
+	upSeq      uint64
+	downCursor uint64
+	ok         bool
+}
+
 func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet || r.Header.Get("Authorization") != "" {
 		s.serveNotFound(w, r)
 		return
 	}
 	protocols := websocket.Subprotocols(r)
-	if len(protocols) != 1 {
+	var proto string
+	if len(protocols) == 1 {
+		proto = protocols[0]
+	}
+	auth := webSocketAuth(r, proto)
+	if !auth.ok {
 		s.serveNotFound(w, r)
 		return
 	}
-	token, laneID, lanes, ok := webSocketCredentials(protocols[0])
-	if !ok {
+	if _, ok := bearerToken("Bearer " + auth.token); !ok {
 		s.serveNotFound(w, r)
 		return
 	}
-	if _, ok := bearerToken("Bearer " + token); !ok {
+	clientIP, err := s.clientIP(r)
+	if err != nil {
 		s.serveNotFound(w, r)
 		return
 	}
-	value, err := s.manager.Get(token)
+	var value *session.Session
+	if auth.isResume {
+		value, err = s.manager.Resume(auth.token, clientIP)
+	} else {
+		value, err = s.manager.Get(auth.token)
+	}
 	if err != nil ||
-		(lanes && value.CarrierMode() != config.CarrierWebSocketLanes) ||
-		(!lanes && value.CarrierMode() != config.CarrierWebSocket) {
+		(auth.lanes && value.CarrierMode() != config.CarrierWebSocketLanes) ||
+		(!auth.lanes && value.CarrierMode() != config.CarrierWebSocket) {
 		s.serveNotFound(w, r)
 		return
 	}
@@ -459,11 +545,12 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 		s.serveNotFound(w, r)
 		return
 	}
+	var wsSuperseded chan struct{}
 	acquired := false
-	if lanes {
-		acquired = value.AcquireWebSocketLane(laneID)
+	if auth.lanes {
+		wsSuperseded, acquired = value.AcquireWebSocketLaneTakeover(auth.laneID)
 	} else {
-		acquired = value.AcquireWebSocket()
+		wsSuperseded, acquired = value.AcquireWebSocketTakeover()
 	}
 	if !acquired {
 		s.serveNotFound(w, r)
@@ -480,25 +567,46 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	connection, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		logger.Warn("websocket upgrade failed", "err", err)
-		if lanes {
-			value.ReleaseWebSocketLane(laneID)
+		if auth.lanes {
+			value.ReleaseWebSocketLaneGraceful(auth.laneID)
 		} else {
-			value.Close()
+			value.ReleaseWebSocket()
 		}
 		return
 	}
-	logger.Info("websocket session connected", "carrier", value.CarrierMode(), "lanes", lanes)
-	if lanes {
-		defer value.ReleaseWebSocketLane(laneID)
+	logger.Info("websocket session connected", "carrier", value.CarrierMode(), "lanes", auth.lanes, "resume", auth.isResume)
+	if auth.lanes {
+		defer value.ReleaseWebSocketLaneGraceful(auth.laneID)
 	} else {
-		defer value.Close()
+		defer value.ReleaseWebSocket()
 	}
 	defer connection.Close()
+
+	startSeq := auth.upSeq
+	startCursor := auth.downCursor
+	if auth.isResume {
+		var serverUp, serverDown uint64
+		var replay []byte
+		if auth.lanes {
+			serverUp, serverDown, replay, err = value.ResumeLane(auth.laneID, auth.upSeq, auth.downCursor)
+		} else {
+			serverUp, serverDown, replay, err = value.Resume(auth.upSeq, auth.downCursor)
+		}
+		if err != nil {
+			logger.Warn("websocket resume alignment failed", "client_ip", clientIP, "err", err)
+			return
+		}
+		startSeq = serverUp
+		startCursor = serverDown
+		if len(replay) > 0 {
+			_ = connection.SetWriteDeadline(time.Now().Add(30 * time.Second))
+			if err := connection.WriteMessage(websocket.BinaryMessage, replay); err != nil {
+				return
+			}
+		}
+	}
+
 	connection.SetReadLimit(int64(s.config.Limits.MaxBodyBytes))
-	// A dead peer that never sends is otherwise only noticed by the listener's
-	// TCP keep-alive minutes later: bound silence to two long-poll periods,
-	// refreshed by every message and every pong, and let the writer ping the
-	// peer whenever a poll period passes without downlink data.
 	idle := 2 * s.config.Timeouts.LongPoll.Value()
 	_ = connection.SetReadDeadline(time.Now().Add(idle))
 	connection.SetPongHandler(func(string) error {
@@ -506,30 +614,149 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	})
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	if wsSuperseded != nil {
+		go func() {
+			select {
+			case <-wsSuperseded:
+				_ = connection.Close()
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+	}
 	finished := make(chan error, 2)
-	go s.readWebSocket(ctx, connection, value, laneID, lanes, idle, finished)
-	go s.writeWebSocket(ctx, connection, value, laneID, lanes, finished)
+	go s.readWebSocket(ctx, connection, value, auth.laneID, auth.lanes, idle, startSeq, finished)
+	go s.writeWebSocket(ctx, connection, value, auth.laneID, auth.lanes, startCursor, finished)
 	<-finished
 }
 
-func webSocketCredentials(protocol string) (string, uint32, bool, bool) {
+func webSocketAuth(r *http.Request, protocol string) wsAuthInfo {
+	if strings.HasPrefix(protocol, webSocketResumeProtocolPrefix) {
+		trimmed := strings.TrimPrefix(protocol, webSocketResumeProtocolPrefix)
+		parts := strings.Split(trimmed, ".")
+		if len(parts) >= 1 && parts[0] != "" {
+			upSeq := uint64(1)
+			downCursor := uint64(0)
+			if len(parts) >= 2 {
+				if val, ok := canonicalUint(parts[1]); ok {
+					upSeq = val
+				}
+			}
+			if len(parts) >= 3 {
+				if val, ok := canonicalUint(parts[2]); ok {
+					downCursor = val
+				}
+			}
+			return wsAuthInfo{
+				token:      parts[0],
+				laneID:     0,
+				lanes:      false,
+				isResume:   true,
+				upSeq:      upSeq,
+				downCursor: downCursor,
+				ok:         true,
+			}
+		}
+	}
+	if strings.HasPrefix(protocol, webSocketLaneResumeProtocolPrefix) {
+		trimmed := strings.TrimPrefix(protocol, webSocketLaneResumeProtocolPrefix)
+		parts := strings.Split(trimmed, ".")
+		if len(parts) >= 2 && parts[0] != "" {
+			lane, ok := canonicalUint(parts[1])
+			if ok && lane > 0 && lane <= frame.MaxStreamID {
+				upSeq := uint64(1)
+				downCursor := uint64(0)
+				if len(parts) >= 3 {
+					if val, ok := canonicalUint(parts[2]); ok {
+						upSeq = val
+					}
+				}
+				if len(parts) >= 4 {
+					if val, ok := canonicalUint(parts[3]); ok {
+						downCursor = val
+					}
+				}
+				return wsAuthInfo{
+					token:      parts[0],
+					laneID:     uint32(lane),
+					lanes:      true,
+					isResume:   true,
+					upSeq:      upSeq,
+					downCursor: downCursor,
+					ok:         true,
+				}
+			}
+		}
+	}
 	if strings.HasPrefix(protocol, webSocketProtocolPrefix) {
 		token := strings.TrimPrefix(protocol, webSocketProtocolPrefix)
-		return token, 0, false, token != ""
+		if token != "" {
+			return wsAuthInfo{
+				token:      token,
+				laneID:     0,
+				lanes:      false,
+				isResume:   false,
+				upSeq:      1,
+				downCursor: 0,
+				ok:         true,
+			}
+		}
 	}
-	if !strings.HasPrefix(protocol, webSocketLaneProtocolPrefix) {
-		return "", 0, false, false
+	if strings.HasPrefix(protocol, webSocketLaneProtocolPrefix) {
+		tokenAndLane := strings.TrimPrefix(protocol, webSocketLaneProtocolPrefix)
+		token, laneText, ok := strings.Cut(tokenAndLane, ".")
+		if ok && token != "" {
+			lane, ok := canonicalUint(laneText)
+			if ok && lane > 0 && lane <= frame.MaxStreamID {
+				return wsAuthInfo{
+					token:      token,
+					laneID:     uint32(lane),
+					lanes:      true,
+					isResume:   false,
+					upSeq:      1,
+					downCursor: 0,
+					ok:         true,
+				}
+			}
+		}
 	}
-	tokenAndLane := strings.TrimPrefix(protocol, webSocketLaneProtocolPrefix)
-	token, laneText, ok := strings.Cut(tokenAndLane, ".")
-	if !ok || token == "" {
-		return "", 0, false, false
+	if r != nil {
+		q := r.URL.Query()
+		resumeToken := q.Get("resume")
+		if resumeToken != "" {
+			upSeq := uint64(1)
+			if u, ok := canonicalUint(q.Get("up")); ok {
+				upSeq = u
+			}
+			downCursor := uint64(0)
+			if d, ok := canonicalUint(q.Get("down")); ok {
+				downCursor = d
+			}
+			laneID := uint32(0)
+			lanes := false
+			if laneStr := q.Get("lane"); laneStr != "" {
+				if l, ok := canonicalUint(laneStr); ok && l > 0 && l <= frame.MaxStreamID {
+					laneID = uint32(l)
+					lanes = true
+				}
+			}
+			return wsAuthInfo{
+				token:      resumeToken,
+				laneID:     laneID,
+				lanes:      lanes,
+				isResume:   true,
+				upSeq:      upSeq,
+				downCursor: downCursor,
+				ok:         true,
+			}
+		}
 	}
-	lane, ok := canonicalUint(laneText)
-	if !ok || lane == 0 || lane > frame.MaxStreamID {
-		return "", 0, false, false
-	}
-	return token, uint32(lane), true, true
+	return wsAuthInfo{}
+}
+
+func webSocketCredentials(protocol string) (string, uint32, bool, bool) {
+	auth := webSocketAuth(nil, protocol)
+	return auth.token, auth.laneID, auth.lanes, auth.ok
 }
 
 func (s *Server) readWebSocket(
@@ -539,8 +766,9 @@ func (s *Server) readWebSocket(
 	laneID uint32,
 	lanes bool,
 	idle time.Duration,
+	startSeq uint64,
 	finished chan<- error) {
-	sequence := uint64(1)
+	sequence := startSeq
 	for {
 		messageType, body, err := connection.ReadMessage()
 		if err != nil {
@@ -593,8 +821,9 @@ func (s *Server) writeWebSocket(
 	value *session.Session,
 	laneID uint32,
 	lanes bool,
+	startCursor uint64,
 	finished chan<- error) {
-	cursor := uint64(0)
+	cursor := startCursor
 	for {
 		var body []byte
 		var next uint64
@@ -634,6 +863,7 @@ func (s *Server) writeWebSocket(
 		cursor = next
 	}
 }
+
 
 func (s *Server) clientIP(r *http.Request) (string, error) {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -705,7 +935,7 @@ func (s *Server) transportSuffix(requestPath string) (string, bool) {
 	}
 	suffix := requestPath[len(s.base):]
 	switch suffix {
-	case "api/v1/session", "api/v1/up", "api/v1/down", "api/v1/ws":
+	case "api/v1/session", "api/v1/up", "api/v1/down", "api/v1/ws", "api/v1/resume":
 		return suffix, true
 	}
 	if strings.HasPrefix(suffix, "_next/data/") || strings.HasPrefix(suffix, "assets/") {

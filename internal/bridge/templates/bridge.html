@@ -12,8 +12,8 @@
 const relayBase=__RELAY_BASE__,bootstrap=__BOOTSTRAP__,carrierMode=__CARRIER_MODE__;
 const fragment=location.hash,androidNonce=/^#android=([A-Za-z0-9_-]{43})$/.exec(fragment)?.[1]||'';
 history.replaceState(null,'',location.pathname);
-let initialized=false,closed=false,port=null,sessionToken='',createStarted=false;
-let queuedBytes=0,queuedItems=0,pollController=null,webSocket=null,webSocketTimer=0;
+let initialized=false,closed=false,port=null,sessionToken='',resumeToken='',createStarted=false;
+let queuedBytes=0,queuedItems=0,pollController=null,webSocket=null,webSocketTimer=0,reconnecting=false;
 const pending=[],upPending=[],lanes=new Map(),closedLanes=new Set(),closedLaneOrder=[];
 const queueLimit=33554432,queueItemLimit=16384,closedLaneLimit=4096;
 const laneQueueLimit=8388608,laneItemLimit=1024,batchLimit=__BATCH_LIMIT__;
@@ -130,6 +130,7 @@ async function createSession(first){
   const response=await request('api/v1/session',()=>options('POST',bootstrap,first));
   if(response.status!==200||response.headers.get('X-Carrier-Mode')!==carrierMode)throw new Error('session creation rejected');
   sessionToken=response.headers.get('X-Session-Token')||'';
+  resumeToken=response.headers.get('X-Resume-Token')||sessionToken;
   downCursor=response.headers.get('X-Down-Cursor')||'0';
   if(!sessionToken)throw new Error('missing session token');
   if(closed){fetch(relayBase+'api/v1/session',options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{});return}
@@ -238,17 +239,47 @@ async function pollLane(lane){
  finally{lane.polling=false;lane.controller=null}
 }
 function openWebSocket(){
+ const isResume=arguments[0];
  return new Promise((resolve,reject)=>{
-  const target=relayBase.replace(/^https:/,'wss:')+'api/v1/ws',socket=new WebSocket(target,'tproxy-v1.'+sessionToken);
+  const proto=isResume?('tproxy-resume-v1.'+resumeToken+'.'+upSequence+'.'+downCursor):('tproxy-v1.'+sessionToken);
+  const target=relayBase.replace(/^https:/,'wss:')+'api/v1/ws',socket=new WebSocket(target,proto);
   webSocket=socket;socket.binaryType='arraybuffer';
-  socket.onopen=()=>resolve();
+  socket.onopen=()=>{
+   reconnecting=false;status('connected');runWebSocketUp();resolve();
+  };
   socket.onmessage=event=>{
    if(!(event.data instanceof ArrayBuffer)||!event.data.byteLength){fail();return}
+   downCursor=String(Number(downCursor)+1);
    port.postMessage({t:'traffic',up:0,down:event.data.byteLength});port.postMessage(event.data,[event.data]);status('connected');
   };
-  socket.onerror=()=>reject(new Error('websocket failed'));
-  socket.onclose=()=>{if(!closed)fail()};
+  socket.onerror=()=>{if(!reconnecting)reject(new Error('websocket failed'))};
+  socket.onclose=()=>{
+   if(closed)return;
+   if(!reconnecting)reconnectWebSocket();
+  };
  });
+}
+let wsReconnectAttempts=0;
+async function reconnectWebSocket(){
+ if(closed||reconnecting)return;
+ reconnecting=true;
+ status('reconnecting');
+ let delay=500;
+ while(!closed){
+  try{
+   await openWebSocket(true);
+   wsReconnectAttempts=0;
+   return;
+  }catch(e){
+   wsReconnectAttempts++;
+   if(wsReconnectAttempts>=15){
+    fail();
+    return;
+   }
+   await pause(delay);
+   delay=Math.min(delay*1.5,5000);
+  }
+ }
 }
 function queueWebSocket(data){
  if(!reserve(data,null)){fail();return}
@@ -261,7 +292,7 @@ function runWebSocketUp(){
   return;
  }
  try{
-  const batch=joinPending(upPending,null);webSocket.send(batch.body);release(batch.total,batch.count,null);
+  const batch=joinPending(upPending,null);webSocket.send(batch.body);upSequence++;release(batch.total,batch.count,null);
   port.postMessage({t:'traffic',up:batch.total,down:0});
   if(upPending.length)queueMicrotask(runWebSocketUp);
  }catch(error){fail()}

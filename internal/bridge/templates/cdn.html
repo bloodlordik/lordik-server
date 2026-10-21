@@ -13,7 +13,7 @@ const relayBase=__RELAY_BASE__,bootstrap=__BOOTSTRAP__,carrierMode=__CARRIER_MOD
 const buildId="__BUILD_ID__";
 const fragment=location.hash,androidNonce=/^#android=([A-Za-z0-9_-]{43})$/.exec(fragment)?.[1]||'';
 history.replaceState(null,'',location.pathname);
-let initialized=false,closed=false,port=null,sessionToken='',shortId='',createStarted=false;
+let initialized=false,closed=false,port=null,sessionToken='',resumeToken='',shortId='',createStarted=false;
 let queuedBytes=0,queuedItems=0,pollController=null;
 let activeMode='cdn-adaptive'; // cdn-adaptive, cdn-get, cdn-body
 const pending=[],upPending=[];
@@ -118,6 +118,7 @@ async function tryPostInit(helloBuf,timeoutMs){
     if(!initDone&&!closed){
      initDone=true;
      sessionToken=tok;
+     resumeToken=res.headers.get('X-Resume-Token')||tok;
      shortId=tok.slice(0,12);
      activeMode='cdn-body';
      deliver(welcomeBuf);
@@ -148,6 +149,7 @@ async function tryGetInit(helloBuf,timeoutMs){
    if(json&&json.token&&!initDone&&!closed){
     initDone=true;
     sessionToken=json.token;
+    resumeToken=json.resume_token||json.token;
     shortId=json.short_id||json.token.slice(0,12);
     activeMode='cdn-get';
     if(json.welcome)deliver(fromBase64Url(json.welcome));

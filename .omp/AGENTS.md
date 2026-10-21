@@ -236,3 +236,18 @@ lordik-server/
       - В `direct.go` потоковая расшифровка клиента и зашифровка для Telegram DC выполняются строго in-place (`XORKeyStream(data, data)`) в L1-кэше процессора.
     - **Адаптивный Coalescing (Micro-Wait) для Uplink/Piggybacking**:
       - В `PiggybackDownWait` реализовано адаптивное микро-ожидание (до 25 мс) по заголовку `X-Coalesce: 1` при отсутствии активного поллинга, позволяющее упаковать быстрый ответ дата-центра (рукопожатие/эхо) прямо в ответ на запрос загрузки без дополнительного сетевого RTT.
+16. **Бесшовное восстановление сессий и миграция потоков (Zero-Drop Session Recovery & Stream Migration)**:
+    - **Компоненты**: `internal/session/token.go`, `internal/session/manager.go`, `internal/session/session.go`, `internal/server/server.go`, `internal/server/cdn.go`, `internal/bridge/templates/`.
+    - **Архитектура и назначение**:
+      - При нестабильной мобильной сети (переключение соты Wi-Fi <-> LTE, смена IP, выход устройства из спящего режима) разрыв транспортного соединения (WebSocket / HTTP long-poll) больше не приводит к уничтожению сессии и обрыву TCP-сокетов Telegram DC / MTProxy / Telemt.
+      - Соединения сохраняются на сервере в течение конфигурируемого окна `reconnect_grace` (по умолчанию 2 минуты), а downlink-трафик буферизируется в памяти сессии.
+    - **Криптографический токен возобновления (`X-Resume-Token`)**:
+      - В `TokenClass` добавлен класс токена `TokenResume` (байт 3). Токен генерируется при создании сессии с 12-байтным случайным nonce, 4-байтным AES-фильтром и 16-байтным HMAC-SHA256, сохраняя 100% стойкость к timing/probing атакам.
+      - Поддерживается дуальная аутентификация: восстановление разрешено как по `X-Resume-Token`, так и по оригинальному `X-Session-Token` для обратной совместимости.
+    - **Конечная точка `POST /api/v1/resume`**:
+      - Позволяет HTTP-клиентам мгновенно синхронизировать счетчик `X-Up-Seq` и курсор `X-Down-Cursor`, а также повторно получить пропущенный буфер недоставленных пакетов (`unacked`).
+    - **WebSocket Subprotocols & Socket Takeover**:
+      - Добавлены протоколы `tproxy-resume-v1.<resume-token>.<up-seq>.<down-cursor>` и `tproxy-lane-resume-v1.<resume-token>.<lane-id>.<up-seq>.<down-cursor>` с fallback на query-параметры `?resume=...&up=...&down=...`.
+      - Реализован механизм атомарного перехвата сокета (`AcquireWebSocketTakeover`): при приходе нового подключения с того же или нового IP старый полуоткрытый сокет немедленно прерывается через `wsSuperseded`, не закрывая сессию и передавая управление новому соединению без сброса потоков.
+    - **Автореконнект в Bridge-шаблонах**:
+      - В шаблоны `websocket.html`, `websocket_lanes.html` и `bridge.html` встроен экспоненциальный цикл переподключения с сохранением `upSequence` и `downCursor` (до 15 попыток, ~30–45 с), исключающий падение WebView в статус `failed` при кратковременных сбоях сети.

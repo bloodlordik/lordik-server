@@ -18,6 +18,7 @@ const (
 	TokenExternal TokenClass = iota
 	TokenBootstrap
 	TokenSession
+	TokenResume
 )
 
 var (
@@ -105,11 +106,15 @@ func (c *TokenClassifier) Signed(decoded []byte) bool {
 func (c *TokenClassifier) classifySigned(decoded []byte) TokenClass {
 	bootstrap := subtle.ConstantTimeCompare(decoded[tokenNonceBytes:], c.tokenMAC(TokenBootstrap, decoded[:tokenNonceBytes]))
 	session := subtle.ConstantTimeCompare(decoded[tokenNonceBytes:], c.tokenMAC(TokenSession, decoded[:tokenNonceBytes]))
+	resume := subtle.ConstantTimeCompare(decoded[tokenNonceBytes:], c.tokenMAC(TokenResume, decoded[:tokenNonceBytes]))
 	if bootstrap == 1 {
 		return TokenBootstrap
 	}
 	if session == 1 {
 		return TokenSession
+	}
+	if resume == 1 {
+		return TokenResume
 	}
 	return TokenExternal
 }

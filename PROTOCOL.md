@@ -208,6 +208,7 @@ Body: one HELLO frame
 
 200 OK
 X-Session-Token: session-token
+X-Resume-Token: resume-token
 X-Down-Cursor: 0
 X-Carrier-Mode: https | https-lanes | websocket | websocket-lanes
 Body: one WELCOME frame
@@ -228,8 +229,8 @@ The bootstrap remains unconsumed so the byte-identical creation request can retr
 Bootstrap and session tokens remain opaque 32-byte values encoded as 43 canonical
 unpadded base64url characters. Their server-side layout is a 16-byte nonce
 followed by a 16-byte truncated HMAC-SHA256. The MAC input is
-`"tproxy-server-token-v1\x00" || kind || nonce`, where kind is byte 1 for bootstrap
-and byte 2 for session. The nonce is 12 random bytes and a 4-byte filter tag: the
+`"tproxy-server-token-v1\x00" || kind || nonce`, where kind is byte 1 for bootstrap,
+byte 2 for session, and byte 3 for resume. The nonce is 12 random bytes and a 4-byte filter tag: the
 first 4 bytes of AES-128, keyed with the first 16 bytes of
 HMAC-SHA256(signing key, `"tproxy-server-token-filter-v1\x00"`), over the random
 bytes padded with zeros. The relay checks every base64 offset of unauthenticated
@@ -353,9 +354,12 @@ malformed frame batches, and an incorrect subprotocol are rejected.
 
 The bridge limits its queued plus browser-buffered uplink to 32 MiB. The relay waits
 up to 30 seconds for temporary backend-write backpressure to clear before closing the
-carrier. A WebSocket loss closes the relay session and every logical stream; this
-reference implementation does not resume a partially delivered WebSocket session.
-
+A WebSocket loss does not immediately destroy the relay session or its active backend
+TCP streams; backend connections to Telegram DCs / MTProxy are preserved for the
+configurable `reconnect_grace` window (default 2 minutes). The client bridge runtime
+automatically reconnects using the `tproxy-resume-v1` subprotocol, synchronizing
+sequence counters and resuming bidirectional transmission without dropping backend streams.
+If the client does not resume within the grace period, the session is cleanly closed.
 One multiplexed WebSocket is sufficient for correctness and removes the HTTP
 stop-and-wait ceiling. It does not preserve the queue and failure isolation of the
 separate TCP connections Telegram normally uses for API, upload, and download
@@ -380,9 +384,10 @@ is no lane-zero WebSocket: HTTPS bootstrap carries `HELLO` and `WELCOME`, while
 WebSocket protocol ping/pong frames provide connection liveness.
 
 Each socket has independent ordered delivery, browser buffering, relay writer,
-and backend connection. Closing an established lane unexpectedly closes that one
-backend stream, and the bridge returns a `CLOSE` frame to the app; other lanes and
-the parent relay session remain active. A client or backend `CLOSE` completes that
+and backend connection. When an established lane socket drops unexpectedly, the backend
+connection is preserved across the `reconnect_grace` window, allowing lane resumption via
+`tproxy-lane-resume-v1`. Only an explicit stream `CLOSE` frame or timeout expiry closes the
+backend stream.
 lane's shutdown and then closes its socket. Failure to establish a new lane is
 treated as parent-carrier failure because it normally means the relay session,
 origin, or network is no longer usable. Deleting or expiring the parent session
@@ -403,6 +408,42 @@ server resources.
 idempotent for a currently authenticated session. Tokens use the opaque signed
 representation described above. Missing or random credentials follow the public
 website; authentic but unusable credentials receive a local uncacheable 404.
+
+### Zero-Drop Session Recovery & Stream Migration
+
+Mobile devices frequently experience transient connection drops (e.g., Wi-Fi <-> LTE
+handover, tunnel resets, and waking from sleep). To prevent Telegram MTProto connections
+from resetting and re-entering the "Connecting..." state, the relay implements Zero-Drop
+Session Recovery:
+
+1. **Cryptographic Resume Token**:
+   During session creation, the server issues an unguessable `X-Resume-Token` (token kind 3).
+   Dual-authentication permits either the resume token or session token for resumption.
+
+2. **HTTP Resume Endpoint**:
+   ```text
+   POST /api/v1/resume
+   Authorization: Bearer <resume-token>  (or X-Resume-Token header)
+   X-Up-Seq: <next-client-uplink-seq>
+   X-Down-Cursor: <last-received-downlink-cursor>
+
+   200 OK / 204 No Content
+   X-Resume-Token: <resume-token>
+   X-Carrier-Mode: <mode>
+   X-Up-Seq: <server-expected-next-up-seq>
+   X-Down-Cursor: <server-current-down-cursor>
+   Body: [replay of unacknowledged downlink frames if cursor was base, or empty]
+   ```
+
+3. **WebSocket Zero-Drop Resume Subprotocols**:
+   - Single WebSocket: `Sec-WebSocket-Protocol: tproxy-resume-v1.<resume-token>.<up-seq>.<down-cursor>`
+   - WebSocket Lanes: `Sec-WebSocket-Protocol: tproxy-lane-resume-v1.<resume-token>.<lane-id>.<up-seq>.<down-cursor>`
+   - Fallback for restricted WebViews: query parameters `?resume=<token>&up=<seq>&down=<cur>[&lane=<id>]`.
+
+4. **Socket Takeover**:
+   When a client migrates between networks, the new connection seamlessly supersedes any
+   lingering half-open socket from the previous interface without dropping buffered packets
+   or resetting stream state.
 
 ## Shared frames
 
