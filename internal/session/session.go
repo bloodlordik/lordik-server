@@ -135,6 +135,7 @@ type Session struct {
 	done                  chan struct{}
 	carrierLanes          map[uint32]*carrierLane
 	cdnReassembly         *ReassemblyBuffer
+	cdnPendingFrames      []frame.Frame
 	finishOnce            sync.Once
 	backendWG             sync.WaitGroup
 	onFinished            func(*Session)
@@ -707,6 +708,13 @@ func (s *Session) ProcessUpCDN(sequence uint64, chunk []byte) (int, error) {
 		return 0, ErrClosed
 	}
 	s.lastActivity = time.Now()
+
+	var frames []frame.Frame
+	// If there were deferred frames from a previous backpressure event, apply them first
+	if len(s.cdnPendingFrames) != 0 {
+		frames = s.cdnPendingFrames
+	}
+
 	if s.cdnReassembly == nil {
 		windowSize := uint64(s.limits.CDNUplinkWindowSize)
 		if windowSize == 0 {
@@ -714,15 +722,15 @@ func (s *Session) ProcessUpCDN(sequence uint64, chunk []byte) (int, error) {
 		}
 		s.cdnReassembly = NewReassemblyBuffer(windowSize, s.limits.MaxFramePayload)
 	}
-	frames, duplicate, err := s.cdnReassembly.Push(sequence, chunk)
+
+	pushedFrames, _, err := s.cdnReassembly.Push(sequence, chunk)
 	if err != nil {
 		s.mu.Unlock()
 		s.protocolFailure()
 		return 0, err
 	}
-	if duplicate {
-		s.mu.Unlock()
-		return 0, nil
+	if len(pushedFrames) != 0 {
+		frames = append(frames, pushedFrames...)
 	}
 	if len(frames) == 0 {
 		s.mu.Unlock()
@@ -737,9 +745,11 @@ func (s *Session) ProcessUpCDN(sequence uint64, chunk []byte) (int, error) {
 	reservedCost, reservedItems := s.backendWriteReservationLocked(frames)
 	if (reservedCost != 0 || reservedItems != 0) &&
 		!s.reservePendingLocked(reservedCost, reservedItems, pendingUplink) {
+		s.cdnPendingFrames = frames
 		s.mu.Unlock()
 		return 0, ErrBackpressure
 	}
+	s.cdnPendingFrames = nil
 	opened, closed, unusedCost, unusedItems, applied := s.applyBatchLocked(
 		frames,
 		reservedCost,
@@ -775,21 +785,32 @@ func (s *Session) PiggybackDown(cursor uint64) ([]byte, uint64, error) {
 		return nil, cursor, ErrClosed
 	}
 	s.lastActivity = time.Now()
-	if len(s.unacked) != 0 {
-		if cursor == s.unackedBase {
-			return s.unacked, s.downCursor, nil
-		}
-		if cursor != s.downCursor {
-			s.protocolFailure()
-			return nil, cursor, ErrProtocol
-		}
+
+	// 1. Future cursor is an invariant violation.
+	if cursor > s.downCursor {
+		s.closeLocked()
+		return nil, cursor, ErrProtocol
+	}
+
+	// 2. Client acknowledges current unacked batch.
+	if cursor == s.downCursor && len(s.unacked) != 0 {
 		s.releasePendingLocked(s.unackedCost, s.unackedItems)
 		s.unacked = nil
 		s.unackedCost = 0
 		s.unackedItems = 0
-	} else if cursor != s.downCursor {
-		s.protocolFailure()
-		return nil, cursor, ErrProtocol
+	}
+
+	// 3. Stale cursor from a concurrent in-flight request, or unacked batch still in flight.
+	// Do not duplicate traffic; client will receive via long-poll or next request.
+	if cursor < s.downCursor || len(s.unacked) != 0 {
+		return nil, s.downCursor, nil
+	}
+
+	// 4. If PollCDN is currently active, supersede it so it doesn't race for downlink frames.
+	if s.downActive && s.superseded != nil {
+		close(s.superseded)
+		s.downActive = false
+		s.superseded = nil
 	}
 
 	if len(s.pendingFrames) == 0 {
@@ -827,26 +848,34 @@ func (s *Session) PollCDN(ctx context.Context, cursor uint64, timeout time.Durat
 		return nil, cursor, ErrClosed
 	}
 	s.lastActivity = time.Now()
-	if len(s.unacked) != 0 {
-		if cursor == s.unackedBase {
+
+	if cursor > s.downCursor {
+		s.mu.Unlock()
+		s.protocolFailure()
+		return nil, cursor, ErrProtocol
+	}
+
+	if cursor < s.downCursor {
+		// If retry of current unacked batch
+		if len(s.unacked) != 0 && cursor == s.unackedBase {
 			result := s.unacked
 			next := s.downCursor
 			s.mu.Unlock()
 			return result, next, nil
 		}
-		if cursor != s.downCursor {
-			s.mu.Unlock()
-			s.protocolFailure()
-			return nil, cursor, ErrProtocol
-		}
+		// Otherwise this cursor was already acknowledged by a concurrent request.
+		// Return empty with current downCursor.
+		next := s.downCursor
+		s.mu.Unlock()
+		return nil, next, nil
+	}
+
+	// cursor == s.downCursor: client acknowledged previous unacked batch
+	if len(s.unacked) != 0 {
 		s.releasePendingLocked(s.unackedCost, s.unackedItems)
 		s.unacked = nil
 		s.unackedCost = 0
 		s.unackedItems = 0
-	} else if cursor != s.downCursor {
-		s.mu.Unlock()
-		s.protocolFailure()
-		return nil, cursor, ErrProtocol
 	}
 
 	if s.downActive && s.superseded != nil {
@@ -1712,6 +1741,8 @@ func (s *Session) closeLocked() {
 	s.unacked = nil
 	s.unackedCost = 0
 	s.unackedItems = 0
+	s.cdnReassembly = nil
+	s.cdnPendingFrames = nil
 	signal(s.notify)
 	s.finishOnce.Do(func() {
 		if s.onFinished != nil {

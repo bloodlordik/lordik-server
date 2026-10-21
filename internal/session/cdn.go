@@ -198,20 +198,24 @@ func UnwrapGLTF(data []byte) (uint32, []byte, error) {
 
 // DecodeCDNPayload decodes base64url payload split across URL path and sharded headers.
 func DecodeCDNPayload(urlPart string, headers []string) ([]byte, error) {
+	totalLen := len(urlPart)
+	for _, h := range headers {
+		totalLen += len(h)
+	}
+	if totalLen == 0 {
+		return nil, nil
+	}
 	var sb strings.Builder
+	sb.Grow(totalLen)
 	sb.WriteString(urlPart)
 	for _, h := range headers {
 		sb.WriteString(strings.TrimSpace(h))
 	}
-	raw := sb.String()
+	raw := strings.TrimRight(sb.String(), "=")
 	if raw == "" {
 		return nil, nil
 	}
-	// Support unpadded and padded Base64URL
-	if pad := len(raw) % 4; pad != 0 {
-		raw += strings.Repeat("=", 4-pad)
-	}
-	return base64.URLEncoding.DecodeString(raw)
+	return base64.RawURLEncoding.DecodeString(raw)
 }
 
 // EncodeCDNPayload encodes binary data into base64url and shards it into URL part

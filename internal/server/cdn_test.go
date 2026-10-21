@@ -297,3 +297,58 @@ func TestCDNCollectAndSyncPost(t *testing.T) {
 		t.Fatalf("expected 'sync data post', got %q", string(echoed))
 	}
 }
+
+func TestCDNChunkGetWithQueryParamPayload(t *testing.T) {
+	backend := startEchoBackend(t)
+	application, _ := newConfiguredTestServer(t, backend, func(value *config.Config) {
+		value.Profiles[0].CarrierMode = config.CarrierCDNAdaptive
+	})
+	defer application.Shutdown()
+
+	hosted := httptest.NewServer(application.Handler())
+	defer hosted.Close()
+
+	buildID := application.BuildID()
+	clientIP := "198.51.100.56"
+
+	bootstrap, err := application.manager.IssueBootstrap(&application.config.Profiles[0], clientIP)
+	if err != nil {
+		t.Fatalf("IssueBootstrap failed: %v", err)
+	}
+
+	helloFrame := frame.Encode(frame.Hello, 0, []byte{1})
+	helloB64 := base64.RawURLEncoding.EncodeToString(helloFrame)
+	initURL := hosted.URL + "/_next/data/" + buildID + "/init/" + bootstrap + "/" + helloB64 + ".json"
+
+	initReq := request(t, http.MethodGet, initURL, nil, clientIP)
+	initReq.Header.Set("X-Client-Key", bootstrap)
+	initRes := perform(t, hosted.Client(), initReq)
+	initBody := readResponse(t, initRes)
+	if initRes.StatusCode != http.StatusOK {
+		t.Fatalf("init handshake failed: %d %s", initRes.StatusCode, string(initBody))
+	}
+
+	var initJSON struct {
+		Token   string `json:"token"`
+		ShortID string `json:"short_id"`
+		Welcome string `json:"welcome"`
+	}
+	_ = json.Unmarshal(initBody, &initJSON)
+
+	// Uplink OPEN frame using query param format: /assets/chunks/{short_id}/{seq}.bin?p={payload}
+	openFrame := frame.Encode(frame.Open, 202, nil)
+	openB64 := base64.RawURLEncoding.EncodeToString(openFrame)
+	chunkURL := hosted.URL + "/assets/chunks/" + initJSON.ShortID + "/1.bin?p=" + openB64
+
+	chunkReq := request(t, http.MethodGet, chunkURL, nil, clientIP)
+	chunkReq.Header.Set("X-Client-Key", initJSON.Token)
+	chunkReq.Header.Set("X-Request-ID", "1.0.0")
+
+	chunkRes := perform(t, hosted.Client(), chunkReq)
+	if chunkRes.StatusCode != http.StatusOK {
+		t.Fatalf("chunk GET with ?p= failed: %d", chunkRes.StatusCode)
+	}
+	if chunkRes.Header.Get("CDN-Cache-Control") != "no-store" {
+		t.Fatalf("missing CDN-Cache-Control header")
+	}
+}

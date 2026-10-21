@@ -187,3 +187,14 @@ lordik-server/
     - **Защита от активного зондирования (Active Probing Resistance)**:
       - Любые некорректные или неавторизованные запросы мгновенно перенаправляются на Decoy-сайт (`servePublic`) с кодом 404, исключая утечку серверных заголовков прокси.
       - Заголовок `X-Client-Key` мгновенно классифицируется в `carrierCredential`, исключая переборные коллизии.
+    - **Стабилизация параллельных потоков и устранение гонок курсоров (CDN Review)**:
+      - **Безопасная обработка устаревших курсоров в `PiggybackDown` и `PollCDN`**: при параллельных uplink-запросах (`maxInflight = 6`) приход запроса с устаревшим курсором (`cursor < s.downCursor`) штатно возвращает текущий `s.downCursor` с пустым телом без сброса протокола (`s.protocolFailure()`) и без повторной перекачки трафика.
+      - **Устранение взаимной блокировки (deadlock)**: в `PiggybackDown` ошибка протокола вызывает `s.closeLocked()` напрямую без повторного захвата мьютекса `s.mu`.
+      - **Сохранение кадров при `ErrBackpressure`**: в `Session` добавлено поле `cdnPendingFrames`, исключающее потерю извлеченных кадров при повторных попытках (HTTP 503).
+      - **Гарантированная очистка памяти**: в `closeLocked()` обнуляются `s.cdnReassembly` и `s.cdnPendingFrames`.
+      - **Доставка кадра `WELCOME` в `cdn.html`**: корректное чтение ArrayBuffer в `POST` и Base64URL в `GET` с передачей в `deliver()`.
+      - **Демультиплексирование батчей в `deliver()` и Android Bridge**: батчи кадров разделяются через `splitFrames()` перед отправкой в порт.
+      - **Happy Eyeballs Handshake в `cdn.html`**: параллельный запуск GET через 250 мс при задержке ответа на POST, сокращающий время подключения.
+      - **Immediate First Dispatch**: мгновенная отправка первого пакета (0 мс задержки пинга) при `upInflight == 0`.
+      - **Оптимизация Base64URL**: блочное кодирование чанками по 4096 байт с поддержкой нативного `Uint8Array.prototype.toBase64` и быстрым `DecodeCDNPayload` на базе `RawURLEncoding`.
+      - **Query String Payload и CDN-кэширование**: поддержка передачи URL-части через `?p=...` в `serveCDNChunkGet` (устранение проблем с `NAME_MAX`), расширенные заголовки запрета кэширования (`CDN-Cache-Control`, `Cloudflare-CDN-Cache-Control`, `Surrogate-Control`, `X-Accel-Buffering`) и легковесный ETag (`W/{cursor}-{len}`).

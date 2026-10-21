@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -180,7 +179,11 @@ func (s *Server) serveCDNCollect(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Session-Token", res.Token)
 	w.Header().Set("X-Carrier-Mode", "cdn-body")
 	w.Header().Set("X-Down-Cursor", "0")
-	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	w.Header().Set("Cache-Control", "private, no-store, no-cache, max-age=0, must-revalidate")
+	w.Header().Set("CDN-Cache-Control", "no-store")
+	w.Header().Set("Cloudflare-CDN-Cache-Control", "no-store")
+	w.Header().Set("Surrogate-Control", "no-store")
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Content-Length", strconv.Itoa(len(res.Welcome)))
 	w.WriteHeader(http.StatusOK)
@@ -229,7 +232,11 @@ func (s *Server) serveCDNInit(w http.ResponseWriter, r *http.Request, bootstrapT
 	respJSON, _ := json.Marshal(resp)
 
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	w.Header().Set("Cache-Control", "private, no-store, no-cache, max-age=0, must-revalidate")
+	w.Header().Set("CDN-Cache-Control", "no-store")
+	w.Header().Set("Cloudflare-CDN-Cache-Control", "no-store")
+	w.Header().Set("Surrogate-Control", "no-store")
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Content-Length", strconv.Itoa(len(respJSON)))
 	w.WriteHeader(http.StatusOK)
@@ -238,13 +245,21 @@ func (s *Server) serveCDNInit(w http.ResponseWriter, r *http.Request, bootstrapT
 
 func (s *Server) serveCDNChunkGet(w http.ResponseWriter, r *http.Request, sessionShortID, file string) {
 	cleanFile := strings.TrimSuffix(file, ".bin")
+	var seqStr, urlPayloadB64 string
 	idx := strings.Index(cleanFile, "_")
-	if idx <= 0 {
+	if idx > 0 {
+		seqStr = cleanFile[:idx]
+		urlPayloadB64 = cleanFile[idx+1:]
+	} else {
+		seqStr = cleanFile
+	}
+	if qp := r.URL.Query().Get("p"); qp != "" {
+		urlPayloadB64 = qp
+	}
+	if seqStr == "" {
 		s.servePublic(w, r)
 		return
 	}
-	seqStr := cleanFile[:idx]
-	urlPayloadB64 := cleanFile[idx+1:]
 	seq, err := strconv.ParseUint(seqStr, 10, 64)
 	if err != nil {
 		s.servePublic(w, r)
@@ -371,19 +386,26 @@ func (s *Server) serveCDNUnload(w http.ResponseWriter, r *http.Request, sessionS
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	w.Header().Set("Cache-Control", "private, no-store, no-cache, max-age=0, must-revalidate")
+	w.Header().Set("CDN-Cache-Control", "no-store")
+	w.Header().Set("Cloudflare-CDN-Cache-Control", "no-store")
+	w.Header().Set("Surrogate-Control", "no-store")
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.Header().Set("Pragma", "no-cache")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("{\"s\":1}"))
 }
 
 func (s *Server) writeCDNDownlinkResponse(w http.ResponseWriter, batch []byte, cursor uint64) {
-	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	w.Header().Set("Cache-Control", "private, no-store, no-cache, max-age=0, must-revalidate")
+	w.Header().Set("CDN-Cache-Control", "no-store")
+	w.Header().Set("Cloudflare-CDN-Cache-Control", "no-store")
+	w.Header().Set("Surrogate-Control", "no-store")
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.Header().Set("Pragma", "no-cache")
 	if len(batch) > 0 {
 		gltf := session.WrapGLTF(batch, cursor)
-		sum := sha256.Sum256(batch)
-		etag := fmt.Sprintf("\"%x-%d\"", sum[:8], cursor)
+		etag := fmt.Sprintf("\"W/%x-%x\"", cursor, len(batch))
 		w.Header().Set("Content-Type", "model/gltf-binary")
 		w.Header().Set("ETag", etag)
 		w.Header().Set("Content-Length", strconv.Itoa(len(gltf)))

@@ -37,6 +37,7 @@ func observingPublicHandler(w http.ResponseWriter, r *http.Request) {
 		kind, body, err := connection.ReadMessage()
 		if err == nil {
 			_ = connection.WriteMessage(kind, body)
+			_, _, _ = connection.ReadMessage()
 		}
 		return
 	}

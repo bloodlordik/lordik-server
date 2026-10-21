@@ -2,10 +2,13 @@ package session
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"errors"
 	"testing"
+	"time"
 
+	"github.com/telegramdesktop/tproxy-server/internal/config"
 	"github.com/telegramdesktop/tproxy-server/internal/frame"
 )
 
@@ -165,5 +168,67 @@ func TestCDNMemoryAndBoundaryLimits(t *testing.T) {
 	_, err = parser.Feed(oversized)
 	if !errors.Is(err, ErrLimit) {
 		t.Fatalf("expected ErrLimit for feed exceeding maxPendingBytes, got %v", err)
+	}
+}
+
+func TestPiggybackAndPollStaleCursorGraceful(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Profiles[0].CarrierMode = config.CarrierCDNAdaptive
+	sess := newSession(sessionOptions{
+		profile:  &configuration.Profiles[0],
+		limits:   configuration.Limits,
+		timeouts: configuration.Timeouts,
+	})
+	defer sess.Close()
+
+	// Queue a downlink frame
+	sess.mu.Lock()
+	queued := sess.queueFrameLocked(frame.Data, 1, []byte("response 1"))
+	sess.mu.Unlock()
+	if !queued {
+		t.Fatal("failed to queue test frame")
+	}
+
+	// 1. Initial PiggybackDown with cursor 0
+	body, cursor, err := sess.PiggybackDown(0)
+	if err != nil {
+		t.Fatalf("initial PiggybackDown failed: %v", err)
+	}
+	if len(body) == 0 || cursor != 1 {
+		t.Fatalf("expected batch at cursor 1, got len=%d cursor=%d", len(body), cursor)
+	}
+
+	// 2. Parallel in-flight request arrives with old cursor 0
+	// MUST NOT fail protocol and MUST NOT kill the session!
+	body2, cursor2, err := sess.PiggybackDown(0)
+	if err != nil {
+		t.Fatalf("parallel PiggybackDown(0) failed with error: %v", err)
+	}
+	if len(body2) != 0 || cursor2 != 1 {
+		t.Fatalf("expected empty body and cursor 1 for stale parallel request, got len=%d cursor=%d", len(body2), cursor2)
+	}
+
+	// 3. Client acks cursor 1
+	body3, cursor3, err := sess.PiggybackDown(1)
+	if err != nil {
+		t.Fatalf("PiggybackDown(1) ack failed: %v", err)
+	}
+	if len(body3) != 0 || cursor3 != 1 {
+		t.Fatalf("expected empty body for empty queue ack, got len=%d cursor=%d", len(body3), cursor3)
+	}
+
+	// 4. Stale PollCDN with cursor 0 arrives after parallel request already advanced cursor
+	pollBody, pollCursor, err := sess.PollCDN(context.Background(), 0, 10*time.Millisecond)
+	if err != nil {
+		t.Fatalf("stale PollCDN(0) failed: %v", err)
+	}
+	if len(pollBody) != 0 || pollCursor != 1 {
+		t.Fatalf("expected empty body and cursor 1 for stale PollCDN, got len=%d cursor=%d", len(pollBody), pollCursor)
+	}
+
+	// 5. Future cursor MUST fail protocol
+	_, _, err = sess.PiggybackDown(99)
+	if !errors.Is(err, ErrProtocol) {
+		t.Fatalf("expected ErrProtocol on future cursor, got %v", err)
 	}
 }
