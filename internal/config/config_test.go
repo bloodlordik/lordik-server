@@ -432,6 +432,15 @@ func TestDirectBackendConfiguration(t *testing.T) {
 	if loaded.Profiles[0].BackendType != BackendDirect || loaded.Profiles[0].StaticDC != "2" || loaded.Profiles[0].Backend != "2" {
 		t.Fatalf("unexpected static direct profile: %#v", loaded.Profiles[0])
 	}
+	// 2b. Valid direct profile with static_dc 203 (CDN) and negative -2 (media)
+	staticCDN := `{"profiles":[{"name":"direct_cdn","secret":"000102030405060708090a0b0c0d0e0f","backend_type":"direct","static_dc":203}]}`
+	loaded, err = writeConfig(staticCDN, "", "")
+	if err != nil {
+		t.Fatalf("valid direct static_dc 203 rejected: %v", err)
+	}
+	if loaded.Profiles[0].StaticDC != "203" {
+		t.Fatalf("unexpected static_dc: %s", loaded.Profiles[0].StaticDC)
+	}
 
 	// 3. Valid direct profile with explicit IP:port backend
 	explicitAddr := `{"profiles":[{"name":"direct_addr","secret":"000102030405060708090a0b0c0d0e0f","backend_type":"direct","backend":"149.154.167.51:443"}]}`

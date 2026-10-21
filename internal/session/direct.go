@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"strconv"
 	"strings"
@@ -20,22 +21,42 @@ import (
 
 // Known Telegram DC IP addresses (standard port 443).
 var defaultTelegramDCsIPv4 = map[int16]string{
-	1:  "149.154.175.50:443",
-	2:  "149.154.167.51:443",
-	3:  "149.154.175.100:443",
-	4:  "149.154.167.91:443",
-	5:  "91.108.56.130:443",
-	-1: "149.154.175.10:443",
-	-2: "149.154.167.40:443",
-	-3: "149.154.175.117:443",
+	// Main DCs (API, messages)
+	1: "149.154.175.50:443",
+	2: "149.154.167.51:443",
+	3: "149.154.175.100:443",
+	4: "149.154.167.91:443",
+	5: "149.154.171.5:443",
+
+	// Media-only DCs (negative IDs for downloading/uploading photos/videos/files)
+	-1: "149.154.175.50:443",
+	-2: "149.154.167.151:443", // Dedicated Media DC2 server (upload.getFile)
+	-3: "149.154.175.100:443",
+	-4: "149.154.166.120:443", // Dedicated Media DC4 server (upload.getFile)
+	-5: "149.154.171.5:443",
+	// CDN DCs (public channels and media)
+	203:  "91.105.192.100:443",
+	-203: "91.105.192.100:443",
 }
 
 var defaultTelegramDCsIPv6 = map[int16]string{
+	// Main DCs (API, messages)
 	1: "[2001:b28:f23d:f001::a]:443",
 	2: "[2001:67c:04e8:f002::a]:443",
 	3: "[2001:b28:f23d:f003::a]:443",
 	4: "[2001:67c:04e8:f004::a]:443",
 	5: "[2001:b28:f23f:f005::a]:443",
+
+	// Media-only DCs
+	-1: "[2001:b28:f23d:f001::a]:443",
+	-2: "[2001:67c:04e8:f002::a]:443",
+	-3: "[2001:b28:f23d:f003::a]:443",
+	-4: "[2001:67c:04e8:f004::a]:443",
+	-5: "[2001:b28:f23f:f005::a]:443",
+
+	// CDN DCs
+	203:  "[2001:b28:f23d:f003::a]:443",
+	-203: "[2001:b28:f23d:f003::a]:443",
 }
 
 const (
@@ -150,6 +171,12 @@ func isValidProtoTag(tag uint32) bool {
 // - tgEncryptor: cipher stream for uplink to Telegram DC (pre-advanced by 64 bytes)
 // - tgDecryptor: cipher stream for downlink from Telegram DC (starting at offset 0)
 func CreateTelegramHandshake(protoTag uint32, dcIdx int16) ([]byte, cipher.Stream, cipher.Stream, error) {
+	if protoTag == 0 {
+		protoTag = TagIntermediate
+	}
+	if dcIdx == 0 {
+		dcIdx = 2
+	}
 	tgNonce := make([]byte, 64)
 	for {
 		if _, err := rand.Read(tgNonce); err != nil {
@@ -205,6 +232,16 @@ func CreateTelegramHandshake(protoTag uint32, dcIdx int16) ([]byte, cipher.Strea
 	return headerToSend, tgEncryptor, tgDecryptor, nil
 }
 
+func absDC(dcIdx int16) int16 {
+	if dcIdx == math.MinInt16 {
+		return 0
+	}
+	if dcIdx < 0 {
+		return -dcIdx
+	}
+	return dcIdx
+}
+
 // ResolveTelegramDC resolves the destination address for a direct Telegram connection.
 // It prioritizes explicit backend/staticDC configurations, falling back to dynamic DC index
 // resolution from the handshake.
@@ -221,20 +258,57 @@ func ResolveTelegramDC(backend, staticDC string, dcIdx int16, preferIPv6 bool, o
 		return resolveCandidate(candidate, preferIPv6)
 	}
 
+	// Normalize older media DC representation (10000 + DC)
+	if dcIdx > 10000 && dcIdx <= 10005 {
+		dcIdx = -(dcIdx - 10000)
+	}
+
+	absIdx := absDC(dcIdx)
+
 	// 3. Dynamic resolution from handshake dcIdx
+	// 3a. Check overrides
 	if overrides != nil {
 		if addr, ok := overrides[dcIdx]; ok && addr != "" {
 			return addr, nil
 		}
+		if addr, ok := overrides[absIdx]; ok && addr != "" {
+			return addr, nil
+		}
 	}
 
+	// 3b. IPv6 resolution if preferred
 	if preferIPv6 {
 		if addr, ok := defaultTelegramDCsIPv6[dcIdx]; ok {
 			return addr, nil
 		}
+		if addr, ok := defaultTelegramDCsIPv6[absIdx]; ok {
+			return addr, nil
+		}
 	}
+
+	// 3c. IPv4 resolution
 	if addr, ok := defaultTelegramDCsIPv4[dcIdx]; ok {
 		return addr, nil
+	}
+	if addr, ok := defaultTelegramDCsIPv4[absIdx]; ok {
+		return addr, nil
+	}
+
+	// 3d. Fallback across IP versions
+	if preferIPv6 {
+		if addr, ok := defaultTelegramDCsIPv4[dcIdx]; ok {
+			return addr, nil
+		}
+		if addr, ok := defaultTelegramDCsIPv4[absIdx]; ok {
+			return addr, nil
+		}
+	} else {
+		if addr, ok := defaultTelegramDCsIPv6[dcIdx]; ok {
+			return addr, nil
+		}
+		if addr, ok := defaultTelegramDCsIPv6[absIdx]; ok {
+			return addr, nil
+		}
 	}
 
 	// Fallback to default DC 2 (Amsterdam) if dcIdx is unknown or 0
@@ -254,17 +328,24 @@ func resolveCandidate(val string, preferIPv6 bool) (string, error) {
 		return val, nil
 	}
 
-	// Clean optional "dc" prefix, e.g. "dc2" -> "2"
+	// Clean optional "dc" prefix, e.g. "dc2" -> "2", "dc-2" -> "-2", "dc203" -> "203"
 	cleanVal := strings.TrimPrefix(strings.ToLower(val), "dc")
 	dcNum, err := strconv.Atoi(cleanVal)
 	if err == nil {
 		idx := int16(dcNum)
+		absIdx := absDC(idx)
 		if preferIPv6 {
 			if addr, ok := defaultTelegramDCsIPv6[idx]; ok {
 				return addr, nil
 			}
+			if addr, ok := defaultTelegramDCsIPv6[absIdx]; ok {
+				return addr, nil
+			}
 		}
 		if addr, ok := defaultTelegramDCsIPv4[idx]; ok {
+			return addr, nil
+		}
+		if addr, ok := defaultTelegramDCsIPv4[absIdx]; ok {
 			return addr, nil
 		}
 	}
@@ -312,6 +393,12 @@ func (s *backendStream) runDirect() {
 		logger.Warn("direct telegram dc resolve failed", "stream_id", s.id, "dc", hsRes.DCIdx, "err", err)
 		return
 	}
+	logger.Info("direct stream handshake parsed",
+		"stream_id", s.id,
+		"dc", hsRes.DCIdx,
+		"tag", fmt.Sprintf("0x%08x", hsRes.Tag),
+		"target", targetAddress,
+	)
 
 	// 4. Dial target DC
 	dialer := net.Dialer{Timeout: s.session.timeouts.BackendDial.Value()}

@@ -238,6 +238,40 @@ func TestResolveTelegramDC(t *testing.T) {
 		}
 	}
 
+	// Negative DC resolution (-1, -2, -4)
+	for _, negIdx := range []int16{-1, -2, -3, -4, -5} {
+		addr, err = ResolveTelegramDC("auto", "", negIdx, false, nil)
+		if err != nil || addr != defaultTelegramDCsIPv4[negIdx] {
+			t.Fatalf("negIdx %d: expected %s, got %s (%v)", negIdx, defaultTelegramDCsIPv4[negIdx], addr, err)
+		}
+	}
+	// Explicit check for dedicated Media DC2 and DC4 IPs (must NOT route to .51 or .91)
+	addr, err = ResolveTelegramDC("auto", "", -2, false, nil)
+	if err != nil || addr != "149.154.167.151:443" {
+		t.Fatalf("Media DC -2 expected 149.154.167.151:443, got %s (%v)", addr, err)
+	}
+	addr, err = ResolveTelegramDC("auto", "", -4, false, nil)
+	if err != nil || addr != "149.154.166.120:443" {
+		t.Fatalf("Media DC -4 expected 149.154.166.120:443, got %s (%v)", addr, err)
+	}
+
+
+	// CDN DC 203 and -203
+	addr, err = ResolveTelegramDC("auto", "", 203, false, nil)
+	if err != nil || addr != "91.105.192.100:443" {
+		t.Fatalf("DC 203: expected 91.105.192.100:443, got %s (%v)", addr, err)
+	}
+	addr, err = ResolveTelegramDC("auto", "", -203, false, nil)
+	if err != nil || addr != "91.105.192.100:443" {
+		t.Fatalf("DC -203: expected 91.105.192.100:443, got %s (%v)", addr, err)
+	}
+
+	// Older media representation (10002 -> -2)
+	addr, err = ResolveTelegramDC("auto", "", 10002, false, nil)
+	if err != nil || addr != defaultTelegramDCsIPv4[-2] {
+		t.Fatalf("DC 10002: expected %s, got %s (%v)", defaultTelegramDCsIPv4[-2], addr, err)
+	}
+
 	// Unknown DC fallback to DC 2
 	addr, err = ResolveTelegramDC("auto", "", 999, false, nil)
 	if err != nil || addr != defaultTelegramDCsIPv4[2] {

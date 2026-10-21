@@ -750,10 +750,10 @@ func validateDirectBackendAddress(backend string) error {
 	}
 	cleanVal := strings.TrimPrefix(trimmed, "dc")
 	if dcNum, err := strconv.Atoi(cleanVal); err == nil {
-		if (dcNum >= 1 && dcNum <= 5) || (dcNum >= -5 && dcNum <= -1) {
+		if (dcNum >= 1 && dcNum <= 5) || (dcNum >= -5 && dcNum <= -1) || dcNum == 203 || dcNum == -203 {
 			return nil
 		}
-		return fmt.Errorf("direct backend dc index must be between 1 and 5 (or -1 to -5), got %d", dcNum)
+		return fmt.Errorf("direct backend dc index must be between 1 and 5 (or -1 to -5, 203, -203), got %d", dcNum)
 	}
 	host, portStr, err := net.SplitHostPort(trimmed)
 	if err != nil {
