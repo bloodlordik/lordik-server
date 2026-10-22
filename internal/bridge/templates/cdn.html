@@ -204,7 +204,7 @@ async function createSession(helloBuf){
   startPollLoop();
  }
  scheduleFlush();
-
+}
 function queueCarrier(buf){
  if(closed)return;
  if(queuedBytes+buf.byteLength>queueLimit||queuedItems+1>queueItemLimit){fail();return}
