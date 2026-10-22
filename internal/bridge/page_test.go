@@ -283,3 +283,40 @@ func TestRenderRejectsInvalidHostnameAndOversizedBatch(t *testing.T) {
 		t.Fatal("accepted a carrier batch above the desktop loopback cap")
 	}
 }
+
+func TestRenderCDNBridgeLifecycleAndRecovery(t *testing.T) {
+	for _, mode := range []string{"cdn-adaptive", "cdn-get", "cdn-body"} {
+		page, err := Render("cdn.example.com", "", "bootstrap-token", mode, 2*1024*1024)
+		if err != nil {
+			t.Fatalf("failed to render %s bridge: %v", mode, err)
+		}
+		body := string(page.Body)
+		for _, expected := range []string{
+			"activeStreams=new Set()",
+			"wakeSignals=new Set()",
+			"function encodeFrame(type,streamId,payloadBytes)",
+			"function trackClientFrames(buf)",
+			"encodeFrame(0x03,streamId,null)",
+			"status('failed')",
+			"port.postMessage({t:'close'})",
+			"setTimeout(()=>close(true),15)",
+			"function processDownlink(resBuf,ct)",
+			"ct.includes('text/html')",
+			"model/gltf-binary",
+			"async function sendAckOnly()",
+			"processDownlink(resBuf,ct)",
+			"function onWakeUp()",
+			"now-lastWakeAt<250",
+			"visibilitychange",
+			"addEventListener('focus',onWakeUp)",
+			"addEventListener('online',onWakeUp)",
+			"addEventListener('pageshow',onWakeUp)",
+			"isBg=(typeof document!=='undefined'&&document.visibilityState==='hidden')",
+			"nextRetry=isBg?retry:retry+1",
+		} {
+			if !strings.Contains(body, expected) {
+				t.Fatalf("rendered %s bridge lacks expected snippet %q", mode, expected)
+			}
+		}
+	}
+}

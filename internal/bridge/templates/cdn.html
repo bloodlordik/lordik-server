@@ -22,9 +22,23 @@ let upSeq=1,downCursor=0,upInflight=0,maxInflight=6;
 let debounceTimer=0;
 let streamSupported=typeof ReadableStream!=='undefined'&&typeof AbortController!=='undefined';
 let lastSentAckCursor=0;
+let failing=false;
+const activeStreams=new Set();
+const wakeSignals=new Set();
 
 const status=state=>{if(port&&!closed)port.postMessage({t:'status',state})};
-const pause=ms=>new Promise(res=>setTimeout(res,ms));
+function pause(ms){
+ return new Promise(res=>{
+  let t=0;
+  const wake=()=>{
+   if(t){clearTimeout(t);t=0}
+   wakeSignals.delete(wake);
+   res();
+  };
+  wakeSignals.add(wake);
+  t=setTimeout(wake,ms);
+ });
+}
 const hasNativeB64=typeof Uint8Array.prototype.toBase64==='function';
 
 function toBase64Url(buf){
@@ -45,6 +59,19 @@ function fromBase64Url(str){
  return bytes.buffer;
 }
 
+function encodeFrame(type,streamId,payloadBytes){
+ const plen=payloadBytes?payloadBytes.byteLength:0;
+ const buf=new ArrayBuffer(8+plen);
+ const view=new DataView(buf);
+ view.setUint8(0,type);
+ view.setUint8(1,(streamId>>16)&0xff);
+ view.setUint8(2,(streamId>>8)&0xff);
+ view.setUint8(3,streamId&0xff);
+ view.setUint32(4,plen,false);
+ if(plen>0)new Uint8Array(buf,8).set(new Uint8Array(payloadBytes));
+ return buf;
+}
+
 function splitFrames(value){
  const view=new DataView(value),result=[];let offset=0;
  while(offset<value.byteLength){
@@ -60,16 +87,37 @@ function splitFrames(value){
  return result;
 }
 
+function trackClientFrames(buf){
+ let frames;
+ try{frames=splitFrames(buf)}catch(e){return}
+ for(const f of frames){
+  if(f.type===0x01)activeStreams.add(f.id);
+  else if(f.type===0x03)activeStreams.delete(f.id);
+ }
+}
+
 function fail(){
- status('error');
- close(true);
+ if(failing||closed)return;
+ failing=true;
+ if(port){
+  for(const streamId of activeStreams){
+   try{port.postMessage(encodeFrame(0x03,streamId,null))}catch(e){}
+  }
+  activeStreams.clear();
+  status('failed');
+  try{port.postMessage({t:'close'})}catch(e){}
+ }
+ setTimeout(()=>close(true),15);
 }
 
 function deliver(batchBuf){
  if(!batchBuf||!batchBuf.byteLength||closed||!port)return;
  let frames;
  try{frames=splitFrames(batchBuf)}catch(e){return}
- for(const frame of frames)port.postMessage(frame.data);
+ for(const frame of frames){
+  if(frame.type===0x03)activeStreams.delete(frame.id);
+  port.postMessage(frame.data);
+ }
 }
 
 function parseGLTF(buf){
@@ -83,19 +131,32 @@ function parseGLTF(buf){
 }
 
 function processDownlink(resBuf,ct){
- if(ct&&ct.includes('model/gltf-binary')){
+ if(!resBuf||resBuf.byteLength===0)return true;
+ if(ct&&ct.includes('text/html'))return false;
+ if(ct&&(ct.includes('model/gltf-binary')||ct.includes('application/octet-stream'))){
   const parsed=parseGLTF(resBuf);
-  if(parsed&&((parsed.cursor-downCursor|0)>0||downCursor===0)){
+  if(!parsed)return false;
+  if((parsed.cursor-downCursor|0)>0||downCursor===0){
    downCursor=parsed.cursor;
    deliver(parsed.payload);
   }
- }else{
+  return true;
+ }
+ if(ct&&ct.includes('application/json')){
   try{
    const dec=new TextDecoder().decode(resBuf);
+   if(!dec.trim())return true;
    const obj=JSON.parse(dec);
-   if(obj&&typeof obj.c==='number'&&((obj.c-downCursor|0)>0||downCursor===0))downCursor=obj.c;
-  }catch(e){}
+   if(!obj||typeof obj!=='object'||obj.s!==1)return false;
+   if(typeof obj.c==='number'&&((obj.c-downCursor|0)>0||downCursor===0)){
+    downCursor=obj.c;
+   }
+   return true;
+  }catch(e){
+   return false;
+  }
  }
+ return false;
 }
 
 let initDone=false;
@@ -207,6 +268,7 @@ async function createSession(helloBuf){
 }
 function queueCarrier(buf){
  if(closed)return;
+ trackClientFrames(buf);
  if(queuedBytes+buf.byteLength>queueLimit||queuedItems+1>queueItemLimit){fail();return}
  queuedBytes+=buf.byteLength;
  queuedItems++;
@@ -258,12 +320,15 @@ async function sendChunkWithBackoff(seq,buf,retry){
  lastSentAckCursor=cur;
  const reqId=seq+'.'+cur+'.0';
  let success=false;
+ const ctrl=new AbortController();
+ const reqTimer=setTimeout(()=>ctrl.abort(),10000);
  try{
   if(activeMode==='cdn-body'){
    const postUrl=relayBase+'_next/data/'+buildId+'/sync/'+shortId+'/'+seq+'.bin';
    const res=await fetch(postUrl,{
     method:'POST',
     body:buf,
+    signal:ctrl.signal,
     mode:'same-origin',credentials:'omit',cache:'no-store',
     headers:{
      'Content-Type':'application/octet-stream',
@@ -273,12 +338,13 @@ async function sendChunkWithBackoff(seq,buf,retry){
      'X-Coalesce':'1'
     }
    });
+   clearTimeout(reqTimer);
    if(res.ok){
     const ct=res.headers.get('Content-Type');
     const resBuf=await res.arrayBuffer();
-    processDownlink(resBuf,ct);
+    if(!processDownlink(resBuf,ct)){fail();return}
     success=true;
-   }else if(res.status===404){
+   }else if(res.status===404||res.status===410){
     fail();return;
    }
   }else{
@@ -299,27 +365,36 @@ async function sendChunkWithBackoff(seq,buf,retry){
    const getUrl=relayBase+'assets/chunks/'+shortId+'/'+seq+'.bin?p='+encodeURIComponent(urlPart);
    const res=await fetch(getUrl,{
     method:'GET',
+    signal:ctrl.signal,
     mode:'same-origin',credentials:'omit',cache:'no-store',
     headers
    });
+   clearTimeout(reqTimer);
    if(res.ok){
     const ct=res.headers.get('Content-Type');
     const resBuf=await res.arrayBuffer();
-    processDownlink(resBuf,ct);
+    if(!processDownlink(resBuf,ct)){fail();return}
     success=true;
-   }else if(res.status===404){
+   }else if(res.status===404||res.status===410){
     fail();return;
    }
   }
- }catch(e){}
+ }catch(e){
+ }finally{
+  clearTimeout(reqTimer);
+ }
 
  upInflight--;
  if(!success){
-  if(retry<5){
-   const delay=Math.min(1000,50*(1<<retry))+(Math.random()*20|0);
+  if(closed)return;
+  const isBg=(typeof document!=='undefined'&&document.visibilityState==='hidden')||(typeof navigator!=='undefined'&&navigator.onLine===false);
+  const nextRetry=isBg?retry:retry+1;
+  if(nextRetry<=8){
+   const delay=isBg?2000:Math.min(1500,50*(1<<Math.min(retry,5)))+(Math.random()*50|0);
    await pause(delay);
+   if(closed)return;
    upInflight++;
-   sendChunkWithBackoff(seq,buf,retry+1);
+   sendChunkWithBackoff(seq,buf,nextRetry);
    return;
   }
   fail();
@@ -328,20 +403,29 @@ async function sendChunkWithBackoff(seq,buf,retry){
  if(upPending.length)scheduleFlush();
 }
 
-function sendAckOnly(){
+async function sendAckOnly(){
  if(closed||!sessionToken||upInflight>0)return;
  const cur=downCursor;
  const randHex=(Math.random()*0xffffffff>>>0).toString(16);
  const ackUrl=relayBase+'assets/chunks/'+shortId+'/0.bin?p=&r='+randHex;
- fetch(ackUrl,{
-  method:'GET',
-  mode:'same-origin',credentials:'omit',cache:'no-store',
-  headers:{
-   'X-Client-Key':sessionToken,
-   'X-Request-ID':'0.'+cur+'.0',
-   'X-Down-Cursor':String(cur)
+ try{
+  const res=await fetch(ackUrl,{
+   method:'GET',
+   mode:'same-origin',credentials:'omit',cache:'no-store',
+   headers:{
+    'X-Client-Key':sessionToken,
+    'X-Request-ID':'0.'+cur+'.0',
+    'X-Down-Cursor':String(cur)
+   }
+  });
+  if(res.ok){
+   const ct=res.headers.get('Content-Type');
+   const resBuf=await res.arrayBuffer();
+   if(!processDownlink(resBuf,ct))fail();
+  }else if(res.status===404||res.status===410){
+   fail();
   }
- }).catch(()=>{});
+ }catch(e){}
 }
 
 function createStreamAssembler(){
@@ -434,11 +518,18 @@ async function startStreamLoop(){
    if(!res.ok){
     clearTimeout(probeTimer);
     clearTimeout(watchdogTimer);
-    if(res.status===404){
+    if(res.status===404||res.status===410){
      fail();return;
     }
     streamSupported=false;
     break;
+   }
+
+   const ct=res.headers.get('Content-Type');
+   if(ct&&ct.includes('text/html')){
+    clearTimeout(probeTimer);
+    clearTimeout(watchdogTimer);
+    fail();return;
    }
 
    if(!res.body||typeof res.body.getReader!=='function'){
@@ -502,8 +593,10 @@ async function startPollLoop(){
    if(res.ok){
     const ct=res.headers.get('Content-Type');
     const resBuf=await res.arrayBuffer();
-    processDownlink(resBuf,ct);
-   }else if(res.status===404){
+    if(!processDownlink(resBuf,ct)){
+     fail();break;
+    }
+   }else if(res.status===404||res.status===410){
     fail();break;
    }else{
     await pause(500);
@@ -518,6 +611,7 @@ async function startPollLoop(){
 function close(notifyServer){
  if(closed)return;
  closed=true;
+ failing=true;
  if(pollController)pollController.abort();
  if(notifyServer&&sessionToken&&shortId){
   const unloadUrl=relayBase+'_next/data/'+buildId+'/unload/'+shortId+'.json?t='+Date.now();
@@ -536,6 +630,7 @@ function activatePort(nextPort){
  initialized=true;port=nextPort;
  port.onmessage=message=>{
   if(message.data instanceof ArrayBuffer){
+   trackClientFrames(message.data);
    if(!createStarted){createStarted=true;createSession(message.data)}
    else queueCarrier(message.data);
   }else if(message.data&&message.data.t==='close')close(true);
@@ -565,6 +660,34 @@ if(!initialized&&androidNonce&&androidBridge&&typeof androidBridge.postMessage==
   if(androidPort.onmessage)androidPort.onmessage({data});
  };
  activatePort(androidPort);androidBridge.postMessage(JSON.stringify({t:'tproxy-android-init',v:1,nonce:androidNonce}));
+}
+
+let lastWakeAt=0;
+function onWakeUp(){
+ if(closed||!sessionToken)return;
+ const now=Date.now();
+ if(now-lastWakeAt<250)return;
+ lastWakeAt=now;
+ for(const wake of Array.from(wakeSignals))wake();
+ if(pollController){
+  try{pollController.abort()}catch(e){}
+ }
+ if(upPending.length&&upInflight<maxInflight){
+  flushUplink();
+ }else if(upInflight===0){
+  sendAckOnly();
+ }
+}
+
+if(typeof document!=='undefined'){
+ document.addEventListener('visibilitychange',()=>{
+  if(document.visibilityState==='visible')onWakeUp();
+ });
+}
+if(typeof addEventListener==='function'){
+ addEventListener('focus',onWakeUp);
+ addEventListener('online',onWakeUp);
+ addEventListener('pageshow',onWakeUp);
 }
 
 addEventListener('pagehide',()=>close(true),{once:true});
