@@ -12,6 +12,7 @@ import (
 	"net/http/httputil"
 	"net/http/pprof"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -42,15 +43,34 @@ const maxCreateBodyBytes = 64
 // carry no body. Public requests use the ordinary gateway timeout policy.
 const bodyReadDeadline = 30 * time.Second
 
+type VHost struct {
+	Hostname          string
+	Profiles          []*config.Profile
+	BasePaths         []string // Sorted descending by length for longest prefix match
+	Site              *staticSite
+	PublicUpstream    http.Handler
+	TrustedHostHeader string
+	TrustedIPHeader   string
+	BuildID           string
+}
+
 type Server struct {
-	config           config.Config
-	base             string
-	manager          *session.Manager
-	site             *staticSite
-	publicUpstream   http.Handler
-	publicTransport  *http.Transport
-	bodyReadDeadline time.Duration
-	buildID          string
+	config            config.Config
+	base              string
+	manager           *session.Manager
+	vhosts            map[string]*VHost
+	defaultVHost      *VHost
+	trustedHostVHosts map[string]*VHost
+	upstreams         map[string]http.Handler
+	transports        []*http.Transport
+	sites             map[string]*staticSite
+	bodyReadDeadline  time.Duration
+	buildID           string
+
+	// Backward compatibility fields
+	site            *staticSite
+	publicUpstream  http.Handler
+	publicTransport *http.Transport
 }
 
 func New(value config.Config) (*Server, error) {
@@ -61,23 +81,34 @@ func New(value config.Config) (*Server, error) {
 	if err := session.ValidateBudget(value); err != nil {
 		return nil, err
 	}
-	var site *staticSite
-	var publicUpstream http.Handler
-	var publicTransport *http.Transport
-	if value.PublicDir != "" {
-		var err error
-		site, err = loadStaticSite(value.PublicDir)
+
+	sites := make(map[string]*staticSite)
+	upstreams := make(map[string]http.Handler)
+	transports := make([]*http.Transport, 0)
+
+	getOrCreateSite := func(dir string) (*staticSite, error) {
+		if site, ok := sites[dir]; ok {
+			return site, nil
+		}
+		site, err := loadStaticSite(dir)
 		if err != nil {
 			return nil, err
 		}
-	} else {
-		target, err := url.Parse(value.PublicUpstream)
+		sites[dir] = site
+		return site, nil
+	}
+
+	getOrCreateUpstream := func(rawURL string) (http.Handler, *http.Transport, error) {
+		if proxy, ok := upstreams[rawURL]; ok {
+			return proxy, nil, nil
+		}
+		target, err := url.Parse(rawURL)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		transport := http.DefaultTransport.(*http.Transport).Clone()
 		transport.DisableCompression = true
-		publicTransport = transport
+		transports = append(transports, transport)
 		proxy := &httputil.ReverseProxy{
 			Transport: transport,
 			Rewrite: func(request *httputil.ProxyRequest) {
@@ -96,17 +127,145 @@ func New(value config.Config) (*Server, error) {
 		proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
 			http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
 		}
-		publicUpstream = proxy
+		upstreams[rawURL] = proxy
+		return proxy, transport, nil
 	}
+
+	// Prepare default decoy
+	var defaultSite *staticSite
+	var defaultUpstream http.Handler
+	var defaultTransport *http.Transport
+	if value.PublicDir != "" {
+		var err error
+		defaultSite, err = getOrCreateSite(value.PublicDir)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		var err error
+		defaultUpstream, defaultTransport, err = getOrCreateUpstream(value.PublicUpstream)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	defaultBuildID := generateBuildID()
+
+	// Group profiles by effective Hostname
+	hostProfiles := make(map[string][]*config.Profile)
+	for i := range value.Profiles {
+		p := &value.Profiles[i]
+		if p.Hostname == "" {
+			p.Hostname = value.PublicHostname
+		}
+		if p.BasePath == "" && value.BasePath != "" {
+			p.BasePath = value.BasePath
+		}
+		hostProfiles[p.Hostname] = append(hostProfiles[p.Hostname], p)
+	}
+
+	vhosts := make(map[string]*VHost)
+	trustedHostVHosts := make(map[string]*VHost)
+
+	// Ensure default host is in hostProfiles
+	if _, ok := hostProfiles[value.PublicHostname]; !ok {
+		hostProfiles[value.PublicHostname] = nil
+	}
+
+	for host, profiles := range hostProfiles {
+		vPublicDir := ""
+		vPublicUpstream := ""
+		vTrustedHostHeader := ""
+		vTrustedIPHeader := ""
+		basePathSet := make(map[string]struct{})
+
+		for _, p := range profiles {
+			if p.PublicDir != "" {
+				vPublicDir = p.PublicDir
+			}
+			if p.PublicUpstream != "" {
+				vPublicUpstream = p.PublicUpstream
+			}
+			if p.TrustedHostHeader != "" {
+				vTrustedHostHeader = p.TrustedHostHeader
+			}
+			if p.TrustedIPHeader != "" {
+				vTrustedIPHeader = p.TrustedIPHeader
+			}
+			basePathSet[p.BasePath] = struct{}{}
+		}
+
+		if host == value.PublicHostname {
+			basePathSet[value.BasePath] = struct{}{}
+		}
+
+		if vPublicDir == "" && vPublicUpstream == "" {
+			vPublicDir = value.PublicDir
+			vPublicUpstream = value.PublicUpstream
+		}
+
+		var vSite *staticSite
+		var vUpstream http.Handler
+		if vPublicDir != "" {
+			var err error
+			vSite, err = getOrCreateSite(vPublicDir)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			var err error
+			vUpstream, _, err = getOrCreateUpstream(vPublicUpstream)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		basePaths := make([]string, 0, len(basePathSet))
+		for bp := range basePathSet {
+			basePaths = append(basePaths, bp)
+		}
+		sort.Slice(basePaths, func(i, j int) bool {
+			return len(basePaths[i]) > len(basePaths[j])
+		})
+
+		buildID := generateBuildID()
+		if host == value.PublicHostname {
+			buildID = defaultBuildID
+		}
+
+		vh := &VHost{
+			Hostname:          host,
+			Profiles:          profiles,
+			BasePaths:         basePaths,
+			Site:              vSite,
+			PublicUpstream:    vUpstream,
+			TrustedHostHeader: vTrustedHostHeader,
+			TrustedIPHeader:   vTrustedIPHeader,
+			BuildID:           buildID,
+		}
+		vhosts[host] = vh
+		if vTrustedHostHeader != "" {
+			trustedHostVHosts[host] = vh
+		}
+	}
+
+	defaultVHost := vhosts[value.PublicHostname]
+
 	return &Server{
-		config:           value,
-		base:             value.Base(),
-		manager:          session.NewManager(value, tokenKey),
-		site:             site,
-		publicUpstream:   publicUpstream,
-		publicTransport:  publicTransport,
-		bodyReadDeadline: bodyReadDeadline,
-		buildID:          generateBuildID(),
+		config:            value,
+		base:              value.Base(),
+		manager:           session.NewManager(value, tokenKey),
+		vhosts:            vhosts,
+		defaultVHost:      defaultVHost,
+		trustedHostVHosts: trustedHostVHosts,
+		upstreams:         upstreams,
+		transports:        transports,
+		sites:             sites,
+		site:              defaultSite,
+		publicUpstream:    defaultUpstream,
+		publicTransport:   defaultTransport,
+		bodyReadDeadline:  bodyReadDeadline,
+		buildID:           defaultBuildID,
 	}, nil
 }
 
@@ -143,8 +302,10 @@ func (s *Server) AdminHandler() http.Handler {
 
 func (s *Server) Shutdown() {
 	s.manager.Shutdown()
-	if s.publicTransport != nil {
-		s.publicTransport.CloseIdleConnections()
+	for _, tr := range s.transports {
+		if tr != nil {
+			tr.CloseIdleConnections()
+		}
 	}
 }
 
@@ -157,29 +318,29 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.ContentLength != 0 {
 		s.setReadDeadline(w)
 	}
-	if r.Host != s.config.PublicHostname && r.Host != s.config.PublicHostname+":443" {
+	vhost := s.resolveVHost(r)
+	if vhost == nil {
 		s.serveNotFound(w, r)
 		return
 	}
-	if suffix, ok := s.transportSuffix(r.URL.Path); ok && r.URL.EscapedPath() == r.URL.Path {
+	if suffix, ok := vhost.transportSuffix(r.URL.Path); ok && r.URL.EscapedPath() == r.URL.Path {
 		if strings.HasPrefix(suffix, "_next/data/") || strings.HasPrefix(suffix, "assets/") {
-			s.serveCDN(w, r, suffix)
+			s.serveCDN(w, r, vhost, suffix)
 			return
 		}
-		s.serveAPI(w, r, suffix)
+		s.serveAPIWithVHost(w, r, vhost, suffix)
 		return
 	}
-	if profile := s.bridgeProfile(r); profile != nil {
-		s.serveBridge(w, r, profile)
+	if profile := s.bridgeProfileForVHost(r, vhost); profile != nil {
+		s.serveBridgeWithVHost(w, r, vhost, profile)
 		return
 	}
 	s.serveNotFound(w, r)
 }
 
-func (s *Server) serveBridge(w http.ResponseWriter, r *http.Request, profile *config.Profile) {
-	clientIP, err := s.clientIP(r)
+func (s *Server) serveBridgeWithVHost(w http.ResponseWriter, r *http.Request, vhost *VHost, profile *config.Profile) {
+	clientIP, err := s.clientIPForVHost(r, vhost)
 	if err != nil {
-		logger.Debug("bridge request rejected: invalid client IP", "err", err)
 		s.serveNotFound(w, r)
 		return
 	}
@@ -190,12 +351,12 @@ func (s *Server) serveBridge(w http.ResponseWriter, r *http.Request, profile *co
 		return
 	}
 	page, err := bridge.RenderWithOptions(bridge.Options{
-		Hostname:       s.config.PublicHostname,
-		BasePath:       s.config.BasePath,
+		Hostname:       profile.Hostname,
+		BasePath:       profile.BasePath,
 		BootstrapToken: token,
 		CarrierMode:    string(profile.CarrierMode.WithDefault()),
 		BatchBytes:     s.config.Limits.CarrierBatchBytes,
-		BuildID:        s.buildID,
+		BuildID:        vhost.BuildID,
 	})
 	if err != nil {
 		logger.Error("bridge render failed", "client_ip", clientIP, "profile", profile.Name, "err", err)
@@ -215,7 +376,7 @@ func (s *Server) serveBridge(w http.ResponseWriter, r *http.Request, profile *co
 	_, _ = w.Write(page.Body)
 }
 
-func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, suffix string) {
+func (s *Server) serveAPIWithVHost(w http.ResponseWriter, r *http.Request, vhost *VHost, suffix string) {
 	if (r.URL.RawQuery != "" || r.URL.ForceQuery) && suffix != "api/v1/ws" {
 		s.serveNotFound(w, r)
 		return
@@ -226,17 +387,17 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, suffix string)
 		s.serveNotFound(w, r)
 		return
 	}
-	clientIP, err := s.clientIP(r)
+	clientIP, err := s.clientIPForVHost(r, vhost)
 	if err != nil {
 		s.serveNotFound(w, r)
 		return
 	}
 	if suffix == "api/v1/ws" {
-		s.serveWebSocket(w, r)
+		s.serveWebSocketWithVHost(w, r, vhost)
 		return
 	}
 	if suffix == "api/v1/resume" {
-		s.serveResume(w, r, clientIP)
+		s.serveResumeWithVHost(w, r, vhost, clientIP)
 		return
 	}
 	token, ok := bearerToken(r.Header.Get("Authorization"))
@@ -246,19 +407,20 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, suffix string)
 	}
 	switch suffix {
 	case "api/v1/session":
-		s.serveSession(w, r, token, clientIP)
+		s.serveSessionWithVHost(w, r, vhost, token, clientIP)
 	case "api/v1/up":
-		s.serveUp(w, r, token)
+		s.serveUpWithVHost(w, r, vhost, token)
 	case "api/v1/down":
-		s.serveDown(w, r, token)
+		s.serveDownWithVHost(w, r, vhost, token)
 	default:
 		s.serveNotFound(w, r)
 	}
 }
 
-func (s *Server) serveSession(
+func (s *Server) serveSessionWithVHost(
 	w http.ResponseWriter,
 	r *http.Request,
+	vhost *VHost,
 	token string,
 	clientIP string,
 ) {
@@ -266,6 +428,12 @@ func (s *Server) serveSession(
 		if !emptyBody(r) || r.Header.Get("Content-Type") != "" {
 			s.serveNotFound(w, r)
 			return
+		}
+		if sess, err := s.manager.Get(token); err == nil && sess != nil {
+			if sess.Profile() != nil && !strings.EqualFold(sess.Profile().Hostname, vhost.Hostname) {
+				s.serveNotFound(w, r)
+				return
+			}
 		}
 		if err := s.manager.CloseToken(token); err != nil {
 			logger.Debug("session delete failed", "err", err)
@@ -280,7 +448,7 @@ func (s *Server) serveSession(
 		s.serveNotFound(w, r)
 		return
 	}
-	if !s.manager.HasBootstrap(token) {
+	if !s.manager.HasBootstrapForHost(token, vhost.Hostname) {
 		s.serveNotFound(w, r)
 		return
 	}
@@ -312,7 +480,46 @@ func (s *Server) serveSession(
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(result.Welcome)
 }
+
+func (s *Server) serveBridge(w http.ResponseWriter, r *http.Request, profile *config.Profile) {
+	vhost := s.resolveVHost(r)
+	if vhost == nil {
+		vhost = s.defaultVHost
+	}
+	s.serveBridgeWithVHost(w, r, vhost, profile)
+}
+
+func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, suffix string) {
+	vhost := s.resolveVHost(r)
+	if vhost == nil {
+		s.serveNotFound(w, r)
+		return
+	}
+	s.serveAPIWithVHost(w, r, vhost, suffix)
+}
+func (s *Server) serveSession(
+	w http.ResponseWriter,
+	r *http.Request,
+	token string,
+	clientIP string,
+) {
+	vhost := s.resolveVHost(r)
+	if vhost == nil {
+		s.serveNotFound(w, r)
+		return
+	}
+	s.serveSessionWithVHost(w, r, vhost, token, clientIP)
+}
 func (s *Server) serveResume(w http.ResponseWriter, r *http.Request, clientIP string) {
+	vhost := s.resolveVHost(r)
+	if vhost == nil {
+		s.serveNotFound(w, r)
+		return
+	}
+	s.serveResumeWithVHost(w, r, vhost, clientIP)
+}
+
+func (s *Server) serveResumeWithVHost(w http.ResponseWriter, r *http.Request, vhost *VHost, clientIP string) {
 	if r.Method != http.MethodPost || !emptyBody(r) || r.Header.Get("Content-Type") != "" {
 		s.serveNotFound(w, r)
 		return
@@ -331,6 +538,10 @@ func (s *Server) serveResume(w http.ResponseWriter, r *http.Request, clientIP st
 	sess, err := s.manager.Resume(token, clientIP)
 	if err != nil {
 		logger.Warn("session resume failed", "client_ip", clientIP, "err", err)
+		s.serveNotFound(w, r)
+		return
+	}
+	if sess.Profile() != nil && !strings.EqualFold(sess.Profile().Hostname, vhost.Hostname) {
 		s.serveNotFound(w, r)
 		return
 	}
@@ -368,8 +579,16 @@ func (s *Server) serveResume(w http.ResponseWriter, r *http.Request, clientIP st
 	}
 }
 
-
 func (s *Server) serveUp(w http.ResponseWriter, r *http.Request, token string) {
+	vhost := s.resolveVHost(r)
+	if vhost == nil {
+		s.serveNotFound(w, r)
+		return
+	}
+	s.serveUpWithVHost(w, r, vhost, token)
+}
+
+func (s *Server) serveUpWithVHost(w http.ResponseWriter, r *http.Request, vhost *VHost, token string) {
 	if r.Method != http.MethodPost || !binaryContentType(r.Header.Get("Content-Type")) {
 		s.serveNotFound(w, r)
 		return
@@ -381,6 +600,10 @@ func (s *Server) serveUp(w http.ResponseWriter, r *http.Request, token string) {
 	}
 	value, err := s.manager.Get(token)
 	if err != nil {
+		s.serveNotFound(w, r)
+		return
+	}
+	if value.Profile() != nil && !strings.EqualFold(value.Profile().Hostname, vhost.Hostname) {
 		s.serveNotFound(w, r)
 		return
 	}
@@ -425,6 +648,15 @@ func (s *Server) serveUp(w http.ResponseWriter, r *http.Request, token string) {
 }
 
 func (s *Server) serveDown(w http.ResponseWriter, r *http.Request, token string) {
+	vhost := s.resolveVHost(r)
+	if vhost == nil {
+		s.serveNotFound(w, r)
+		return
+	}
+	s.serveDownWithVHost(w, r, vhost, token)
+}
+
+func (s *Server) serveDownWithVHost(w http.ResponseWriter, r *http.Request, vhost *VHost, token string) {
 	if r.Method != http.MethodPost || r.Header.Get("Content-Type") != "" {
 		s.serveNotFound(w, r)
 		return
@@ -436,6 +668,10 @@ func (s *Server) serveDown(w http.ResponseWriter, r *http.Request, token string)
 	}
 	value, err := s.manager.Get(token)
 	if err != nil {
+		s.serveNotFound(w, r)
+		return
+	}
+	if value.Profile() != nil && !strings.EqualFold(value.Profile().Hostname, vhost.Hostname) {
 		s.serveNotFound(w, r)
 		return
 	}
@@ -494,7 +730,6 @@ func (s *Server) serveDown(w http.ResponseWriter, r *http.Request, token string)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
 }
-
 type wsAuthInfo struct {
 	token      string
 	laneID     uint32
@@ -505,7 +740,17 @@ type wsAuthInfo struct {
 	ok         bool
 }
 
+
 func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
+	vhost := s.resolveVHost(r)
+	if vhost == nil {
+		s.serveNotFound(w, r)
+		return
+	}
+	s.serveWebSocketWithVHost(w, r, vhost)
+}
+
+func (s *Server) serveWebSocketWithVHost(w http.ResponseWriter, r *http.Request, vhost *VHost) {
 	if r.Method != http.MethodGet || r.Header.Get("Authorization") != "" {
 		s.serveNotFound(w, r)
 		return
@@ -524,7 +769,7 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 		s.serveNotFound(w, r)
 		return
 	}
-	clientIP, err := s.clientIP(r)
+	clientIP, err := s.clientIPForVHost(r, vhost)
 	if err != nil {
 		s.serveNotFound(w, r)
 		return
@@ -538,6 +783,10 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	if err != nil ||
 		(auth.lanes && value.CarrierMode() != config.CarrierWebSocketLanes) ||
 		(!auth.lanes && value.CarrierMode() != config.CarrierWebSocket) {
+		s.serveNotFound(w, r)
+		return
+	}
+	if value.Profile() != nil && !strings.EqualFold(value.Profile().Hostname, vhost.Hostname) {
 		s.serveNotFound(w, r)
 		return
 	}
@@ -902,23 +1151,173 @@ func (s *Server) clientIP(r *http.Request) (string, error) {
 // The request reaches the site with its original path, base prefix included. A
 // stripped prefix would expose the whole site a second time under it, which is a
 // far louder signature than the 404 it would replace.
-func (s *Server) servePublic(w http.ResponseWriter, r *http.Request) {
-	logger.Debug("serving public site", "method", r.Method, "host", r.Host, "path", r.URL.Path)
-	if s.publicUpstream != nil {
+func (s *Server) servePublicForVHost(w http.ResponseWriter, r *http.Request, vh *VHost) {
+	logger.Debug("serving public site", "method", r.Method, "host", r.Host, "path", r.URL.Path, "vhost", vh.Hostname)
+	// If the server's publicUpstream has been overridden (e.g. in tests) on default host
+	if vh == s.defaultVHost && s.publicUpstream != nil {
 		s.publicUpstream.ServeHTTP(w, r)
 		return
 	}
-	if r.Method == http.MethodGet || r.Method == http.MethodHead {
-		if r.URL.Path == "/" {
-			s.serveEntry(w, r, s.site.index, http.StatusOK)
-			return
+	if vh.PublicUpstream != nil {
+		vh.PublicUpstream.ServeHTTP(w, r)
+		return
+	}
+	site := vh.Site
+	if vh == s.defaultVHost && s.site != nil {
+		site = s.site
+	}
+	if site != nil {
+		legacy := s.config.StaticRoutes == "legacy" || s.config.StaticRoutes == ""
+		if r.Method == http.MethodGet || r.Method == http.MethodHead {
+			if r.URL.Path == "/" {
+				serveStaticEntry(w, r, site.index, http.StatusOK)
+				return
+			}
+			if entry := site.resolve(r.URL.Path, legacy); entry != nil {
+				serveStaticEntry(w, r, entry, http.StatusOK)
+				return
+			}
 		}
-		if entry := s.site.resolve(r.URL.Path, s.config.StaticRoutes == "legacy"); entry != nil {
-			s.serveEntry(w, r, entry, http.StatusOK)
-			return
+		serveStaticEntry(w, r, site.notFound, http.StatusNotFound)
+		return
+	}
+	http.NotFound(w, r)
+}
+
+func (vh *VHost) servePublic(w http.ResponseWriter, r *http.Request) {
+	logger.Debug("serving public site", "method", r.Method, "host", r.Host, "path", r.URL.Path, "vhost", vh.Hostname)
+	if vh.PublicUpstream != nil {
+		vh.PublicUpstream.ServeHTTP(w, r)
+		return
+	}
+	if vh.Site != nil {
+		if r.Method == http.MethodGet || r.Method == http.MethodHead {
+			if r.URL.Path == "/" {
+				serveStaticEntry(w, r, vh.Site.index, http.StatusOK)
+				return
+			}
+			if entry := vh.Site.resolve(r.URL.Path, true); entry != nil {
+				serveStaticEntry(w, r, entry, http.StatusOK)
+				return
+			}
+		}
+		serveStaticEntry(w, r, vh.Site.notFound, http.StatusNotFound)
+		return
+	}
+	http.NotFound(w, r)
+}
+
+func (vh *VHost) transportSuffix(requestPath string) (string, bool) {
+	for _, bp := range vh.BasePaths {
+		prefix := config.Base(bp)
+		if strings.HasPrefix(requestPath, prefix) {
+			suffix := requestPath[len(prefix):]
+			switch suffix {
+			case "api/v1/session", "api/v1/up", "api/v1/down", "api/v1/ws", "api/v1/resume":
+				return suffix, true
+			}
+			if strings.HasPrefix(suffix, "_next/data/") || strings.HasPrefix(suffix, "assets/") {
+				return suffix, true
+			}
 		}
 	}
-	s.serveEntry(w, r, s.site.notFound, http.StatusNotFound)
+	return "", false
+}
+
+func (s *Server) resolveRequestHost(r *http.Request) string {
+	directHost := strings.TrimSpace(r.Host)
+	if host, _, err := net.SplitHostPort(directHost); err == nil {
+		directHost = host
+	}
+	directHost = strings.ToLower(directHost)
+
+	// If directHost matches a trusted VHost or any VHost accepts a trusted host header
+	for _, vh := range s.trustedHostVHosts {
+		if vh.TrustedHostHeader != "" {
+			if fwd := strings.TrimSpace(r.Header.Get(vh.TrustedHostHeader)); fwd != "" {
+				if idx := strings.IndexByte(fwd, ','); idx != -1 {
+					fwd = fwd[:idx]
+				}
+				fwd = strings.TrimSpace(fwd)
+				if host, _, err := net.SplitHostPort(fwd); err == nil {
+					fwd = host
+				}
+				fwd = strings.ToLower(fwd)
+				if targetVH, ok := s.trustedHostVHosts[fwd]; ok && strings.EqualFold(targetVH.TrustedHostHeader, vh.TrustedHostHeader) {
+					return fwd
+				}
+			}
+		}
+	}
+	return directHost
+}
+
+func (s *Server) resolveVHost(r *http.Request) *VHost {
+	host := s.resolveRequestHost(r)
+	if vh, ok := s.vhosts[host]; ok {
+		return vh
+	}
+	return nil
+}
+
+func (s *Server) clientIPForVHost(r *http.Request, vhost *VHost) (string, error) {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return "", err
+	}
+	peer := net.ParseIP(host)
+	if peer == nil || !peer.IsLoopback() {
+		return "", errors.New("request did not arrive through loopback proxy")
+	}
+
+	// If VHost configures a specific trusted IP header, check it first
+	if vhost != nil && vhost.TrustedIPHeader != "" {
+		if val := strings.TrimSpace(r.Header.Get(vhost.TrustedIPHeader)); val != "" {
+			target := val
+			if idx := strings.IndexByte(target, ','); idx != -1 {
+				target = target[:idx]
+			}
+			target = strings.TrimSpace(target)
+			if parsed := net.ParseIP(target); parsed != nil {
+				return parsed.String(), nil
+			}
+		}
+	}
+
+	// Standard chain
+	for _, headerName := range []string{"CF-Connecting-IP", "True-Client-IP", "X-Real-IP"} {
+		if val := strings.TrimSpace(r.Header.Get(headerName)); val != "" {
+			if parsed := net.ParseIP(val); parsed != nil {
+				return parsed.String(), nil
+			}
+		}
+	}
+	forwarded := r.Header.Get("X-Forwarded-For")
+	if forwarded == "" {
+		return peer.String(), nil
+	}
+	target := forwarded
+	if idx := strings.IndexByte(forwarded, ','); idx != -1 {
+		target = forwarded[:idx]
+	}
+	target = strings.TrimSpace(target)
+	parsed := net.ParseIP(target)
+	if parsed == nil {
+		return "", errors.New("invalid forwarding address")
+	}
+	return parsed.String(), nil
+}
+
+func (s *Server) servePublic(w http.ResponseWriter, r *http.Request) {
+	vhost := s.resolveVHost(r)
+	if vhost == nil {
+		vhost = s.defaultVHost
+	}
+	if vhost != nil {
+		s.servePublicForVHost(w, r, vhost)
+		return
+	}
+	http.NotFound(w, r)
 }
 
 func (s *Server) serveNotFound(w http.ResponseWriter, r *http.Request) {
@@ -926,10 +1325,10 @@ func (s *Server) serveNotFound(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 
-// transportSuffix names the carrier endpoint a request path selects, relative to
-// the configured base. A path outside the base, or one naming anything else, is
-// not carrier traffic and stays with the bridge or public handlers.
 func (s *Server) transportSuffix(requestPath string) (string, bool) {
+	if s.defaultVHost != nil {
+		return s.defaultVHost.transportSuffix(requestPath)
+	}
 	if !strings.HasPrefix(requestPath, s.base) {
 		return "", false
 	}

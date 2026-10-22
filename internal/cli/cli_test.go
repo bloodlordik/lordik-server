@@ -144,6 +144,57 @@ func TestRunLink(t *testing.T) {
 	}
 }
 
+func TestRunLinkWithVHostProfile(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "token.key")
+	if err := os.WriteFile(tokenPath, []byte("0123456789abcdef0123456789abcdef"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	profilesPath := filepath.Join(dir, "profiles.json")
+	profilesJSON := `{
+		"profiles": [
+			{
+				"name": "default",
+				"secret": "000102030405060708090a0b0c0d0e01",
+				"backend": "127.0.0.1:443"
+			},
+			{
+				"name": "cdn-profile",
+				"secret": "000102030405060708090a0b0c0d0e02",
+				"backend": "127.0.0.1:443",
+				"hostname": "cdn.example.com",
+				"base_path": "relay"
+			}
+		]
+	}`
+	if err := os.WriteFile(profilesPath, []byte(profilesJSON), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(dir, "config.json")
+	cfgJSON := `{
+		"public_hostname": "global.example.com",
+		"public_upstream": "http://127.0.0.1:3000",
+		"token_key_file": "` + filepath.ToSlash(tokenPath) + `",
+		"profiles_file": "` + filepath.ToSlash(profilesPath) + `"
+	}`
+	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := RunLink([]string{
+		"-config", cfgPath,
+		"-profile", "cdn-profile",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("RunLink with vhost profile failed: %d, stderr: %s", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "cdn.example.com%2Frelay") {
+		t.Errorf("expected link to use profile hostname and base_path, got: %s", out)
+	}
+}
+
 func TestReadLastLinesFromFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	logFile := filepath.Join(tmpDir, "test.log")

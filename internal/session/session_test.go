@@ -1100,3 +1100,70 @@ func TestEvictedLaneReleasesBudgetAndIgnoresLateFrames(t *testing.T) {
 		t.Fatal("late DATA for an evicted lane closed the session")
 	}
 }
+
+func TestHasBootstrapForHostAndRateLimits(t *testing.T) {
+	secret, _ := hex.DecodeString("000102030405060708090a0b0c0d0e0f")
+	configuration := config.Defaults()
+	configuration.Limits.MaxBootstrapsPerIP = 1
+	configuration.Limits.MaxSessionsPerIP = 1
+	configuration.Profiles = []config.Profile{
+		{
+			Name:               "host-a",
+			Backend:            "127.0.0.1:1",
+			Hostname:           "hosta.example.com",
+			Capability:         config.DeriveCapability("hosta.example.com", "", secret),
+			DisableIPRateLimit: false,
+		},
+		{
+			Name:               "host-b",
+			Backend:            "127.0.0.1:1",
+			Hostname:           "hostb.example.com",
+			Capability:         config.DeriveCapability("hostb.example.com", "", secret),
+			DisableIPRateLimit: true,
+		},
+	}
+	manager := NewManager(configuration, [32]byte{1})
+	defer manager.Shutdown()
+
+	// 1. Host isolation check
+	tokenA, err := manager.IssueBootstrap(&configuration.Profiles[0], "192.0.2.1")
+	if err != nil {
+		t.Fatalf("failed to issue bootstrap A: %v", err)
+	}
+	if !manager.HasBootstrapForHost(tokenA, "hosta.example.com") {
+		t.Fatal("expected HasBootstrapForHost to return true for matching host")
+	}
+	if manager.HasBootstrapForHost(tokenA, "hostb.example.com") {
+		t.Fatal("expected HasBootstrapForHost to return false for mismatched host")
+	}
+	if manager.HasBootstrapForHost("bogus-token", "hosta.example.com") {
+		t.Fatal("expected HasBootstrapForHost to return false for bogus token")
+	}
+
+	// 2. IP rate limit enforcement for profile without DisableIPRateLimit
+	_, err = manager.IssueBootstrap(&configuration.Profiles[0], "192.0.2.1")
+	if !errors.Is(err, ErrLimit) {
+		t.Fatalf("expected ErrLimit for second bootstrap from same IP on host-a, got %v", err)
+	}
+
+	// 3. IP rate limit bypass for profile with DisableIPRateLimit
+	tokenB1, err := manager.IssueBootstrap(&configuration.Profiles[1], "192.0.2.2")
+	if err != nil {
+		t.Fatalf("failed to issue bootstrap B1: %v", err)
+	}
+	tokenB2, err := manager.IssueBootstrap(&configuration.Profiles[1], "192.0.2.2")
+	if err != nil {
+		t.Fatalf("failed to issue bootstrap B2 with DisableIPRateLimit: %v", err)
+	}
+
+	// 4. Session creation IP rate limit bypass
+	hello := frame.Encode(frame.Hello, 0, []byte{1})
+	_, err = manager.Create(tokenB1, "192.0.2.2", hello)
+	if err != nil {
+		t.Fatalf("failed to create session B1: %v", err)
+	}
+	_, err = manager.Create(tokenB2, "192.0.2.2", hello)
+	if err != nil {
+		t.Fatalf("failed to create session B2 from same IP with DisableIPRateLimit: %v", err)
+	}
+}

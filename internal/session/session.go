@@ -198,6 +198,10 @@ func newSession(options sessionOptions) *Session {
 	return result
 }
 
+func (s *Session) Profile() *config.Profile {
+	return s.profile
+}
+
 func (s *Session) CarrierMode() config.CarrierMode {
 	return s.carrier
 }

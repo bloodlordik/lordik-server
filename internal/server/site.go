@@ -105,7 +105,7 @@ func contentTypeFor(relative string) string {
 	return "application/octet-stream"
 }
 
-func (s *Server) serveEntry(
+func serveStaticEntry(
 	w http.ResponseWriter,
 	r *http.Request,
 	entry *staticEntry,
@@ -121,4 +121,12 @@ func (s *Server) serveEntry(
 	if r.Method != http.MethodHead {
 		_, _ = w.Write(entry.body)
 	}
+}
+
+func (s *Server) serveEntry(
+	w http.ResponseWriter,
+	r *http.Request,
+	entry *staticEntry,
+	status int) {
+	serveStaticEntry(w, r, entry, status)
 }

@@ -102,18 +102,8 @@ func RunLink(args []string, stdout, stderr io.Writer) int {
 				fmt.Fprintf(stderr, "error loading config %q: %v\n", *configPath, err)
 				return 1
 			}
-			if hostname == "" {
-				hostname = cfg.PublicHostname
-			}
-			if basePath == "" && *basePathOverride == "" {
-				basePath = cfg.BasePath
-			}
-			if secret == "" {
-				if len(cfg.Profiles) == 0 {
-					fmt.Fprintf(stderr, "no profiles found in configuration\n")
-					return 1
-				}
-				var selected *config.Profile
+			var selected *config.Profile
+			if len(cfg.Profiles) > 0 {
 				if *profileName != "" {
 					for i := range cfg.Profiles {
 						if cfg.Profiles[i].Name == *profileName {
@@ -127,6 +117,27 @@ func RunLink(args []string, stdout, stderr io.Writer) int {
 					}
 				} else {
 					selected = &cfg.Profiles[0]
+				}
+			}
+
+			if hostname == "" {
+				if selected != nil && selected.Hostname != "" {
+					hostname = selected.Hostname
+				} else {
+					hostname = cfg.PublicHostname
+				}
+			}
+			if basePath == "" && *basePathOverride == "" {
+				if selected != nil && selected.BasePath != "" {
+					basePath = selected.BasePath
+				} else {
+					basePath = cfg.BasePath
+				}
+			}
+			if secret == "" {
+				if selected == nil {
+					fmt.Fprintf(stderr, "no profiles found in configuration\n")
+					return 1
 				}
 				secret = selected.Secret
 			}

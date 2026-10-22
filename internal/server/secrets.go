@@ -11,7 +11,15 @@ import (
 )
 
 func (s *Server) bridgeProfile(r *http.Request) *config.Profile {
-	if r.Method != http.MethodGet || r.URL.EscapedPath() != s.base ||
+	vhost := s.resolveVHost(r)
+	if vhost == nil {
+		return nil
+	}
+	return s.bridgeProfileForVHost(r, vhost)
+}
+
+func (s *Server) bridgeProfileForVHost(r *http.Request, vhost *VHost) *config.Profile {
+	if r.Method != http.MethodGet ||
 		len(r.URL.RawQuery) != len("bridge=")+43 ||
 		!strings.HasPrefix(r.URL.RawQuery, "bridge=") {
 		return nil
@@ -21,7 +29,17 @@ func (s *Server) bridgeProfile(r *http.Request) *config.Profile {
 	if err != nil {
 		return nil
 	}
-	return s.manager.MatchCapability(value)
+	profile := s.manager.MatchCapability(value)
+	if profile == nil {
+		return nil
+	}
+	if !strings.EqualFold(profile.Hostname, vhost.Hostname) {
+		return nil
+	}
+	if r.URL.EscapedPath() != config.Base(profile.BasePath) {
+		return nil
+	}
+	return profile
 }
 
 // Inspect metadata before interpreting credential syntax. Parsing only the

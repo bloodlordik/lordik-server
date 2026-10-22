@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -111,6 +112,12 @@ type Manager struct {
 
 func NewManager(value config.Config, tokenKey [sha256.Size]byte) *Manager {
 	for i := range value.Profiles {
+		if value.Profiles[i].Hostname == "" {
+			value.Profiles[i].Hostname = value.PublicHostname
+		}
+		if value.Profiles[i].BasePath == "" && value.BasePath != "" {
+			value.Profiles[i].BasePath = value.BasePath
+		}
 		value.Profiles[i].CarrierMode = value.Profiles[i].CarrierMode.WithDefault()
 		value.Profiles[i].Limits = value.Profiles[i].Limits.WithDefaults(value.Limits)
 	}
@@ -184,8 +191,8 @@ func (m *Manager) IssueBootstrap(profile *config.Profile, clientIP string) (stri
 		return "", ErrClosed
 	}
 	m.removeExpiredBootstrapsLocked(now)
-	isCDN := profile != nil && profile.CarrierMode.IsCDN()
-	if (!isCDN && m.config.Limits.MaxBootstrapsPerIP != 0 &&
+	skipIPLimit := profile != nil && (profile.CarrierMode.IsCDN() || profile.DisableIPRateLimit)
+	if (!skipIPLimit && m.config.Limits.MaxBootstrapsPerIP != 0 &&
 		m.bootstrapsPerIP[clientIP] >= m.config.Limits.MaxBootstrapsPerIP) || !allowRateLocked(
 		&m.bootstrapRate,
 		now,
@@ -237,11 +244,11 @@ func (m *Manager) Create(token, clientIP string, body []byte) (CreateResult, err
 		}, nil
 	}
 	profileLimits := entry.profile.Limits
-	isCDN := entry.profile != nil && entry.profile.CarrierMode.IsCDN()
+	skipIPLimit := entry.profile != nil && (entry.profile.CarrierMode.IsCDN() || entry.profile.DisableIPRateLimit)
 	if m.closed ||
 		len(m.sessions) >= m.config.Limits.MaxSessionsGlobal ||
 		m.sessionsPerProfile[entry.profile.Name] >= profileLimits.MaxSessions ||
-		(!isCDN && m.config.Limits.MaxSessionsPerIP != 0 &&
+		(!skipIPLimit && m.config.Limits.MaxSessionsPerIP != 0 &&
 			m.sessionsPerIP[clientIP] >= m.config.Limits.MaxSessionsPerIP) {
 		m.limitHits.Add(1)
 		return CreateResult{}, ErrLimit
@@ -326,6 +333,21 @@ func (m *Manager) HasBootstrap(token string) bool {
 	return entry != nil && !now.After(entry.expires)
 }
 
+func (m *Manager) HasBootstrapForHost(token, expectedHost string) bool {
+	hash, err := tokenHash(token)
+	if err != nil {
+		return false
+	}
+	now := time.Now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry := m.bootstraps[hash]
+	if entry == nil || now.After(entry.expires) || entry.profile == nil {
+		return false
+	}
+	return strings.EqualFold(entry.profile.Hostname, expectedHost)
+}
+
 func (m *Manager) Get(token string) (*Session, error) {
 	hash, err := tokenHash(token)
 	if err != nil {
@@ -354,7 +376,8 @@ func (m *Manager) Resume(token, clientIP string) (*Session, error) {
 		return nil, ErrAuthentication
 	}
 	if clientIP != "" && sess.clientIP != clientIP {
-		if sess.profile != nil && !sess.profile.CarrierMode.IsCDN() && m.config.Limits.MaxSessionsPerIP != 0 {
+		skipIPLimit := sess.profile != nil && (sess.profile.CarrierMode.IsCDN() || sess.profile.DisableIPRateLimit)
+		if !skipIPLimit && m.config.Limits.MaxSessionsPerIP != 0 {
 			if m.sessionsPerIP[clientIP] >= m.config.Limits.MaxSessionsPerIP {
 				m.limitHits.Add(1)
 				return nil, ErrLimit

@@ -295,6 +295,15 @@ type profileInput struct {
 	PreferIPv6           bool                 `json:"prefer_ipv6,omitempty"`
 	CarrierMode          CarrierMode          `json:"carrier_mode"`
 	Limits               ProfileLimits        `json:"limits"`
+
+	// Virtual Host configuration (optional, defaults inherited from global Config)
+	Hostname           string  `json:"hostname,omitempty"`
+	BasePath           *string `json:"base_path,omitempty"`
+	PublicDir          string  `json:"public_dir,omitempty"`
+	PublicUpstream     string  `json:"public_upstream,omitempty"`
+	TrustedHostHeader  string  `json:"trusted_host_header,omitempty"`
+	TrustedIPHeader    string  `json:"trusted_ip_header,omitempty"`
+	DisableIPRateLimit bool    `json:"disable_ip_rate_limit,omitempty"`
 }
 
 type ProfileLimits struct {
@@ -323,6 +332,15 @@ type Profile struct {
 	CarrierMode          CarrierMode
 	Capability           [sha256.Size]byte
 	Limits               ProfileLimits
+
+	// Normalized Effective VHost settings
+	Hostname           string
+	BasePath           string
+	PublicDir          string
+	PublicUpstream     string
+	TrustedHostHeader  string
+	TrustedIPHeader    string
+	DisableIPRateLimit bool
 }
 
 func (p Profile) BackendNetworkAndAddress() (string, string) {
@@ -901,11 +919,40 @@ func loadProfiles(path, host, basePath string, limits Limits, defaultBackendType
 			return nil, fmt.Errorf("profile %q: %w", input.Name, err)
 		}
 		profileLimits := input.Limits.WithDefaults(limits)
+
+		// VHost normalization and validation
+		effectiveHost := host
+		if input.Hostname != "" {
+			normHost := strings.ToLower(strings.TrimSpace(input.Hostname))
+			if err := ValidateHostname(normHost); err != nil {
+				return nil, fmt.Errorf("profile %q hostname: %w", input.Name, err)
+			}
+			effectiveHost = normHost
+		}
+
+		effectiveBasePath := basePath
+		if input.BasePath != nil {
+			normBase := strings.TrimSpace(*input.BasePath)
+			if err := ValidateBasePath(normBase); err != nil {
+				return nil, fmt.Errorf("profile %q base_path: %w", input.Name, err)
+			}
+			effectiveBasePath = normBase
+		}
+
+		if input.PublicDir != "" && input.PublicUpstream != "" {
+			return nil, fmt.Errorf("profile %q: public_dir and public_upstream are mutually exclusive", input.Name)
+		}
+		if input.PublicUpstream != "" {
+			if err := validatePublicUpstream(input.PublicUpstream); err != nil {
+				return nil, fmt.Errorf("profile %q public_upstream: %w", input.Name, err)
+			}
+		}
+
 		secret, err := DecodeSecret(input.Secret)
 		if err != nil {
 			return nil, fmt.Errorf("profile %q: %w", input.Name, err)
 		}
-		capability := DeriveCapability(host, basePath, secret)
+		capability := DeriveCapability(effectiveHost, effectiveBasePath, secret)
 		for i := range secret {
 			secret[i] = 0
 		}
@@ -923,9 +970,68 @@ func loadProfiles(path, host, basePath string, limits Limits, defaultBackendType
 			CarrierMode:          carrierMode,
 			Capability:           capability,
 			Limits:               profileLimits,
+			Hostname:             effectiveHost,
+			BasePath:             effectiveBasePath,
+			PublicDir:            input.PublicDir,
+			PublicUpstream:       input.PublicUpstream,
+			TrustedHostHeader:    input.TrustedHostHeader,
+			TrustedIPHeader:      input.TrustedIPHeader,
+			DisableIPRateLimit:   input.DisableIPRateLimit,
 		})
 		names[input.Name] = struct{}{}
 		capabilities[capability] = struct{}{}
+	}
+
+	// Validate VHost consistency across profiles sharing the same effective Hostname
+	type hostSettings struct {
+		publicDir         string
+		publicUpstream    string
+		trustedHostHeader string
+		trustedIPHeader   string
+	}
+	vhostConfigs := make(map[string]hostSettings)
+	for _, p := range result {
+		current, exists := vhostConfigs[p.Hostname]
+		if !exists {
+			vhostConfigs[p.Hostname] = hostSettings{
+				publicDir:         p.PublicDir,
+				publicUpstream:    p.PublicUpstream,
+				trustedHostHeader: p.TrustedHostHeader,
+				trustedIPHeader:   p.TrustedIPHeader,
+			}
+			continue
+		}
+		if p.PublicDir != "" {
+			if current.publicDir != "" && current.publicDir != p.PublicDir {
+				return nil, fmt.Errorf("conflicting public_dir for hostname %q between profiles: %q vs %q", p.Hostname, current.publicDir, p.PublicDir)
+			}
+			if current.publicUpstream != "" {
+				return nil, fmt.Errorf("conflicting decoy configuration for hostname %q: public_dir %q conflicts with public_upstream %q", p.Hostname, p.PublicDir, current.publicUpstream)
+			}
+			current.publicDir = p.PublicDir
+		}
+		if p.PublicUpstream != "" {
+			if current.publicUpstream != "" && current.publicUpstream != p.PublicUpstream {
+				return nil, fmt.Errorf("conflicting public_upstream for hostname %q between profiles: %q vs %q", p.Hostname, current.publicUpstream, p.PublicUpstream)
+			}
+			if current.publicDir != "" {
+				return nil, fmt.Errorf("conflicting decoy configuration for hostname %q: public_upstream %q conflicts with public_dir %q", p.Hostname, p.PublicUpstream, current.publicDir)
+			}
+			current.publicUpstream = p.PublicUpstream
+		}
+		if p.TrustedHostHeader != "" {
+			if current.trustedHostHeader != "" && current.trustedHostHeader != p.TrustedHostHeader {
+				return nil, fmt.Errorf("conflicting trusted_host_header for hostname %q between profiles: %q vs %q", p.Hostname, current.trustedHostHeader, p.TrustedHostHeader)
+			}
+			current.trustedHostHeader = p.TrustedHostHeader
+		}
+		if p.TrustedIPHeader != "" {
+			if current.trustedIPHeader != "" && current.trustedIPHeader != p.TrustedIPHeader {
+				return nil, fmt.Errorf("conflicting trusted_ip_header for hostname %q between profiles: %q vs %q", p.Hostname, current.trustedIPHeader, p.TrustedIPHeader)
+			}
+			current.trustedIPHeader = p.TrustedIPHeader
+		}
+		vhostConfigs[p.Hostname] = current
 	}
 	return result, nil
 }

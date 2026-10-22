@@ -1,7 +1,9 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -520,5 +522,163 @@ func TestLoggingConfiguration(t *testing.T) {
 	negativeDays := `{"enabled": true, "output": "file", "max_days": -5}`
 	if err := writeMainConfig(negativeDays); err == nil {
 		t.Fatal("accepted negative max_days")
+	}
+}
+
+func TestVHostConfiguration(t *testing.T) {
+	directory := t.TempDir()
+	tokenPath := filepath.Join(directory, "token.key")
+	if err := os.WriteFile(tokenPath, []byte("0123456789abcdef0123456789abcdef"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	loadWithProfiles := func(profilesJSON string) (Config, error) {
+		profilesPath := filepath.Join(directory, fmt.Sprintf("profiles_%d.json", time.Now().UnixNano()))
+		if err := os.WriteFile(profilesPath, []byte(profilesJSON), 0600); err != nil {
+			return Config{}, err
+		}
+		cfgJSON := `{
+			"public_hostname": "default.example.com",
+			"public_upstream": "http://127.0.0.1:3000",
+			"token_key_file": "` + filepath.ToSlash(tokenPath) + `",
+			"profiles_file": "` + filepath.ToSlash(profilesPath) + `"
+		}`
+		configPath := filepath.Join(directory, fmt.Sprintf("config_%d.json", time.Now().UnixNano()))
+		if err := os.WriteFile(configPath, []byte(cfgJSON), 0600); err != nil {
+			return Config{}, err
+		}
+		return Load(configPath)
+	}
+
+	// 1. Valid profiles with distinct hostnames, same secret allowed because capabilities differ
+	validMultiHost := `{
+		"profiles": [
+			{
+				"name": "direct-profile",
+				"secret": "000102030405060708090a0b0c0d0e0f",
+				"backend": "127.0.0.1:443",
+				"hostname": "direct.example.com",
+				"carrier_mode": "websocket-lanes"
+			},
+			{
+				"name": "cdn-profile",
+				"secret": "000102030405060708090a0b0c0d0e0f",
+				"backend": "127.0.0.1:443",
+				"hostname": "cdn.example.com",
+				"base_path": "proxy",
+				"carrier_mode": "cdn-adaptive",
+				"trusted_ip_header": "CF-Connecting-IP",
+				"disable_ip_rate_limit": true
+			}
+		]
+	}`
+	cfg, err := loadWithProfiles(validMultiHost)
+	if err != nil {
+		t.Fatalf("failed to load valid multi-host profiles: %v", err)
+	}
+	if len(cfg.Profiles) != 2 {
+		t.Fatalf("expected 2 profiles, got %d", len(cfg.Profiles))
+	}
+	if cfg.Profiles[0].Hostname != "direct.example.com" || cfg.Profiles[0].BasePath != "" {
+		t.Errorf("unexpected profile 0 host/base: %s, %s", cfg.Profiles[0].Hostname, cfg.Profiles[0].BasePath)
+	}
+	if cfg.Profiles[1].Hostname != "cdn.example.com" || cfg.Profiles[1].BasePath != "proxy" {
+		t.Errorf("unexpected profile 1 host/base: %s, %s", cfg.Profiles[1].Hostname, cfg.Profiles[1].BasePath)
+	}
+	if !cfg.Profiles[1].DisableIPRateLimit || cfg.Profiles[1].TrustedIPHeader != "CF-Connecting-IP" {
+		t.Errorf("unexpected profile 1 settings: disable_ip=%v header=%s", cfg.Profiles[1].DisableIPRateLimit, cfg.Profiles[1].TrustedIPHeader)
+	}
+	if bytes.Equal(cfg.Profiles[0].Capability[:], cfg.Profiles[1].Capability[:]) {
+		t.Fatal("capabilities should differ for different hostnames with same secret")
+	}
+
+	// 2. Same secret and same host -> duplicate capability error
+	duplicateCapability := `{
+		"profiles": [
+			{
+				"name": "p1",
+				"secret": "000102030405060708090a0b0c0d0e0f",
+				"backend": "127.0.0.1:443",
+				"hostname": "same.example.com"
+			},
+			{
+				"name": "p2",
+				"secret": "000102030405060708090a0b0c0d0e0f",
+				"backend": "127.0.0.1:443",
+				"hostname": "same.example.com"
+			}
+		]
+	}`
+	if _, err := loadWithProfiles(duplicateCapability); err == nil {
+		t.Fatal("expected duplicate capability error for same host and secret")
+	}
+
+	// 3. Conflicting public_upstream on same host
+	conflictingUpstream := `{
+		"profiles": [
+			{
+				"name": "p1",
+				"secret": "000102030405060708090a0b0c0d0e01",
+				"backend": "127.0.0.1:443",
+				"hostname": "host.example.com",
+				"public_upstream": "http://127.0.0.1:8080"
+			},
+			{
+				"name": "p2",
+				"secret": "000102030405060708090a0b0c0d0e02",
+				"backend": "127.0.0.1:443",
+				"hostname": "host.example.com",
+				"public_upstream": "http://127.0.0.1:8081"
+			}
+		]
+	}`
+	if _, err := loadWithProfiles(conflictingUpstream); err == nil {
+		t.Fatal("expected conflict error for differing public_upstream on same host")
+	}
+
+	// 4. Conflicting public_dir and public_upstream on same host
+	conflictingDecoys := `{
+		"profiles": [
+			{
+				"name": "p1",
+				"secret": "000102030405060708090a0b0c0d0e01",
+				"backend": "127.0.0.1:443",
+				"hostname": "host.example.com",
+				"public_dir": "/var/www/site"
+			},
+			{
+				"name": "p2",
+				"secret": "000102030405060708090a0b0c0d0e02",
+				"backend": "127.0.0.1:443",
+				"hostname": "host.example.com",
+				"public_upstream": "http://127.0.0.1:8081"
+			}
+		]
+	}`
+	if _, err := loadWithProfiles(conflictingDecoys); err == nil {
+		t.Fatal("expected conflict error between public_dir and public_upstream on same host")
+	}
+
+	// 5. Conflicting trusted_host_header on same host
+	conflictingHostHeader := `{
+		"profiles": [
+			{
+				"name": "p1",
+				"secret": "000102030405060708090a0b0c0d0e01",
+				"backend": "127.0.0.1:443",
+				"hostname": "host.example.com",
+				"trusted_host_header": "X-Forwarded-Host"
+			},
+			{
+				"name": "p2",
+				"secret": "000102030405060708090a0b0c0d0e02",
+				"backend": "127.0.0.1:443",
+				"hostname": "host.example.com",
+				"trusted_host_header": "X-Host"
+			}
+		]
+	}`
+	if _, err := loadWithProfiles(conflictingHostHeader); err == nil {
+		t.Fatal("expected conflict error for differing trusted_host_header on same host")
 	}
 }
