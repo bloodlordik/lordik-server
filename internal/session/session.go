@@ -1075,11 +1075,16 @@ func (s *Session) PiggybackDownWait(cursor uint64, coalesce bool) ([]byte, uint6
 		return nil, s.downCursor, nil
 	}
 
-	// 5. Adaptive micro-wait (coalescing up to 25ms) when requested by client
-	// and no poll is active: wait for backend DATA frame to bundle with WINDOW ack.
-	if coalesce && !s.hasPendingDataLocked() {
-		deadline := time.Now().Add(25 * time.Millisecond)
-		for !s.hasPendingDataLocked() && !s.closed && !s.downActive {
+	// 5. Adaptive micro-wait when requested by client and no poll is active:
+	// wait for backend DATA/CLOSE frame to bundle with WINDOW ack.
+	// For direct backend, TCP dial + MTProto resPQ takes ~30-100ms.
+	if coalesce && !s.hasPendingDataOrCloseLocked() {
+		waitDur := 40 * time.Millisecond
+		if s.profile != nil && s.profile.BackendType == config.BackendDirect {
+			waitDur = 150 * time.Millisecond
+		}
+		deadline := time.Now().Add(waitDur)
+		for !s.hasPendingDataOrCloseLocked() && !s.closed && !s.downActive {
 			rem := time.Until(deadline)
 			if rem <= 0 {
 				break
@@ -1102,7 +1107,9 @@ func (s *Session) PiggybackDownWait(cursor uint64, coalesce bool) ([]byte, uint6
 		}
 	}
 
-	if len(s.pendingFrames) == 0 {
+	// Do not waste a downlink batch & cursor increment on a tiny standalone WINDOW frame
+	// during piggybacking unless significant window credit (>64 KiB) is being returned.
+	if !s.hasWorthwhilePiggybackLocked() {
 		return nil, s.downCursor, nil
 	}
 
@@ -1192,7 +1199,7 @@ func (s *Session) PollCDN(ctx context.Context, cursor uint64, timeout time.Durat
 			s.mu.Unlock()
 			return nil, cursor, nil
 		}
-		if len(s.pendingFrames) != 0 {
+		if s.hasWorthwhilePiggybackLocked() {
 			batch := s.takeDownBatchLimitLocked(maxBatch)
 			s.downCursor++
 			s.unackedBase = cursor
@@ -1243,7 +1250,26 @@ func (s *Session) PollCDN(ctx context.Context, cursor uint64, timeout time.Durat
 				return nil, cursor, nil
 			}
 			if len(s.pendingFrames) != 0 {
-				continue
+				batch := s.takeDownBatchLimitLocked(maxBatch)
+				s.downCursor++
+				s.unackedBase = cursor
+				s.unacked = batch.body
+				s.unackedCost += batch.cost
+				s.unackedItems += batch.items
+				s.unackedBatches = append(s.unackedBatches, sentBatch{
+					cursor: s.downCursor,
+					body:   batch.body,
+					cost:   batch.cost,
+					items:  batch.items,
+				})
+				s.downActive = false
+				s.superseded = nil
+				next := s.downCursor
+				s.mu.Unlock()
+				if s.onDown != nil {
+					s.onDown(len(batch.body))
+				}
+				return batch.body, next, nil
 			}
 			s.downActive = false
 			s.superseded = nil
@@ -1423,6 +1449,32 @@ func (s *Session) hasPendingDataLocked() bool {
 	for i := range s.pendingFrames {
 		if s.pendingFrames[i].typeCode == frame.Data {
 			return true
+		}
+	}
+	return false
+}
+
+func (s *Session) hasPendingDataOrCloseLocked() bool {
+	for i := range s.pendingFrames {
+		if s.pendingFrames[i].typeCode == frame.Data || s.pendingFrames[i].typeCode == frame.Close {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Session) hasWorthwhilePiggybackLocked() bool {
+	if len(s.pendingFrames) == 0 {
+		return false
+	}
+	for i := range s.pendingFrames {
+		if s.pendingFrames[i].typeCode != frame.Window {
+			return true
+		}
+		if len(s.pendingFrames[i].encoded) >= frame.HeaderSize+4 {
+			if amount, err := frame.WindowAmount(s.pendingFrames[i].encoded[frame.HeaderSize : frame.HeaderSize+4]); err == nil && amount >= 65536 {
+				return true
+			}
 		}
 	}
 	return false

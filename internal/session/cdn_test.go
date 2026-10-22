@@ -504,3 +504,140 @@ func TestStreamCDN_Superseded(t *testing.T) {
 		t.Fatal("stream 1 was not superseded in time")
 	}
 }
+
+func TestPiggybackAndPollSkipTinyWindow(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Profiles[0].CarrierMode = config.CarrierCDNAdaptive
+	configuration.Profiles[0].BackendType = config.BackendDirect
+	sess := newSession(sessionOptions{
+		profile:  &configuration.Profiles[0],
+		limits:   configuration.Limits,
+		timeouts: configuration.Timeouts,
+	})
+	defer sess.Close()
+
+	// 1. Queue tiny WINDOW frame (104 bytes credit)
+	sess.mu.Lock()
+	queued := sess.queueFrameLocked(frame.Window, 1, frame.WindowPayload(104))
+	sess.mu.Unlock()
+	if !queued {
+		t.Fatal("failed to queue window frame")
+	}
+
+	// 2. PiggybackDownWait without coalesce: tiny WINDOW must NOT be returned standalone
+	body, cursor, err := sess.PiggybackDownWait(0, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(body) != 0 || cursor != 0 {
+		t.Fatalf("expected tiny WINDOW to be skipped, got len=%d cursor=%d", len(body), cursor)
+	}
+
+	// 3. PiggybackDownWait with coalesce: should wait and still NOT return standalone tiny WINDOW
+	start := time.Now()
+	body, cursor, err = sess.PiggybackDownWait(0, true)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(body) != 0 || cursor != 0 {
+		t.Fatalf("expected tiny WINDOW to be skipped after coalesce timeout, got len=%d cursor=%d", len(body), cursor)
+	}
+	// Direct backend has 150ms coalesce wait
+	if elapsed < 100*time.Millisecond {
+		t.Fatalf("expected direct coalesce wait >= 100ms, got %v", elapsed)
+	}
+
+	// 4. Now queue DATA frame (simulate Telegram DC resPQ arriving)
+	sess.mu.Lock()
+	queued = sess.queueFrameLocked(frame.Data, 1, []byte("telegram res_pq_multi response"))
+	sess.mu.Unlock()
+	if !queued {
+		t.Fatal("failed to queue data frame")
+	}
+
+	// 5. Now PiggybackDownWait should return both frames bundled
+	body, cursor, err = sess.PiggybackDownWait(0, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(body) == 0 || cursor != 1 {
+		t.Fatalf("expected bundled batch at cursor 1, got len=%d cursor=%d", len(body), cursor)
+	}
+
+	// Verify both WINDOW and DATA frames are in the bundled batch
+	parsed, err := frame.ParseAll(body, frame.MaxPayload)
+	if err != nil {
+		t.Fatalf("failed to parse bundled frames: %v", err)
+	}
+	if len(parsed) != 2 {
+		t.Fatalf("expected 2 frames (WINDOW + DATA), got %d", len(parsed))
+	}
+	if parsed[0].Type != frame.Window || parsed[1].Type != frame.Data {
+		t.Fatalf("expected [Window, Data], got [%v, %v]", parsed[0].Type, parsed[1].Type)
+	}
+}
+
+func TestPollCDNSkipsTinyWindowUntilData(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Profiles[0].CarrierMode = config.CarrierCDNAdaptive
+	sess := newSession(sessionOptions{
+		profile:  &configuration.Profiles[0],
+		limits:   configuration.Limits,
+		timeouts: configuration.Timeouts,
+	})
+	defer sess.Close()
+
+	// Queue tiny WINDOW
+	sess.mu.Lock()
+	_ = sess.queueFrameLocked(frame.Window, 1, frame.WindowPayload(104))
+	sess.mu.Unlock()
+
+	resultCh := make(chan struct {
+		body   []byte
+		cursor uint64
+		err    error
+	}, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() {
+		b, c, e := sess.PollCDN(ctx, 0, 1*time.Second)
+		resultCh <- struct {
+			body   []byte
+			cursor uint64
+			err    error
+		}{b, c, e}
+	}()
+
+	// PollCDN must NOT immediately return on tiny WINDOW
+	select {
+	case res := <-resultCh:
+		t.Fatalf("PollCDN returned prematurely for tiny WINDOW: len=%d cursor=%d err=%v", len(res.body), res.cursor, res.err)
+	case <-time.After(50 * time.Millisecond):
+		// Expected: PollCDN is still waiting for worthwhile frames
+	}
+
+	// Now queue DATA frame
+	sess.mu.Lock()
+	_ = sess.queueFrameLocked(frame.Data, 1, []byte("delayed data"))
+	sess.mu.Unlock()
+
+	// PollCDN should now wake up and return bundled frames
+	select {
+	case res := <-resultCh:
+		if res.err != nil {
+			t.Fatalf("PollCDN returned error: %v", res.err)
+		}
+		if len(res.body) == 0 || res.cursor != 1 {
+			t.Fatalf("expected bundled body and cursor 1, got len=%d cursor=%d", len(res.body), res.cursor)
+		}
+		parsed, err := frame.ParseAll(res.body, frame.MaxPayload)
+		if err != nil || len(parsed) != 2 {
+			t.Fatalf("expected 2 parsed frames, got len=%d err=%v", len(parsed), err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("PollCDN did not wake up after DATA frame queued")
+	}
+}

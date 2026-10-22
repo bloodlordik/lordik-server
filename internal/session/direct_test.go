@@ -203,6 +203,27 @@ func TestCreateTelegramHandshake(t *testing.T) {
 	}
 }
 
+func TestCreateTelegramHandshakeNormalizedDC(t *testing.T) {
+	header, _, _, err := CreateTelegramHandshake(TagIntermediate, 10002)
+	if err != nil {
+		t.Fatalf("CreateTelegramHandshake failed: %v", err)
+	}
+	tgEncKey := header[8:40]
+	tgEncIV := header[40:56]
+	block, err := aes.NewCipher(tgEncKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dcDecryptor := cipher.NewCTR(block, tgEncIV)
+	decrypted := make([]byte, 64)
+	dcDecryptor.XORKeyStream(decrypted, header)
+
+	dcIdx := int16(binary.LittleEndian.Uint16(decrypted[60:62]))
+	if dcIdx != -2 {
+		t.Fatalf("expected normalized dcIdx -2, got %d", dcIdx)
+	}
+}
+
 func TestResolveTelegramDC(t *testing.T) {
 	// Explicit host:port in backend
 	addr, err := ResolveTelegramDC("1.2.3.4:443", "", 2, false, nil)

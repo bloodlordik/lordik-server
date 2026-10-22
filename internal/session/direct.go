@@ -173,6 +173,11 @@ func CreateTelegramHandshake(protoTag uint32, dcIdx int16) ([]byte, cipher.Strea
 	if protoTag == 0 {
 		protoTag = TagIntermediate
 	}
+	if dcIdx > 10000 && dcIdx <= 10005 {
+		dcIdx = -(dcIdx - 10000)
+	} else if dcIdx < -10000 && dcIdx >= -10005 {
+		dcIdx = -(dcIdx + 10000)
+	}
 	if dcIdx == 0 {
 		dcIdx = 2
 	}
@@ -264,6 +269,8 @@ func ResolveTelegramDC(backend, staticDC string, dcIdx int16, preferIPv6 bool, o
 	// Normalize older media DC representation (10000 + DC)
 	if dcIdx > 10000 && dcIdx <= 10005 {
 		dcIdx = -(dcIdx - 10000)
+	} else if dcIdx < -10000 && dcIdx >= -10005 {
+		dcIdx = -(dcIdx + 10000)
 	}
 
 	absIdx := absDC(dcIdx)

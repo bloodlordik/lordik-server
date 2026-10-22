@@ -400,3 +400,17 @@ lordik-server/
           ''      '';
       }
       ```
+20. **Устранение задержки пинга и ловушки standalone `WINDOW` в CDN + Direct (`session.go`, `direct.go`)**:
+    - **Компоненты**: `internal/session/session.go`, `internal/session/direct.go`, `internal/session/cdn_test.go`, `internal/session/direct_test.go`.
+    - **Проблема**:
+      - При проверке пинга в Telegram (Proxy Check) клиент отправляет одиночный пакет `OPEN` + `DATA` (104 байта: 64 байта MTProto-рукопожатия + 40 байт `req_pq_multi`).
+      - В `runDirect()` отправка в сокет ядра мгновенно триггерит `s.session.backendDrained(s.id, written)`, который генерирует кадр `frame.Window` (104 байта) и будит `s.notify`.
+      - Ранее в `PiggybackDownWait` было зашито ожидание всего 25 мс, в то время как TCP Dial + MTProto Handshake + ответ `resPQ` от дата-центра Telegram занимают 30–100 мс. `PiggybackDownWait` по истечении 25 мс забирал одинокий кадр `WINDOW`, инкрементировал `downCursor` и закрывал HTTP-ответ, а параллельный `PollCDN` получал дубликат `WINDOW` без данных.
+      - В `PollCDN` приход `s.notify` от `backendDrained` также преждевременно срывал HTTP-ответ, отправляя клиенту пустой возврат 104 байт кредитного окна прямо перед носом у ответа `resPQ`.
+      - В `CreateTelegramHandshake` передавался ненормализованный `dcIdx` (> 10000 для старого формата медиа/прокси DC), что приводило к отклонению рукопожатия серверами Telegram.
+    - **Решение**:
+      - В `session.go` внедрены предикаты `hasPendingDataOrCloseLocked()` и `hasWorthwhilePiggybackLocked()`: если в очереди лежит только одиночный `WINDOW` (< 64 КиБ кредита), он не расходует батч и курсор `downCursor`, а ожидает склейки с реальным `frame.Data` (`resPQ`).
+      - В `PiggybackDownWait` микро-ожидание `coalesce` для `BackendDirect` расширено до 150 мс (40 мс для остальных бэкендов) и ожидает появления `DATA` или `CLOSE`.
+      - В `PollCDN` цикл поллинга ожидает полноценных кадров (`hasWorthwhilePiggybackLocked()`) и отдает мелкие `WINDOW` только при истечении таймаута поллинга.
+      - В `CreateTelegramHandshake` и `ResolveTelegramDC` добавлена нормализация `dcIdx` (`10001..10005` -> `-1..-5`, `-10001..-10005` -> `1..5`).
+      - В результате пинг в меню выбора Telegram рассчитывается за 1 сетевой RTT (60–150 мс), объединяя `WINDOW` и `DATA (resPQ)` в первый же HTTP-ответ uplink без ожидания повторных циклов поллинга.
