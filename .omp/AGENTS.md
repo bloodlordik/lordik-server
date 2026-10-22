@@ -88,6 +88,7 @@ lordik-server/
      - `https_lanes.html`: шаблон для HTTP с мультиплексированием по логическим линиям (lanes).
      - `websocket.html`: оптимизированный шаблон для единого WebSocket-соединения.
      - `websocket_lanes.html`: шаблон для индивидуальных WebSocket-соединений на каждую логическую линию.
+     - `cdn.html`: специализированный адаптивный шаблон для CDN-транспортов (`cdn-adaptive`, `cdn-get`, `cdn-body`, `cdn-ws`) с мимикрией под Next.js/HLS, поддержкой Header Sharding, Happy Eyeballs рукопожатия, Streaming Downlink (`ReadableStream`) с авто-откатом к Long-Polling, ETag-кэшированием и анти-буферизацией glTF binary.
    - **Архитектура фабрики (`Factory`)**:
      - Реализован компонент `Factory` с методом `Render(Options)` и иерархическим разрешением шаблонов: сначала проверяется наличие платформо-специфичного шаблона для режима (`platform_carrierMode.html`), затем платформенного (`platform.html`), затем carrier-режима (`carrierMode.html`), с откатом к `bridge.html`.
      - Поддерживается динамическая регистрация и переопределение шаблонов (`RegisterTemplate`).
@@ -296,3 +297,106 @@ lordik-server/
       - **Probe Fallback**: при первом запуске стрима выставляется таймер 1500 мс. Если промежуточный CDN буферизирует ответ или окружение не поддерживает `ReadableStream`, клиент мгновенно откатывается на классический Long-Polling (`startPollLoop`).
       - **Watchdog**: таймер на 16 с детектирует «тихий» обрыв TCP-сокета и инициирует прозрачное переподключение.
       - **Auto-Ack Uplink**: при активном скачивании данных и отсутствии исходящего трафика клиент отправляет пустой легковесный Uplink-запрос для подтверждения курсора каждые 16 батчей, предотвращая заполнение очереди `unackedBatches`.
+19. **Руководство по настройке раздельных профилей (VHost), CDN-транспортов и Nginx**:
+    - **Архитектура виртуальных хостов (`profiles.json`)**:
+      - Каждый профиль может обслуживать собственный домен (`hostname`), иметь независимый префикс пути (`base_path`), отдельный маскировочный сайт (`public_dir` или `public_upstream`) и кастомные сетевые лимиты.
+      - Пример файла `profiles.json` с раздельными профилями (классический WebSocket и облачный CDN):
+      ```json
+      {
+        "profiles": [
+          {
+            "name": "direct-ws",
+            "secret": "ee0102030405060708090a0b0c0d0e0f",
+            "carrier_mode": "websocket-lanes",
+            "backend_type": "direct",
+            "backend": "auto",
+            "hostname": "proxy.myhost.com",
+            "public_dir": "/var/www/decoy-main",
+            "trusted_ip_header": "X-Forwarded-For"
+          },
+          {
+            "name": "cloudflare-cdn",
+            "secret": "dd0102030405060708090a0b0c0d0e0f",
+            "carrier_mode": "cdn-adaptive",
+            "backend_type": "telemt",
+            "backend": "127.0.0.1:9090",
+            "backend_proxy_protocol": "v2",
+            "hostname": "cdn.myhost.com",
+            "base_path": "assets",
+            "public_upstream": "http://127.0.0.1:3000",
+            "trusted_ip_header": "CF-Connecting-IP",
+            "disable_ip_rate_limit": true,
+            "limits": {
+              "cdn_poll_timeout_secs": 12,
+              "cdn_max_down_batch_bytes": 524288,
+              "cdn_uplink_window_size": 16,
+              "cdn_stream_max_duration_secs": 45,
+              "cdn_stream_heartbeat_secs": 10,
+              "cdn_max_unacked_batches": 32
+            }
+          }
+        ]
+      }
+      ```
+    - **Специфика настройки CDN-профилей**:
+      - Режим `carrier_mode`: рекомендуется `"cdn-adaptive"`, который автоматически стартует рукопожатие через Happy Eyeballs (параллельный запуск POST collect и GET init) и выбирает рабочий конвейер с учетом ограничений сети клиента и пограничного CDN.
+      - Для работы за проксирующими CDN (Cloudflare, Gcore и др.) обязателен параметр `"trusted_ip_header": "CF-Connecting-IP"` (или `"True-Client-IP"` / `"X-Real-IP"`), а также `"disable_ip_rate_limit": true` во избежание блокировки пользователей за общими пограничными IP-адресами CDN.
+    - **Обязательная конфигурация Nginx**:
+      - Для предотвращения буферизации стриминга, таймаутов long-poll и ошибок передачи больших чанков Nginx конфигурируется следующим образом:
+      ```nginx
+      # Upstream к tproxy-server
+      upstream tproxy_backend {
+          server 127.0.0.1:8080;
+          keepalive 32;
+      }
+
+      server {
+          listen 443 ssl http2;
+          server_name cdn.myhost.com proxy.myhost.com;
+
+          ssl_certificate /etc/letsencrypt/live/myhost.com/fullchain.pem;
+          ssl_certificate_key /etc/letsencrypt/live/myhost.com/privkey.pem;
+
+          # Приватность: отключаем логи доступа во избежание утечки токенов сессий
+          access_log off;
+          error_log /var/log/nginx/tproxy_error.log warn;
+
+          # Отключаем сжатие gzip, чтобы не ломать бинарные потоки glTF и чанки
+          gzip off;
+
+          # Лимит тела запроса: uplink-пакеты достигают 2 МиБ (+ overhead заголовков)
+          client_max_body_size 4m;
+
+          location / {
+              proxy_pass http://tproxy_backend;
+              proxy_http_version 1.1;
+
+              # Поддержка WebSocket для websocket / websocket-lanes режимов
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection $connection_upgrade;
+
+              # Передача целевого хоста для корректной маршрутизации виртуальных хостов (VHost)
+              proxy_set_header Host $host;
+
+              # Клиентский IP: строго один IP-адрес без запятых!
+              proxy_set_header X-Forwarded-For $remote_addr;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header CF-Connecting-IP $http_cf_connecting_ip;
+
+              # КРИТИЧНО для Streaming Downlink и Long-Polling: отключение буферизации
+              proxy_buffering off;
+              proxy_request_buffering off;
+
+              # Таймауты: стриминг длится до 45 с, long-poll до 25 с
+              proxy_read_timeout 90s;
+              proxy_send_timeout 90s;
+              proxy_connect_timeout 10s;
+          }
+      }
+
+      # Карта для корректного переключения заголовка Connection (WebSocket vs Keep-Alive)
+      map $http_upgrade $connection_upgrade {
+          default upgrade;
+          ''      '';
+      }
+      ```
