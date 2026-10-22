@@ -76,6 +76,13 @@ type downBatch struct {
 	items int
 }
 
+type sentBatch struct {
+	cursor uint64
+	body   []byte
+	cost   int
+	items  int
+}
+
 type carrierLane struct {
 	lastUpSequence  uint64
 	lastUpDigest    [sha256.Size]byte
@@ -122,6 +129,7 @@ type Session struct {
 	unackedCost           int
 	unackedItems          int
 	unackedBase           uint64
+	unackedBatches        []sentBatch
 	downCursor            uint64
 	lastUpSequence        uint64
 	lastUpDigest          [sha256.Size]byte
@@ -317,7 +325,13 @@ func (s *Session) Resume(upSeq, downCursor uint64) (serverUpSeq, serverDownCurso
 		return 0, 0, nil, ErrClosed
 	}
 	s.lastActivity = time.Now()
-	if len(s.unacked) != 0 {
+	if len(s.unackedBatches) != 0 {
+		s.ackCursorLocked(downCursor)
+		if len(s.unackedBatches) != 0 {
+			replay = s.unackedBatches[0].body
+		}
+		serverDownCursor = s.downCursor
+	} else if len(s.unacked) != 0 {
 		if downCursor == s.unackedBase {
 			replay = s.unacked
 			serverDownCursor = s.downCursor
@@ -981,6 +995,58 @@ func (s *Session) PiggybackDown(cursor uint64) ([]byte, uint64, error) {
 
 // PiggybackDownWait attempts a harvest of downlink frames, optionally micro-waiting up to 5ms
 // if coalesce is true, no poll is active, and no frames are immediately available.
+func (s *Session) ackCursorLocked(ackCursor uint64) {
+	if ackCursor > s.downCursor {
+		return
+	}
+	freedCount := 0
+	freedCost := 0
+	freedItems := 0
+	for i := 0; i < len(s.unackedBatches); i++ {
+		if s.unackedBatches[i].cursor <= ackCursor {
+			freedCost += s.unackedBatches[i].cost
+			freedItems += s.unackedBatches[i].items
+			freedCount++
+		} else {
+			break
+		}
+	}
+	if freedCount > 0 {
+		s.releasePendingLocked(freedCost, freedItems)
+		s.unackedBatches = s.unackedBatches[freedCount:]
+		s.unackedCost -= freedCost
+		s.unackedItems -= freedItems
+		if s.unackedCost < 0 {
+			s.unackedCost = 0
+		}
+		if s.unackedItems < 0 {
+			s.unackedItems = 0
+		}
+		if len(s.pendingFrames) > 0 {
+			signal(s.notify)
+		}
+	}
+	if len(s.unackedBatches) > 0 {
+		s.unacked = s.unackedBatches[0].body
+		s.unackedBase = s.unackedBatches[0].cursor - 1
+	} else {
+		if len(s.unacked) != 0 && (ackCursor == s.downCursor || ackCursor == s.unackedBase+1) {
+			s.releasePendingLocked(s.unackedCost, s.unackedItems)
+			s.unacked = nil
+			s.unackedCost = 0
+			s.unackedItems = 0
+			if len(s.pendingFrames) > 0 {
+				signal(s.notify)
+			}
+		} else if len(s.unacked) == 0 {
+			s.unackedCost = 0
+			s.unackedItems = 0
+		}
+	}
+}
+
+// PiggybackDownWait attempts a harvest of downlink frames, optionally micro-waiting up to 5ms
+// if coalesce is true, no poll is active, and no frames are immediately available.
 func (s *Session) PiggybackDownWait(cursor uint64, coalesce bool) ([]byte, uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -995,21 +1061,16 @@ func (s *Session) PiggybackDownWait(cursor uint64, coalesce bool) ([]byte, uint6
 		return nil, cursor, ErrProtocol
 	}
 
-	// 2. Client acknowledges current unacked batch.
-	if cursor == s.downCursor && len(s.unacked) != 0 {
-		s.releasePendingLocked(s.unackedCost, s.unackedItems)
-		s.unacked = nil
-		s.unackedCost = 0
-		s.unackedItems = 0
-	}
+	// 2. Client acknowledges current unacked batch(es).
+	s.ackCursorLocked(cursor)
 
 	// 3. Stale cursor from a concurrent in-flight request, or unacked batch still in flight.
-	// Do not duplicate traffic; client will receive via long-poll or next request.
-	if cursor < s.downCursor || len(s.unacked) != 0 {
+	// Do not duplicate traffic; client will receive via stream, long-poll or next request.
+	if cursor < s.downCursor || len(s.unackedBatches) != 0 || len(s.unacked) != 0 {
 		return nil, s.downCursor, nil
 	}
 
-	// 4. If PollCDN is currently active, leave frames for the dedicated downlink poll.
+	// 4. If PollCDN or StreamCDN is currently active, leave frames for the dedicated downlink poll.
 	if s.downActive {
 		return nil, s.downCursor, nil
 	}
@@ -1036,7 +1097,7 @@ func (s *Session) PiggybackDownWait(cursor uint64, coalesce bool) ([]byte, uint6
 		if s.closed {
 			return nil, cursor, ErrClosed
 		}
-		if cursor != s.downCursor || len(s.unacked) != 0 || s.downActive {
+		if cursor != s.downCursor || len(s.unackedBatches) != 0 || len(s.unacked) != 0 || s.downActive {
 			return nil, s.downCursor, nil
 		}
 	}
@@ -1053,8 +1114,14 @@ func (s *Session) PiggybackDownWait(cursor uint64, coalesce bool) ([]byte, uint6
 	s.downCursor++
 	s.unackedBase = cursor
 	s.unacked = batch.body
-	s.unackedCost = batch.cost
-	s.unackedItems = batch.items
+	s.unackedCost += batch.cost
+	s.unackedItems += batch.items
+	s.unackedBatches = append(s.unackedBatches, sentBatch{
+		cursor: s.downCursor,
+		body:   batch.body,
+		cost:   batch.cost,
+		items:  batch.items,
+	})
 	next := s.downCursor
 	if s.onDown != nil {
 		s.onDown(len(batch.body))
@@ -1083,8 +1150,18 @@ func (s *Session) PollCDN(ctx context.Context, cursor uint64, timeout time.Durat
 		return nil, cursor, ErrProtocol
 	}
 
+	s.ackCursorLocked(cursor)
+
 	if cursor < s.downCursor {
-		// If retry of current unacked batch
+		// If retry of an unacknowledged batch
+		for _, b := range s.unackedBatches {
+			if b.cursor > cursor {
+				result := b.body
+				next := b.cursor
+				s.mu.Unlock()
+				return result, next, nil
+			}
+		}
 		if len(s.unacked) != 0 && cursor == s.unackedBase {
 			result := s.unacked
 			next := s.downCursor
@@ -1096,14 +1173,6 @@ func (s *Session) PollCDN(ctx context.Context, cursor uint64, timeout time.Durat
 		next := s.downCursor
 		s.mu.Unlock()
 		return nil, next, nil
-	}
-
-	// cursor == s.downCursor: client acknowledged previous unacked batch
-	if len(s.unacked) != 0 {
-		s.releasePendingLocked(s.unackedCost, s.unackedItems)
-		s.unacked = nil
-		s.unackedCost = 0
-		s.unackedItems = 0
 	}
 
 	if s.downActive && s.superseded != nil {
@@ -1128,8 +1197,14 @@ func (s *Session) PollCDN(ctx context.Context, cursor uint64, timeout time.Durat
 			s.downCursor++
 			s.unackedBase = cursor
 			s.unacked = batch.body
-			s.unackedCost = batch.cost
-			s.unackedItems = batch.items
+			s.unackedCost += batch.cost
+			s.unackedItems += batch.items
+			s.unackedBatches = append(s.unackedBatches, sentBatch{
+				cursor: s.downCursor,
+				body:   batch.body,
+				cost:   batch.cost,
+				items:  batch.items,
+			})
 			s.downActive = false
 			s.superseded = nil
 			next := s.downCursor
@@ -1180,6 +1255,166 @@ func (s *Session) PollCDN(ctx context.Context, cursor uint64, timeout time.Durat
 			if s.superseded != mine {
 				signal(s.notify)
 			}
+		}
+	}
+}
+
+// StreamCDN streams downlink frames continuously using binary stream envelopes.
+// It performs zero-loss replay for unacknowledged batches, handles periodic heartbeats,
+// and bounds unacknowledged memory via sliding window backpressure.
+func (s *Session) StreamCDN(ctx context.Context, startCursor uint64, onBatch func(cursor uint64, body []byte) error) error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return ErrClosed
+	}
+	if startCursor > s.downCursor {
+		s.mu.Unlock()
+		s.protocolFailure()
+		return ErrProtocol
+	}
+	s.lastActivity = time.Now()
+
+	s.ackCursorLocked(startCursor)
+
+	if s.downActive && s.superseded != nil {
+		close(s.superseded)
+	}
+	mine := make(chan struct{})
+	s.superseded = mine
+	s.downActive = true
+
+	defer func() {
+		s.mu.Lock()
+		if s.superseded == mine {
+			s.downActive = false
+			s.superseded = nil
+		}
+		s.mu.Unlock()
+	}()
+
+	// 1. Zero-Loss Replay for any remaining unacknowledged batches
+	var toReplay []sentBatch
+	if len(s.unackedBatches) > 0 {
+		toReplay = make([]sentBatch, len(s.unackedBatches))
+		copy(toReplay, s.unackedBatches)
+	}
+	s.mu.Unlock()
+
+	for _, b := range toReplay {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-mine:
+			return nil
+		default:
+		}
+		if err := onBatch(b.cursor, b.body); err != nil {
+			return err
+		}
+		s.mu.Lock()
+		s.lastActivity = time.Now()
+		s.mu.Unlock()
+	}
+
+	s.mu.Lock()
+
+	maxDuration := time.Duration(s.limits.CDNStreamMaxDurationSecs) * time.Second
+	if maxDuration <= 0 {
+		maxDuration = 45 * time.Second
+	}
+	heartbeatInterval := time.Duration(s.limits.CDNStreamHeartbeatSecs) * time.Second
+	if heartbeatInterval <= 0 {
+		heartbeatInterval = 10 * time.Second
+	}
+	maxUnacked := s.limits.CDNMaxUnackedBatches
+	if maxUnacked <= 0 {
+		maxUnacked = 32
+	}
+	maxBatch := s.limits.CDNMaxDownBatchBytes
+	if maxBatch <= 0 {
+		maxBatch = 524288
+	}
+
+	heartbeat := time.NewTicker(heartbeatInterval)
+	defer heartbeat.Stop()
+	maxDur := time.NewTimer(maxDuration)
+	defer maxDur.Stop()
+
+	for {
+		if s.closed {
+			s.mu.Unlock()
+			return ErrClosed
+		}
+		if s.superseded != mine {
+			s.mu.Unlock()
+			return nil
+		}
+
+		// Backpressure check: don't take new frames if unacked queue is full or unackedCost >= 4 MiB
+		if len(s.pendingFrames) > 0 && len(s.unackedBatches) < maxUnacked && s.unackedCost < 4*1024*1024 {
+			batch := s.takeDownBatchLimitLocked(maxBatch)
+			s.downCursor++
+			s.unackedBase = s.downCursor - 1
+			s.unacked = batch.body
+			s.unackedCost += batch.cost
+			s.unackedItems += batch.items
+			sb := sentBatch{
+				cursor: s.downCursor,
+				body:   batch.body,
+				cost:   batch.cost,
+				items:  batch.items,
+			}
+			s.unackedBatches = append(s.unackedBatches, sb)
+			cur := s.downCursor
+			body := batch.body
+			s.lastActivity = time.Now()
+			if s.onDown != nil {
+				s.onDown(len(body))
+			}
+			s.mu.Unlock()
+
+			if err := onBatch(cur, body); err != nil {
+				return err
+			}
+
+			s.mu.Lock()
+			continue
+		}
+
+		notify := s.notify
+		done := s.done
+		s.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-mine:
+			return nil
+		case <-done:
+			return ErrClosed
+		case <-maxDur.C:
+			return nil
+		case <-heartbeat.C:
+			s.mu.Lock()
+			if s.closed {
+				s.mu.Unlock()
+				return ErrClosed
+			}
+			if s.superseded != mine {
+				s.mu.Unlock()
+				return nil
+			}
+			cur := s.downCursor
+			s.lastActivity = time.Now()
+			s.mu.Unlock()
+
+			if err := onBatch(cur, nil); err != nil {
+				return err
+			}
+			s.mu.Lock()
+		case <-notify:
+			s.mu.Lock()
 		}
 	}
 }
@@ -2010,6 +2245,7 @@ func (s *Session) closeLocked() {
 	s.unacked = nil
 	s.unackedCost = 0
 	s.unackedItems = 0
+	s.unackedBatches = nil
 	s.cdnReassembly = nil
 	s.cdnPendingFrames = nil
 	signal(s.notify)

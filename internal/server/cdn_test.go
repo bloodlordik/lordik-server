@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -457,5 +458,167 @@ func TestCDNReverseProxyHeadersAndCoalescing(t *testing.T) {
 	}
 	if !bytes.Equal(echoed, payloadMsg) {
 		t.Fatalf("expected echoed %q, got %q", payloadMsg, echoed)
+	}
+}
+
+func TestServer_CDNStreamDown_HeadersAndStreaming(t *testing.T) {
+	backend := startEchoBackend(t)
+	application, _ := newConfiguredTestServer(t, backend, func(value *config.Config) {
+		value.Profiles[0].CarrierMode = config.CarrierCDNAdaptive
+	})
+	defer application.Shutdown()
+
+	hosted := httptest.NewServer(application.Handler())
+	defer hosted.Close()
+
+	buildID := application.BuildID()
+	clientIP := "198.51.100.99"
+
+	// 1. Issue bootstrap and init
+	bootstrap, err := application.manager.IssueBootstrap(&application.config.Profiles[0], clientIP)
+	if err != nil {
+		t.Fatalf("IssueBootstrap failed: %v", err)
+	}
+
+	helloFrame := frame.Encode(frame.Hello, 0, []byte{1})
+	helloB64 := base64.RawURLEncoding.EncodeToString(helloFrame)
+	initURL := hosted.URL + "/_next/data/" + buildID + "/init/" + bootstrap + "/" + helloB64 + ".json"
+
+	initReq := request(t, http.MethodGet, initURL, nil, clientIP)
+	initReq.Header.Set("X-Client-Key", bootstrap)
+	initRes := perform(t, hosted.Client(), initReq)
+	initBody := readResponse(t, initRes)
+
+	var initJSON struct {
+		Token   string `json:"token"`
+		ShortID string `json:"short_id"`
+	}
+	if err := json.Unmarshal(initBody, &initJSON); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Open Stream Downlink: GET /assets/media/{short_id}/stream_0_test.m4s
+	streamURL := hosted.URL + "/assets/media/" + initJSON.ShortID + "/stream_0_test.m4s"
+	streamReq := request(t, http.MethodGet, streamURL, nil, "")
+	streamReq.Header.Set("X-Client-Key", initJSON.Token)
+	streamReq.Header.Set("X-Forwarded-For", clientIP)
+
+	streamRes, err := hosted.Client().Do(streamReq)
+	if err != nil {
+		t.Fatalf("stream GET failed: %v", err)
+	}
+	defer streamRes.Body.Close()
+
+	if streamRes.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", streamRes.StatusCode)
+	}
+	if streamRes.Header.Get("Content-Type") != "model/gltf-binary" {
+		t.Fatalf("expected Content-Type model/gltf-binary, got %q", streamRes.Header.Get("Content-Type"))
+	}
+	if streamRes.Header.Get("X-Accel-Buffering") != "no" {
+		t.Fatalf("expected X-Accel-Buffering no, got %q", streamRes.Header.Get("X-Accel-Buffering"))
+	}
+	if !strings.Contains(streamRes.Header.Get("Cache-Control"), "no-store") {
+		t.Fatalf("expected no-store in Cache-Control, got %q", streamRes.Header.Get("Cache-Control"))
+	}
+
+	// Read 12-byte glTF prefix
+	prefix := make([]byte, 12)
+	if _, err := io.ReadFull(streamRes.Body, prefix); err != nil {
+		t.Fatalf("failed to read glTF stream prefix: %v", err)
+	}
+	if !bytes.Equal(prefix[:4], []byte("glTF")) {
+		t.Fatalf("invalid glTF prefix magic: %q", prefix[:4])
+	}
+
+	// Read initial 8-byte heartbeat envelope
+	heartbeat := make([]byte, 8)
+	if _, err := io.ReadFull(streamRes.Body, heartbeat); err != nil {
+		t.Fatalf("failed to read heartbeat envelope: %v", err)
+	}
+	hbCursor := uint32(heartbeat[0])<<24 | uint32(heartbeat[1])<<16 | uint32(heartbeat[2])<<8 | uint32(heartbeat[3])
+	hbLen := uint32(heartbeat[4])<<24 | uint32(heartbeat[5])<<16 | uint32(heartbeat[6])<<8 | uint32(heartbeat[7])
+	if hbCursor != 0 || hbLen != 0 {
+		t.Fatalf("expected heartbeat cursor=0, len=0, got cursor=%d, len=%d", hbCursor, hbLen)
+	}
+
+	// 3. Uplink OPEN + DATA frame via POST sync
+	streamID := uint32(777)
+	openFrame := frame.Encode(frame.Open, streamID, nil)
+	dataPayload := []byte("streaming test data")
+	dataFrame := frame.Encode(frame.Data, streamID, dataPayload)
+	batch := append(openFrame, dataFrame...)
+
+	syncURL := hosted.URL + "/_next/data/" + buildID + "/sync/" + initJSON.ShortID + "/1.bin"
+	syncReq := request(t, http.MethodPost, syncURL, batch, "application/octet-stream")
+	syncReq.Header.Set("X-Client-Key", initJSON.Token)
+	syncReq.Header.Set("X-Request-ID", "1.0.0")
+	syncReq.Header.Set("X-Forwarded-For", clientIP)
+	syncReq.Header.Set("X-Down-Cursor", "0")
+	syncRes := perform(t, hosted.Client(), syncReq)
+	if syncRes.StatusCode != http.StatusOK {
+		t.Fatalf("sync POST failed: %d", syncRes.StatusCode)
+	}
+
+	// 4. Read the streamed batch envelope from the open stream body!
+	var foundData bool
+	for attempts := 0; attempts < 5 && !foundData; attempts++ {
+		batchHdr := make([]byte, 8)
+		if _, err := io.ReadFull(streamRes.Body, batchHdr); err != nil {
+			t.Fatalf("failed to read batch envelope header: %v", err)
+		}
+		bCursor := uint32(batchHdr[0])<<24 | uint32(batchHdr[1])<<16 | uint32(batchHdr[2])<<8 | uint32(batchHdr[3])
+		bLen := uint32(batchHdr[4])<<24 | uint32(batchHdr[5])<<16 | uint32(batchHdr[6])<<8 | uint32(batchHdr[7])
+		if bLen == 0 {
+			continue // heartbeat
+		}
+		payload := make([]byte, bLen)
+		if _, err := io.ReadFull(streamRes.Body, payload); err != nil {
+			t.Fatalf("failed to read batch payload: %v", err)
+		}
+		recvFrames, err := frame.ParseAll(payload, 1024*1024)
+		if err != nil {
+			t.Fatalf("ParseAll failed on streamed payload: %v", err)
+		}
+		for _, f := range recvFrames {
+			if f.StreamID == streamID && f.Type == frame.Data && bytes.Equal(f.Payload, dataPayload) {
+				foundData = true
+				if bCursor == 0 {
+					t.Fatalf("expected non-zero bCursor, got %d", bCursor)
+				}
+				break
+			}
+		}
+	}
+	if !foundData {
+		t.Fatal("did not receive echoed DATA frame in streamed envelopes")
+	}
+}
+
+func TestServer_CDNStreamDown_ProbingResistance(t *testing.T) {
+	backend := startEchoBackend(t)
+	application, _ := newConfiguredTestServer(t, backend, func(value *config.Config) {
+		value.Profiles[0].CarrierMode = config.CarrierCDNAdaptive
+	})
+	defer application.Shutdown()
+
+	hosted := httptest.NewServer(application.Handler())
+	defer hosted.Close()
+
+	// Probe stream endpoint without token and with invalid token
+	for _, urlPath := range []string{
+		"/assets/media/fake_short/stream_0_test.m4s",
+		"/assets/media/fake_short/seg_0_test.m4s",
+	} {
+		req, _ := http.NewRequest(http.MethodGet, hosted.URL+urlPath, nil)
+		req.Header.Set("X-Stream-Poll", "1")
+		res := perform(t, hosted.Client(), req)
+		body := readResponse(t, res)
+		if res.StatusCode != http.StatusNotFound {
+			t.Fatalf("%s: expected 404, got %d", urlPath, res.StatusCode)
+		}
+		if !strings.Contains(string(body), "Operator Site") {
+			t.Fatalf("%s: expected decoy body, got %q", urlPath, string(body))
+		}
 	}
 }

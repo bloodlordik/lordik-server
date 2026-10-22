@@ -136,11 +136,16 @@ func (s *Server) serveCDN(w http.ResponseWriter, r *http.Request, vhost *VHost, 
 		return
 	}
 
-	// Route 5: GET assets/media/{session_short_id}/seg_{cursor}_{rand}.m4s
-	// [0]: "assets", [1]: "media", [2]: session_short_id, [3]: seg_{cursor}_{rand}.m4s
+	// Route 5: GET assets/media/{session_short_id}/{seg|stream}_{cursor}_{rand}.m4s
+	// [0]: "assets", [1]: "media", [2]: session_short_id, [3]: {seg|stream}_{cursor}_{rand}.m4s
 	if len(parts) == 4 && parts[0] == "assets" && parts[1] == "media" {
 		if r.Method != http.MethodGet {
 			vhost.servePublic(w, r)
+			return
+		}
+		cleanFile := strings.TrimSuffix(parts[3], ".m4s")
+		if strings.HasPrefix(cleanFile, "stream_") || (strings.HasPrefix(cleanFile, "seg_") && r.Header.Get("X-Stream-Poll") == "1") {
+			s.serveCDNStreamDown(w, r, vhost, parts[2], parts[3])
 			return
 		}
 		s.serveCDNMediaPoll(w, r, vhost, parts[2], parts[3])
@@ -393,6 +398,77 @@ func (s *Server) serveCDNMediaPoll(w http.ResponseWriter, r *http.Request, vhost
 	}
 
 	s.writeCDNDownlinkResponse(w, batch, nextCursor)
+}
+
+func (s *Server) serveCDNStreamDown(w http.ResponseWriter, r *http.Request, vhost *VHost, sessionShortID, file string) {
+	cleanFile := strings.TrimSuffix(file, ".m4s")
+	var prefix string
+	if strings.HasPrefix(cleanFile, "stream_") {
+		prefix = "stream_"
+	} else if strings.HasPrefix(cleanFile, "seg_") {
+		prefix = "seg_"
+	} else {
+		vhost.servePublic(w, r)
+		return
+	}
+	parts := strings.Split(strings.TrimPrefix(cleanFile, prefix), "_")
+	if len(parts) == 0 {
+		vhost.servePublic(w, r)
+		return
+	}
+	cursor, err := strconv.ParseUint(parts[0], 10, 64)
+	if err != nil {
+		vhost.servePublic(w, r)
+		return
+	}
+
+	sess := s.resolveSession(r, sessionShortID, vhost)
+	if sess == nil {
+		vhost.servePublic(w, r)
+		return
+	}
+
+	if cursor > sess.DownCursor() {
+		s.handleCDNSessionError(w, r, vhost, session.ErrProtocol)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		s.serveCDNMediaPoll(w, r, vhost, sessionShortID, file)
+		return
+	}
+
+	w.Header().Set("Content-Type", "model/gltf-binary")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("Cache-Control", "private, no-store, no-cache, max-age=0, must-revalidate")
+	w.Header().Set("CDN-Cache-Control", "no-store")
+	w.Header().Set("Cloudflare-CDN-Cache-Control", "no-store")
+	w.Header().Set("Surrogate-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	w.WriteHeader(http.StatusOK)
+
+	if err := session.WriteGLTFStreamPrefix(w); err != nil {
+		return
+	}
+	flusher.Flush()
+
+	if err := session.WriteBatchEnvelope(w, cursor, nil); err != nil {
+		return
+	}
+	flusher.Flush()
+
+	rc := http.NewResponseController(w)
+	onBatch := func(cur uint64, body []byte) error {
+		_ = rc.SetWriteDeadline(time.Now().Add(15 * time.Second))
+		if err := session.WriteBatchEnvelope(w, cur, body); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
+
+	_ = sess.StreamCDN(r.Context(), cursor, onBatch)
 }
 
 func (s *Server) serveCDNUnload(w http.ResponseWriter, r *http.Request, vhost *VHost, sessionShortID string) {

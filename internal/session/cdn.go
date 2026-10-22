@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/telegramdesktop/tproxy-server/internal/frame"
@@ -15,10 +16,46 @@ var (
 )
 
 const (
-	GLTFHeaderSize = 12
-	GLTFMagic      = "glTF" // 0x67, 0x6c, 0x54, 0x46
-	GLTFVersion    = 2
+	GLTFHeaderSize           = 12
+	GLTFMagic                = "glTF" // 0x67, 0x6c, 0x54, 0x46
+	GLTFVersion              = 2
+	StreamEnvelopeHeaderSize = 8
 )
+
+// GLTFStreamHeader is the 12-byte stream prefix:
+// - bytes 0..3: magic "glTF"
+// - bytes 4..7: version 2 in Little-Endian
+// - bytes 8..11: 0xFFFFFFFF (unknown streaming length LE)
+var GLTFStreamHeader = [GLTFHeaderSize]byte{
+	0x67, 0x6c, 0x54, 0x46, // "glTF"
+	0x02, 0x00, 0x00, 0x00, // version 2 LE
+	0xff, 0xff, 0xff, 0xff, // unknown streaming length LE
+}
+
+// WriteGLTFStreamPrefix writes the 12-byte streaming glTF header to w.
+func WriteGLTFStreamPrefix(w io.Writer) error {
+	_, err := w.Write(GLTFStreamHeader[:])
+	return err
+}
+
+// WriteBatchEnvelope writes an 8-byte envelope header followed by payload:
+// - bytes 0..3: Next DownCursor (uint32 BE)
+// - bytes 4..7: Payload ByteLength (uint32 BE)
+// - bytes 8..8+len(payload): Payload bytes (if len > 0)
+func WriteBatchEnvelope(w io.Writer, cursor uint64, payload []byte) error {
+	var hdr [StreamEnvelopeHeaderSize]byte
+	binary.BigEndian.PutUint32(hdr[0:4], uint32(cursor))
+	binary.BigEndian.PutUint32(hdr[4:8], uint32(len(payload)))
+	if _, err := w.Write(hdr[:]); err != nil {
+		return err
+	}
+	if len(payload) > 0 {
+		if _, err := w.Write(payload); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // FrameStreamParser accumulates bytes from stream-oriented chunks and extracts
 // full frames. It enforces a strict upper bound on pending incomplete frame bytes.

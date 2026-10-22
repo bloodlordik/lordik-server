@@ -271,3 +271,236 @@ func TestCDNPerIPLimitsBypass(t *testing.T) {
 	}
 	defer res2.Session.Close()
 }
+
+func TestStreamCDN_InitialHeartbeatAndPrefix(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteGLTFStreamPrefix(&buf); err != nil {
+		t.Fatalf("WriteGLTFStreamPrefix failed: %v", err)
+	}
+	if buf.Len() != 12 {
+		t.Fatalf("expected 12 bytes prefix, got %d", buf.Len())
+	}
+	if !bytes.Equal(buf.Bytes()[:4], []byte("glTF")) {
+		t.Fatalf("expected glTF magic, got %q", buf.Bytes()[:4])
+	}
+
+	// Test empty envelope (heartbeat)
+	buf.Reset()
+	if err := WriteBatchEnvelope(&buf, 42, nil); err != nil {
+		t.Fatalf("WriteBatchEnvelope heartbeat failed: %v", err)
+	}
+	if buf.Len() != 8 {
+		t.Fatalf("expected 8 bytes heartbeat envelope, got %d", buf.Len())
+	}
+
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Profiles[0].CarrierMode = config.CarrierCDNAdaptive
+	configuration.Limits.CDNStreamHeartbeatSecs = 1
+	configuration.Limits.CDNStreamMaxDurationSecs = 10
+	sess := newSession(sessionOptions{
+		profile:  &configuration.Profiles[0],
+		limits:   configuration.Limits,
+		timeouts: configuration.Timeouts,
+	})
+	defer sess.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	received := make(chan []byte, 5)
+	go func() {
+		_ = sess.StreamCDN(ctx, 0, func(cur uint64, body []byte) error {
+			if len(body) > 0 {
+				received <- body
+			}
+			return nil
+		})
+	}()
+
+	// Wait for stream to become active
+	time.Sleep(20 * time.Millisecond)
+
+	// Queue a downlink frame
+	sess.mu.Lock()
+	sess.queueFrameLocked(frame.Data, 10, []byte("streamed frame payload"))
+	sess.mu.Unlock()
+
+	select {
+	case b := <-received:
+		frames, err := frame.ParseAll(b, 1024*1024)
+		if err != nil || len(frames) != 1 {
+			t.Fatalf("invalid batch received: frames=%d err=%v", len(frames), err)
+		}
+		if frames[0].StreamID != 10 || string(frames[0].Payload) != "streamed frame payload" {
+			t.Fatalf("unexpected frame content: %+v", frames[0])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for streamed batch")
+	}
+}
+
+func TestStreamCDN_ZeroLossReplay(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Profiles[0].CarrierMode = config.CarrierCDNAdaptive
+	sess := newSession(sessionOptions{
+		profile:  &configuration.Profiles[0],
+		limits:   configuration.Limits,
+		timeouts: configuration.Timeouts,
+	})
+	defer sess.Close()
+
+	// Send 2 batches via StreamCDN
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	batches1 := make(chan uint64, 5)
+	go func() {
+		_ = sess.StreamCDN(ctx1, 0, func(cur uint64, body []byte) error {
+			if len(body) > 0 {
+				batches1 <- cur
+			}
+			return nil
+		})
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	sess.mu.Lock()
+	sess.queueFrameLocked(frame.Data, 1, []byte("batch 1"))
+	sess.mu.Unlock()
+
+	select {
+	case cur := <-batches1:
+		if cur != 1 {
+			t.Fatalf("expected cursor 1, got %d", cur)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for batch 1")
+	}
+
+	sess.mu.Lock()
+	sess.queueFrameLocked(frame.Data, 2, []byte("batch 2"))
+	sess.mu.Unlock()
+
+	select {
+	case cur := <-batches1:
+		if cur != 2 {
+			t.Fatalf("expected cursor 2, got %d", cur)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for batch 2")
+	}
+
+	// Disconnect client 1
+	cancel1()
+	time.Sleep(30 * time.Millisecond)
+
+	// Client 2 reconnects asking for cursor 1 (missed batch 2)
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+
+	replayed := make(chan uint64, 5)
+	go func() {
+		_ = sess.StreamCDN(ctx2, 1, func(cur uint64, body []byte) error {
+			if len(body) > 0 {
+				replayed <- cur
+			}
+			return nil
+		})
+	}()
+
+	select {
+	case cur := <-replayed:
+		if cur != 2 {
+			t.Fatalf("expected replayed batch cursor 2, got %d", cur)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for replayed batch 2")
+	}
+}
+
+func TestStreamCDN_UplinkAckPruning(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Profiles[0].CarrierMode = config.CarrierCDNAdaptive
+	sess := newSession(sessionOptions{
+		profile:  &configuration.Profiles[0],
+		limits:   configuration.Limits,
+		timeouts: configuration.Timeouts,
+	})
+	defer sess.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	batches := make(chan uint64, 5)
+	go func() {
+		_ = sess.StreamCDN(ctx, 0, func(cur uint64, body []byte) error {
+			if len(body) > 0 {
+				batches <- cur
+			}
+			return nil
+		})
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	sess.mu.Lock()
+	sess.queueFrameLocked(frame.Data, 1, []byte("frame 1"))
+	sess.mu.Unlock()
+
+	<-batches
+
+	sess.mu.Lock()
+	if len(sess.unackedBatches) != 1 {
+		t.Fatalf("expected 1 unacked batch, got %d", len(sess.unackedBatches))
+	}
+	sess.mu.Unlock()
+
+	// Send PiggybackDown with cursor 1 (acknowledging batch 1)
+	_, _, err := sess.PiggybackDown(1)
+	if err != nil {
+		t.Fatalf("PiggybackDown ack failed: %v", err)
+	}
+
+	sess.mu.Lock()
+	if len(sess.unackedBatches) != 0 || sess.unackedCost != 0 {
+		t.Fatalf("expected 0 unacked batches and 0 cost after ack, got %d batches, cost=%d",
+			len(sess.unackedBatches), sess.unackedCost)
+	}
+	sess.mu.Unlock()
+}
+
+func TestStreamCDN_Superseded(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Profiles[0].CarrierMode = config.CarrierCDNAdaptive
+	sess := newSession(sessionOptions{
+		profile:  &configuration.Profiles[0],
+		limits:   configuration.Limits,
+		timeouts: configuration.Timeouts,
+	})
+	defer sess.Close()
+
+	stream1Done := make(chan error, 1)
+	go func() {
+		err := sess.StreamCDN(context.Background(), 0, func(cur uint64, body []byte) error {
+			return nil
+		})
+		stream1Done <- err
+	}()
+
+	time.Sleep(30 * time.Millisecond)
+
+	// Start stream 2 (supersedes stream 1)
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	go func() {
+		_ = sess.StreamCDN(ctx2, 0, func(cur uint64, body []byte) error {
+			return nil
+		})
+	}()
+
+	select {
+	case err := <-stream1Done:
+		if err != nil {
+			t.Fatalf("stream 1 should exit cleanly with nil on superseded, got: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream 1 was not superseded in time")
+	}
+}

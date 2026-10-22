@@ -221,6 +221,9 @@ type Limits struct {
 	CDNPollTimeoutSecs        int `json:"cdn_poll_timeout_secs"`
 	CDNMaxDownBatchBytes      int `json:"cdn_max_down_batch_bytes"`
 	CDNUplinkWindowSize       int `json:"cdn_uplink_window_size"`
+	CDNStreamMaxDurationSecs  int `json:"cdn_stream_max_duration_secs"`
+	CDNStreamHeartbeatSecs    int `json:"cdn_stream_heartbeat_secs"`
+	CDNMaxUnackedBatches      int `json:"cdn_max_unacked_batches"`
 }
 
 type Timeouts struct {
@@ -319,6 +322,9 @@ type ProfileLimits struct {
 	CDNPollTimeoutSecs      int `json:"cdn_poll_timeout_secs"`
 	CDNMaxDownBatchBytes    int `json:"cdn_max_down_batch_bytes"`
 	CDNUplinkWindowSize     int `json:"cdn_uplink_window_size"`
+	CDNStreamMaxDurationSecs int `json:"cdn_stream_max_duration_secs"`
+	CDNStreamHeartbeatSecs   int `json:"cdn_stream_heartbeat_secs"`
+	CDNMaxUnackedBatches     int `json:"cdn_max_unacked_batches"`
 }
 
 type Profile struct {
@@ -401,6 +407,15 @@ func (limits ProfileLimits) WithDefaults(global Limits) ProfileLimits {
 	if result.CDNUplinkWindowSize == 0 {
 		result.CDNUplinkWindowSize = global.CDNUplinkWindowSize
 	}
+	if result.CDNStreamMaxDurationSecs == 0 {
+		result.CDNStreamMaxDurationSecs = global.CDNStreamMaxDurationSecs
+	}
+	if result.CDNStreamHeartbeatSecs == 0 {
+		result.CDNStreamHeartbeatSecs = global.CDNStreamHeartbeatSecs
+	}
+	if result.CDNMaxUnackedBatches == 0 {
+		result.CDNMaxUnackedBatches = global.CDNMaxUnackedBatches
+	}
 	return result
 }
 
@@ -439,6 +454,9 @@ func Defaults() Config {
 			CDNPollTimeoutSecs:        12,
 			CDNMaxDownBatchBytes:      524288,
 			CDNUplinkWindowSize:       16,
+			CDNStreamMaxDurationSecs:  45,
+			CDNStreamHeartbeatSecs:    10,
+			CDNMaxUnackedBatches:      32,
 		},
 		Timeouts: Timeouts{
 			BackendDial:       Duration(5 * time.Second),
@@ -569,6 +587,15 @@ func (c Config) validate() error {
 	}
 	if c.Limits.CDNUplinkWindowSize <= 0 || c.Limits.CDNUplinkWindowSize > 64 {
 		return errors.New("cdn_uplink_window_size must be between 1 and 64")
+	}
+	if c.Limits.CDNStreamMaxDurationSecs < 10 || c.Limits.CDNStreamMaxDurationSecs > 300 {
+		return errors.New("cdn_stream_max_duration_secs must be between 10 and 300")
+	}
+	if c.Limits.CDNStreamHeartbeatSecs < 1 || c.Limits.CDNStreamHeartbeatSecs > 30 {
+		return errors.New("cdn_stream_heartbeat_secs must be between 1 and 30")
+	}
+	if c.Limits.CDNMaxUnackedBatches < 4 || c.Limits.CDNMaxUnackedBatches > 128 {
+		return errors.New("cdn_max_unacked_batches must be between 4 and 128")
 	}
 	values := []int{
 		c.Limits.MaxStreamsPerSession, c.Limits.MaxClosedStreamIDs,
@@ -1065,6 +1092,15 @@ func validateProfileLimits(value ProfileLimits, global Limits) error {
 	}
 	if value.CDNUplinkWindowSize < 0 || value.CDNUplinkWindowSize > 64 {
 		return errors.New("cdn_uplink_window_size must be between 0 and 64")
+	}
+	if value.CDNStreamMaxDurationSecs < 0 || value.CDNStreamMaxDurationSecs > 300 {
+		return errors.New("cdn_stream_max_duration_secs must be between 0 and 300")
+	}
+	if value.CDNStreamHeartbeatSecs < 0 || value.CDNStreamHeartbeatSecs > 30 {
+		return errors.New("cdn_stream_heartbeat_secs must be between 0 and 30")
+	}
+	if value.CDNMaxUnackedBatches < 0 || value.CDNMaxUnackedBatches > 128 {
+		return errors.New("cdn_max_unacked_batches must be between 0 and 128")
 	}
 	resolved := value.WithDefaults(global)
 	if resolved.MaxStreamsPerSession > resolved.MaxStreams {
