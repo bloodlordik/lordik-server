@@ -19,6 +19,8 @@ let activeMode='cdn-adaptive'; // cdn-adaptive, cdn-get, cdn-body
 const pending=[],upPending=[];
 const queueLimit=33554432,queueItemLimit=16384,batchLimit=__BATCH_LIMIT__;
 let upSeq=1,downCursor=0,upInflight=0,maxInflight=6;
+const maxWindowSpan=48;
+const inflightSeqs=new Set();
 let debounceTimer=0;
 let lastSentAckCursor=0;
 let failing=false;
@@ -261,12 +263,22 @@ async function createSession(helloBuf){
  startStreamLoop();
  scheduleFlush();
 }
+
+function canAdvanceWindow(){
+ if(inflightSeqs.size===0)return true;
+ let minSeq=Infinity;
+ for(const s of inflightSeqs){
+  if(s<minSeq)minSeq=s;
+ }
+ return (upSeq-minSeq)<maxWindowSpan;
+}
+
 function queueCarrier(buf){
  if(closed)return;
  if(queuedBytes+buf.byteLength>queueLimit||queuedItems+1>queueItemLimit){fail();return}
  queuedBytes+=buf.byteLength;
  queuedItems++;
- upPending.push(buf);
+ upPending.push(new Uint8Array(buf));
  if(sessionToken&&upInflight===0&&!debounceTimer){
   flushUplink();
  }else{
@@ -283,118 +295,209 @@ function scheduleFlush(){
 }
 
 function flushUplink(){
- if(closed||!sessionToken||!upPending.length||upInflight>=maxInflight)return;
- let total=0,count=0;
- const maxChunk=activeMode==='cdn-body'?16384:9216;
- while(count<upPending.length&&count<64){
-  if(count>0&&total+upPending[count].byteLength>maxChunk)break;
-  total+=upPending[count].byteLength;
-  count++;
+ while(!closed&&sessionToken&&upPending.length>0&&upInflight<maxInflight&&canAdvanceWindow()){
+  const maxChunk=activeMode==='cdn-body'?16384:6144;
+  let total=0;
+  const parts=[];
+
+  while(upPending.length>0&&total<maxChunk&&parts.length<64){
+   const head=upPending[0];
+   const need=maxChunk-total;
+   if(head.byteLength<=need){
+    parts.push(head);
+    total+=head.byteLength;
+    queuedBytes-=head.byteLength;
+    queuedItems--;
+    upPending.shift();
+   }else{
+    // Крупный кадр (например, 64 КиБ DATA при загрузке медиа) разрезается точно по maxChunk!
+    parts.push(head.subarray(0,need));
+    upPending[0]=head.subarray(need);
+    total+=need;
+    queuedBytes-=need;
+    break;
+   }
+  }
+
+  if(total===0)break;
+
+  let payloadBuf;
+  if(parts.length===1&&parts[0].byteOffset===0&&parts[0].byteLength===parts[0].buffer.byteLength){
+   payloadBuf=parts[0].buffer;
+  }else{
+   const merged=new Uint8Array(total);
+   let off=0;
+   for(const p of parts){
+    merged.set(p,off);
+    off+=p.byteLength;
+   }
+   payloadBuf=merged.buffer;
+  }
+
+  const seq=upSeq++;
+  upInflight++;
+  inflightSeqs.add(seq);
+  sendChunkWithBackoff(seq,payloadBuf,0);
  }
- const chunkItems=upPending.splice(0,count);
- for(const item of chunkItems){
-  queuedBytes-=item.byteLength;
-  queuedItems--;
- }
- const merged=new Uint8Array(total);
- let off=0;
- for(const item of chunkItems){
-  merged.set(new Uint8Array(item),off);
-  off+=item.byteLength;
- }
- const seq=upSeq++;
- upInflight++;
- sendChunkWithBackoff(seq,merged.buffer,0);
- if(upPending.length&&upInflight<maxInflight)scheduleFlush();
 }
 
 async function sendChunkWithBackoff(seq,buf,retry){
- if(closed)return;
- const cur=downCursor;
- lastSentAckCursor=cur;
- const reqId=seq+'.'+cur+'.0';
- let success=false;
- const ctrl=new AbortController();
- const reqTimer=setTimeout(()=>ctrl.abort(),10000);
- try{
-  if(activeMode==='cdn-body'){
-   const postUrl=relayBase+'_next/data/'+buildId+'/sync/'+shortId+'/'+seq+'.bin';
-   const res=await fetch(postUrl,{
-    method:'POST',
-    body:buf,
-    signal:ctrl.signal,
-    mode:'same-origin',credentials:'omit',cache:'no-store',
-    headers:{
-     'Content-Type':'application/octet-stream',
-     'X-Client-Key':sessionToken,
-     'X-Request-ID':reqId,
-     'X-Down-Cursor':String(cur),
-     'X-Coalesce':'1'
+ while(!closed){
+  const cur=downCursor;
+  lastSentAckCursor=cur;
+  const reqId=seq+'.'+cur+'.0';
+  let success=false;
+  let statusCode=0;
+  const ctrl=new AbortController();
+  const reqTimer=setTimeout(()=>ctrl.abort(),10000);
+  try{
+   if(activeMode==='cdn-body'&&buf.byteLength<=6144){
+    const postUrl=relayBase+'_next/data/'+buildId+'/sync/'+shortId+'/'+seq+'.bin';
+    const res=await fetch(postUrl,{
+     method:'POST',
+     body:buf,
+     signal:ctrl.signal,
+     mode:'same-origin',credentials:'omit',cache:'no-store',
+     headers:{
+      'Content-Type':'application/octet-stream',
+      'X-Client-Key':sessionToken,
+      'X-Request-ID':reqId,
+      'X-Down-Cursor':String(cur),
+      'X-Coalesce':(upPending.length===0&&upInflight<=1)?'1':'0'
+     }
+    });
+    clearTimeout(reqTimer);
+    statusCode=res.status;
+    if(res.ok){
+     const ct=res.headers.get('Content-Type');
+     const resBuf=await res.arrayBuffer();
+     if(!processDownlink(resBuf,ct)){
+      inflightSeqs.delete(seq);
+      upInflight--;
+      fail();
+      return;
+     }
+     success=true;
+    }else if(res.status===404||res.status===410){
+     inflightSeqs.delete(seq);
+     upInflight--;
+     fail();
+     return;
+    }else if(carrierMode!=='cdn-body'&&(res.status===400||res.status===403||res.status===405||res.status===413)){
+     // Если CDN заблокировал POST на загрузке медиа — мгновенно переключаемся на cdn-get
+     activeMode='cdn-get';
     }
-   });
+   }else{
+    // Если буфер в cdn-body был > 6144 и мы переключились в cdn-get или идем по cdn-get
+    if(activeMode==='cdn-body'&&buf.byteLength>6144){
+     const postUrl=relayBase+'_next/data/'+buildId+'/sync/'+shortId+'/'+seq+'.bin';
+     const res=await fetch(postUrl,{
+      method:'POST',
+      body:buf,
+      signal:ctrl.signal,
+      mode:'same-origin',credentials:'omit',cache:'no-store',
+      headers:{
+       'Content-Type':'application/octet-stream',
+       'X-Client-Key':sessionToken,
+       'X-Request-ID':reqId,
+       'X-Down-Cursor':String(cur),
+       'X-Coalesce':(upPending.length===0&&upInflight<=1)?'1':'0'
+      }
+     });
+     clearTimeout(reqTimer);
+     statusCode=res.status;
+     if(res.ok){
+      const ct=res.headers.get('Content-Type');
+      const resBuf=await res.arrayBuffer();
+      if(!processDownlink(resBuf,ct)){
+       inflightSeqs.delete(seq);
+       upInflight--;
+       fail();
+       return;
+      }
+      success=true;
+     }else if(res.status===404||res.status===410){
+      inflightSeqs.delete(seq);
+      upInflight--;
+      fail();
+      return;
+     }else if(carrierMode!=='cdn-body'){
+      activeMode='cdn-get';
+     }
+    }else{
+     const b64=toBase64Url(buf);
+     const urlPart=b64.slice(0,2048);
+     const remaining=b64.slice(2048);
+     const headers={
+      'X-Client-Key':sessionToken,
+      'X-Request-ID':reqId,
+      'X-Down-Cursor':String(cur),
+      'X-Coalesce':(upPending.length===0&&upInflight<=1)?'1':'0'
+     };
+     let roff=0,hidx=0;
+     while(roff<remaining.length&&hidx<8){
+      headers['X-Client-Data-'+hidx]=remaining.slice(roff,roff+3072);
+      roff+=3072;hidx++;
+     }
+     const getUrl=relayBase+'assets/chunks/'+shortId+'/'+seq+'.bin?p='+encodeURIComponent(urlPart);
+     const res=await fetch(getUrl,{
+      method:'GET',
+      signal:ctrl.signal,
+      mode:'same-origin',credentials:'omit',cache:'no-store',
+      headers
+     });
+     clearTimeout(reqTimer);
+     statusCode=res.status;
+     if(res.ok){
+      const ct=res.headers.get('Content-Type');
+      const resBuf=await res.arrayBuffer();
+      if(!processDownlink(resBuf,ct)){
+       inflightSeqs.delete(seq);
+       upInflight--;
+       fail();
+       return;
+      }
+      success=true;
+     }else if(res.status===404||res.status===410){
+      inflightSeqs.delete(seq);
+      upInflight--;
+      fail();
+      return;
+     }
+    }
+   }
+  }catch(e){
+   if(activeMode==='cdn-body'&&carrierMode!=='cdn-body')activeMode='cdn-get';
+  }finally{
    clearTimeout(reqTimer);
-   if(res.ok){
-    const ct=res.headers.get('Content-Type');
-    const resBuf=await res.arrayBuffer();
-    if(!processDownlink(resBuf,ct)){fail();return}
-    success=true;
-   }else if(res.status===404||res.status===410){
-    fail();return;
-   }
-  }else{
-   const b64=toBase64Url(buf);
-   const urlPart=b64.slice(0,3072);
-   const remaining=b64.slice(3072);
-   const headers={
-    'X-Client-Key':sessionToken,
-    'X-Request-ID':reqId,
-    'X-Down-Cursor':String(cur),
-    'X-Coalesce':'1'
-   };
-   let roff=0,hidx=0;
-   while(roff<remaining.length&&hidx<8){
-    headers['X-Client-Data-'+hidx]=remaining.slice(roff,roff+3072);
-    roff+=3072;hidx++;
-   }
-   const getUrl=relayBase+'assets/chunks/'+shortId+'/'+seq+'.bin?p='+encodeURIComponent(urlPart);
-   const res=await fetch(getUrl,{
-    method:'GET',
-    signal:ctrl.signal,
-    mode:'same-origin',credentials:'omit',cache:'no-store',
-    headers
-   });
-   clearTimeout(reqTimer);
-   if(res.ok){
-    const ct=res.headers.get('Content-Type');
-    const resBuf=await res.arrayBuffer();
-    if(!processDownlink(resBuf,ct)){fail();return}
-    success=true;
-   }else if(res.status===404||res.status===410){
-    fail();return;
-   }
   }
- }catch(e){
- }finally{
-  clearTimeout(reqTimer);
- }
 
- upInflight--;
- if(!success){
-  if(closed)return;
-  const isBg=(typeof document!=='undefined'&&document.visibilityState==='hidden')||(typeof navigator!=='undefined'&&navigator.onLine===false);
-  const nextRetry=isBg?retry:retry+1;
-  if(nextRetry<=8){
-   const delay=isBg?2000:Math.min(1500,50*(1<<Math.min(retry,5)))+(Math.random()*50|0);
-   await pause(delay);
-   if(closed)return;
-   upInflight++;
-   sendChunkWithBackoff(seq,buf,nextRetry);
+  if(success){
+   inflightSeqs.delete(seq);
+   upInflight--;
+   if(upPending.length)flushUplink();
    return;
   }
-  fail();
-  return;
+
+  if(closed){
+   inflightSeqs.delete(seq);
+   upInflight--;
+   return;
+  }
+
+  const isBg=(typeof document!=='undefined'&&document.visibilityState==='hidden')||(typeof navigator!=='undefined'&&navigator.onLine===false);
+  retry=isBg?retry:retry+1;
+  if(retry>8){
+   inflightSeqs.delete(seq);
+   upInflight--;
+   fail();
+   return;
+  }
+  const delay=isBg?2000:Math.min(1500,50*(1<<Math.min(retry,5)))+(Math.random()*50|0);
+  await pause(delay);
  }
- if(upPending.length)scheduleFlush();
+ inflightSeqs.delete(seq);
+ upInflight--;
 }
 
 async function sendAckOnly(){

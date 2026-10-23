@@ -19,6 +19,8 @@ let activeMode='cdn-adaptive'; // cdn-adaptive, cdn-get, cdn-body
 const pending=[],upPending=[];
 const queueLimit=33554432,queueItemLimit=16384,batchLimit=__BATCH_LIMIT__;
 let upSeq=1,downCursor=0,upInflight=0,maxInflight=6;
+const maxWindowSpan=48;
+const inflightSeqs=new Set();
 let debounceTimer=0;
 let lastSentAckCursor=0;
 let failing=false;
@@ -261,12 +263,21 @@ async function createSession(helloBuf){
  startPollLoop();
  scheduleFlush();
 }
+
+function canAdvanceWindow(){
+ if(inflightSeqs.size===0)return true;
+ let minSeq=Infinity;
+ for(const s of inflightSeqs){
+  if(s<minSeq)minSeq=s;
+ }
+ return (upSeq-minSeq)<maxWindowSpan;
+}
 function queueCarrier(buf){
  if(closed)return;
  if(queuedBytes+buf.byteLength>queueLimit||queuedItems+1>queueItemLimit){fail();return}
  queuedBytes+=buf.byteLength;
  queuedItems++;
- upPending.push(buf);
+ upPending.push(new Uint8Array(buf));
  if(sessionToken&&upInflight===0&&!debounceTimer){
   flushUplink();
  }else{
@@ -283,29 +294,49 @@ function scheduleFlush(){
 }
 
 function flushUplink(){
- if(closed||!sessionToken||!upPending.length||upInflight>=maxInflight)return;
- let total=0,count=0;
- const maxChunk=activeMode==='cdn-body'?16384:9216;
- while(count<upPending.length&&count<64){
-  if(count>0&&total+upPending[count].byteLength>maxChunk)break;
-  total+=upPending[count].byteLength;
-  count++;
+ while(!closed&&sessionToken&&upPending.length>0&&upInflight<maxInflight&&canAdvanceWindow()){
+  const maxChunk=activeMode==='cdn-body'?16384:6144;
+  let total=0;
+  const parts=[];
+
+  while(upPending.length>0&&total<maxChunk&&parts.length<64){
+   const head=upPending[0];
+   const need=maxChunk-total;
+   if(head.byteLength<=need){
+    parts.push(head);
+    total+=head.byteLength;
+    queuedBytes-=head.byteLength;
+    queuedItems--;
+    upPending.shift();
+   }else{
+    parts.push(head.subarray(0,need));
+    upPending[0]=head.subarray(need);
+    total+=need;
+    queuedBytes-=need;
+    break;
+   }
+  }
+
+  if(total===0)break;
+
+  let payloadBuf;
+  if(parts.length===1&&parts[0].byteOffset===0&&parts[0].byteLength===parts[0].buffer.byteLength){
+   payloadBuf=parts[0].buffer;
+  }else{
+   const merged=new Uint8Array(total);
+   let off=0;
+   for(const p of parts){
+    merged.set(p,off);
+    off+=p.byteLength;
+   }
+   payloadBuf=merged.buffer;
+  }
+
+  const seq=upSeq++;
+  upInflight++;
+  inflightSeqs.add(seq);
+  sendChunkWithBackoff(seq,payloadBuf,0);
  }
- const chunkItems=upPending.splice(0,count);
- for(const item of chunkItems){
-  queuedBytes-=item.byteLength;
-  queuedItems--;
- }
- const merged=new Uint8Array(total);
- let off=0;
- for(const item of chunkItems){
-  merged.set(new Uint8Array(item),off);
-  off+=item.byteLength;
- }
- const seq=upSeq++;
- upInflight++;
- sendChunkWithBackoff(seq,merged.buffer,0);
- if(upPending.length&&upInflight<maxInflight)scheduleFlush();
 }
 
 async function sendChunkWithBackoff(seq,buf,retry){
@@ -329,7 +360,7 @@ async function sendChunkWithBackoff(seq,buf,retry){
      'X-Client-Key':sessionToken,
      'X-Request-ID':reqId,
      'X-Down-Cursor':String(cur),
-     'X-Coalesce':'1'
+     'X-Coalesce':(upPending.length===0&&upInflight<=1)?'1':'0'
     }
    });
    clearTimeout(reqTimer);
@@ -338,9 +369,11 @@ async function sendChunkWithBackoff(seq,buf,retry){
     const resBuf=await res.arrayBuffer();
     if(!processDownlink(resBuf,ct)){fail();return}
     success=true;
-   }else if(res.status===404||res.status===410){
-    fail();return;
-   }
+  }else if(res.status===404||res.status===410){
+   inflightSeqs.delete(seq);
+   upInflight--;
+   fail();return;
+  }
   }else{
    const b64=toBase64Url(buf);
    const urlPart=b64.slice(0,3072);
@@ -349,7 +382,7 @@ async function sendChunkWithBackoff(seq,buf,retry){
     'X-Client-Key':sessionToken,
     'X-Request-ID':reqId,
     'X-Down-Cursor':String(cur),
-    'X-Coalesce':'1'
+    'X-Coalesce':(upPending.length===0&&upInflight<=1)?'1':'0'
    };
    let roff=0,hidx=0;
    while(roff<remaining.length&&hidx<8){
@@ -370,6 +403,8 @@ async function sendChunkWithBackoff(seq,buf,retry){
     if(!processDownlink(resBuf,ct)){fail();return}
     success=true;
    }else if(res.status===404||res.status===410){
+    inflightSeqs.delete(seq);
+    upInflight--;
     fail();return;
    }
   }
@@ -391,9 +426,11 @@ async function sendChunkWithBackoff(seq,buf,retry){
    sendChunkWithBackoff(seq,buf,nextRetry);
    return;
   }
+  inflightSeqs.delete(seq);
   fail();
   return;
  }
+ inflightSeqs.delete(seq);
  if(upPending.length)scheduleFlush();
 }
 

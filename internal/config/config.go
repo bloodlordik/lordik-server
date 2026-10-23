@@ -453,7 +453,7 @@ func Defaults() Config {
 			MaxProfiles:               32,
 			CDNPollTimeoutSecs:        12,
 			CDNMaxDownBatchBytes:      524288,
-			CDNUplinkWindowSize:       16,
+			CDNUplinkWindowSize:       64,
 			CDNStreamMaxDurationSecs:  45,
 			CDNStreamHeartbeatSecs:    10,
 			CDNMaxUnackedBatches:      32,
@@ -585,8 +585,8 @@ func (c Config) validate() error {
 	if c.Limits.CDNMaxDownBatchBytes <= 0 || c.Limits.CDNMaxDownBatchBytes > c.Limits.MaxBodyBytes {
 		return errors.New("cdn_max_down_batch_bytes must be positive and not exceed max_body_bytes")
 	}
-	if c.Limits.CDNUplinkWindowSize <= 0 || c.Limits.CDNUplinkWindowSize > 64 {
-		return errors.New("cdn_uplink_window_size must be between 1 and 64")
+	if c.Limits.CDNUplinkWindowSize <= 0 || c.Limits.CDNUplinkWindowSize > 128 {
+		return errors.New("cdn_uplink_window_size must be between 1 and 128")
 	}
 	if c.Limits.CDNStreamMaxDurationSecs < 10 || c.Limits.CDNStreamMaxDurationSecs > 300 {
 		return errors.New("cdn_stream_max_duration_secs must be between 10 and 300")
@@ -1090,8 +1090,8 @@ func validateProfileLimits(value ProfileLimits, global Limits) error {
 	if value.CDNMaxDownBatchBytes < 0 || value.CDNMaxDownBatchBytes > global.MaxBodyBytes {
 		return fmt.Errorf("cdn_max_down_batch_bytes must be between 0 and %d", global.MaxBodyBytes)
 	}
-	if value.CDNUplinkWindowSize < 0 || value.CDNUplinkWindowSize > 64 {
-		return errors.New("cdn_uplink_window_size must be between 0 and 64")
+	if value.CDNUplinkWindowSize < 0 || value.CDNUplinkWindowSize > 128 {
+		return errors.New("cdn_uplink_window_size must be between 0 and 128")
 	}
 	if value.CDNStreamMaxDurationSecs < 0 || value.CDNStreamMaxDurationSecs > 300 {
 		return errors.New("cdn_stream_max_duration_secs must be between 0 and 300")

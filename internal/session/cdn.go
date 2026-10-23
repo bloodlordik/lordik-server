@@ -141,7 +141,7 @@ type ReassemblyBuffer struct {
 // NewReassemblyBuffer constructs a ReassemblyBuffer starting at seq 1.
 func NewReassemblyBuffer(windowSize uint64, maxPayload int) *ReassemblyBuffer {
 	if windowSize == 0 {
-		windowSize = 16
+		windowSize = 64
 	}
 	return &ReassemblyBuffer{
 		expectedUpSeq: 1,
@@ -202,6 +202,14 @@ func (b *ReassemblyBuffer) Push(seq uint64, chunk []byte) ([]frame.Frame, bool, 
 // ExpectedUpSeq returns the current in-order sequence expected next.
 func (b *ReassemblyBuffer) ExpectedUpSeq() uint64 {
 	return b.expectedUpSeq
+}
+
+// HasHoles reports whether there are out-of-order chunks waiting for earlier missing sequences.
+func (b *ReassemblyBuffer) HasHoles() bool {
+	if b == nil {
+		return false
+	}
+	return len(b.outOfOrder) > 0
 }
 
 // FillGLTFHeader writes the 12-byte glTF 2.0 binary header into dst.

@@ -454,7 +454,7 @@ func (s *Server) writeCDNDownlinkResponse(w http.ResponseWriter, batch []byte, c
 
 
 func (s *Server) handleCDNSessionError(w http.ResponseWriter, r *http.Request, vhost *VHost, err error) {
-	if errors.Is(err, session.ErrBackpressure) || errors.Is(err, session.ErrConcurrent) {
+	if errors.Is(err, session.ErrBackpressure) || errors.Is(err, session.ErrConcurrent) || errors.Is(err, session.ErrLimit) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Retry-After", "1")
 		w.WriteHeader(http.StatusServiceUnavailable)

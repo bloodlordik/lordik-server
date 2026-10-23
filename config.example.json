@@ -45,7 +45,7 @@
     "max_profiles": 32,
     "cdn_poll_timeout_secs": 12,
     "cdn_max_down_batch_bytes": 524288,
-    "cdn_uplink_window_size": 16,
+    "cdn_uplink_window_size": 64,
     "cdn_stream_max_duration_secs": 45,
     "cdn_stream_heartbeat_secs": 10,
     "cdn_max_unacked_batches": 32

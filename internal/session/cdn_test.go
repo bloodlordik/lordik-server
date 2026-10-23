@@ -641,3 +641,67 @@ func TestPollCDNSkipsTinyWindowUntilData(t *testing.T) {
 		t.Fatal("PollCDN did not wake up after DATA frame queued")
 	}
 }
+
+func TestPiggybackDownWaitSkipsCoalesceWhenBufferHasHoles(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Profiles[0].CarrierMode = config.CarrierCDNAdaptive
+	configuration.Profiles[0].BackendType = config.BackendDirect
+	sess := newSession(sessionOptions{
+		profile:  &configuration.Profiles[0],
+		limits:   configuration.Limits,
+		timeouts: configuration.Timeouts,
+	})
+	defer sess.Close()
+
+	// Send out-of-order chunk (seq 2 arrives when expected is 1)
+	f2 := frame.Encode(frame.Data, 1, []byte("chunk-2"))
+	_, err := sess.ProcessUpCDN(2, f2)
+	if err != nil {
+		t.Fatalf("unexpected error on out-of-order chunk: %v", err)
+	}
+	if !sess.cdnReassembly.HasHoles() {
+		t.Fatal("expected ReassemblyBuffer to have holes")
+	}
+
+	// Coalesce request with holes in buffer must NOT wait 150ms
+	start := time.Now()
+	body, cursor, err := sess.PiggybackDownWait(0, true)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(body) != 0 || cursor != 0 {
+		t.Fatalf("expected empty body and cursor 0, got len=%d cursor=%d", len(body), cursor)
+	}
+	if elapsed >= 80*time.Millisecond {
+		t.Fatalf("expected micro-wait to be skipped when buffer has holes, but took %v", elapsed)
+	}
+}
+
+func TestProcessUpCDNErrLimitDoesNotCloseSession(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Profiles[0].CarrierMode = config.CarrierCDNAdaptive
+	configuration.Limits.MaxFramePayload = 1024
+	configuration.Limits.CDNUplinkWindowSize = 4
+	sess := newSession(sessionOptions{
+		profile:  &configuration.Profiles[0],
+		limits:   configuration.Limits,
+		timeouts: configuration.Timeouts,
+	})
+	defer sess.Close()
+
+	// Feed oversized chunk > maxPendingBytes (1024 + 8) to trigger ErrLimit from parser
+	oversized := make([]byte, 2048)
+	_, err := sess.ProcessUpCDN(1, oversized)
+	if !errors.Is(err, ErrLimit) {
+		t.Fatalf("expected ErrLimit, got %v", err)
+	}
+
+	// The session MUST NOT be marked closed on ErrLimit!
+	sess.mu.Lock()
+	isClosed := sess.closed
+	sess.mu.Unlock()
+	if isClosed {
+		t.Fatal("session was closed on ErrLimit; expected session to stay open for retry")
+	}
+}

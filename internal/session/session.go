@@ -199,7 +199,7 @@ func newSession(options sessionOptions) *Session {
 	if carrier.IsCDN() {
 		windowSize := uint64(options.limits.CDNUplinkWindowSize)
 		if windowSize == 0 {
-			windowSize = 16
+			windowSize = 64
 		}
 		result.cdnReassembly = NewReassemblyBuffer(windowSize, options.limits.MaxFramePayload)
 	}
@@ -929,15 +929,17 @@ func (s *Session) ProcessUpCDN(sequence uint64, chunk []byte) (int, error) {
 	if s.cdnReassembly == nil {
 		windowSize := uint64(s.limits.CDNUplinkWindowSize)
 		if windowSize == 0 {
-			windowSize = 16
+			windowSize = 64
 		}
 		s.cdnReassembly = NewReassemblyBuffer(windowSize, s.limits.MaxFramePayload)
 	}
 
 	pushedFrames, _, err := s.cdnReassembly.Push(sequence, chunk)
 	if err != nil {
+		if !errors.Is(err, ErrLimit) {
+			s.protocolFailure()
+		}
 		s.mu.Unlock()
-		s.protocolFailure()
 		return 0, err
 	}
 	if len(pushedFrames) != 0 {
@@ -1078,7 +1080,7 @@ func (s *Session) PiggybackDownWait(cursor uint64, coalesce bool) ([]byte, uint6
 	// 5. Adaptive micro-wait when requested by client and no poll is active:
 	// wait for backend DATA/CLOSE frame to bundle with WINDOW ack.
 	// For direct backend, TCP dial + MTProto resPQ takes ~30-100ms.
-	if coalesce && !s.hasPendingDataOrCloseLocked() {
+	if coalesce && !s.hasPendingDataOrCloseLocked() && !s.cdnReassembly.HasHoles() {
 		waitDur := 40 * time.Millisecond
 		if s.profile != nil && s.profile.BackendType == config.BackendDirect {
 			waitDur = 150 * time.Millisecond

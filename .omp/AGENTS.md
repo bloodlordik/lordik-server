@@ -32,6 +32,8 @@ lordik-server/
 │   ├── server/                      # HTTP/WebSocket сервер, маршрутизация, интеграция с сайтом и Caddy
 │   └── session/                     # Управление сессиями, токенами доступа и логическими потоками
 ├── deploy/                          # Скрипты развертывания, systemd-юниты, конфигурация Caddyfile, nginx-tproxy.conf и nftables
+├── docs/
+│   └── CDN_TRANSPORT_SPEC.md        # Спецификация транспортного протокола CDN-Adaptive / CDN-Stream (GET-only uplink, header sharding, glTF streaming downlink)
 ├── config.example.json              # Пример основной конфигурации сервера
 ├── profiles.example.json            # Пример профилей сетевых транспортов/carrier
 ├── PROTOCOL.md                      # Спецификация сетевого протокола и формата кадров
@@ -63,7 +65,7 @@ lordik-server/
 *(Пополняется по ходу разработки)*
 
 1. **Обратная совместимость протокола**:
-   - Любые изменения формата кадров в `internal/frame` или протокола в `PROTOCOL.md` должны сохранять совместимость с существующими клиентами Telegram Desktop / Android / iOS.
+   - Любые изменения формата кадров в `internal/frame`, сетевого протокола в `PROTOCOL.md` или спецификации CDN-транспорта в `docs/CDN_TRANSPORT_SPEC.md` должны сохранять совместимость с существующими клиентами Telegram Desktop / Android / iOS.
 2. **Изоляция публичного сайта**:
    - При неверном capability или отсутствии токена сессии запросы должны бесшовно отдавать публичный сайт без утечки информации о наличии прокси.
 3. **Особенности работы за обратным прокси Nginx**:
@@ -169,7 +171,7 @@ lordik-server/
       - Перед перемещением создается резервная копия (`.tproxy-bak-<pid>`). Если подмена файла срывается, выполняется автоматический откат к оригинальному файлу.
       - Проверка целостности по SHA-256 обязательна перед любыми операциями замены на диске.
 13. **Транспортный режим CDN Adaptive (`cdn`, `cdn-adaptive`, `cdn-get`, `cdn-body`, `cdn-ws`)**:
-    - **Компоненты**: `internal/config/config.go`, `internal/session/cdn.go`, `internal/session/session.go`, `internal/session/manager.go`, `internal/server/cdn.go`, `internal/server/server.go`, `internal/server/secrets.go`, `internal/bridge/factory.go`, `internal/bridge/templates/cdn.html`.
+    - **Компоненты**: `docs/CDN_TRANSPORT_SPEC.md`, `internal/config/config.go`, `internal/session/cdn.go`, `internal/session/session.go`, `internal/session/manager.go`, `internal/server/cdn.go`, `internal/server/server.go`, `internal/server/secrets.go`, `internal/bridge/factory.go`, `internal/bridge/templates/cdn.html`.
     - **Архитектура и назначение**:
       - Новый режим сетевого транспорта поверх жестких облачных CDN (Cloudflare, CloudFront, Gcore, Fastly) и корпоративных L7-прокси.
       - Мимикрия трафика под SPA-запросы Next.js / Webpack chunks / HLS-сегменты:
@@ -454,3 +456,15 @@ lordik-server/
       - **Устойчивость к временным сбоям CDN/прокси в `startStreamLoop()`**: ошибки 502/503/504 или сетевые сбои больше не приводят к вызову `fail()` и мгновенному закрытию сессии; фатальными считаются только явные `404`, `410` или `text/html` (перехват decoy-сайтом).
       - **Откат на одиночный poll при буферизации CDN**: если `probeTimer` (1500 мс) прерывает стрим 2 раза подряд из-за буферизации промежуточным CDN, клиент выполняет fallback-запрос `pollOnce()` (`assets/media/{shortId}/seg_{cursor}_{randHex}.m4s`), сбрасывая накопленный буфер кадров.
       - **Неблокирующий ACK при пробуждении в `onWakeUp()`**: при `upPending.length === 0` отправляется `sendAckOnly()` независимо от значения `upInflight`, гарантируя доставку подтверждения и получение данных после переключения сети, даже если предыдущий запрос завис на старом IP-адресе.
+24. **Оптимизация выгрузки медиа и предотвращение переполнения окна в CDN (`config.go`, `session.go`, `cdn_ws.html`, `cdn.html`)**:
+    - **Компоненты**: `internal/config/config.go`, `internal/session/session.go`, `internal/session/cdn.go`, `internal/server/cdn.go`, `internal/bridge/templates/cdn_ws.html`, `internal/bridge/templates/cdn.html`.
+    - **Суть изменений**:
+      - **Расширение размера скользящего окна ReassemblyBuffer**:
+        - Дефолтное значение `cdn_uplink_window_size` увеличено с 16 до 64 (с поддержкой конфигурирования вплоть до 128). Это позволяет серверу без переполнения (`ErrProtocol`) и без блокировок удерживать до 64 внеочередных чанков (~384 КиБ) при сетевом джиттере на узлах CDN.
+        - `ErrLimit` парсера/буфера теперь возвращает клиенту HTTP 503 (`Retry-After: 1`) с сохранением сессии в `handleCDNSessionError`, предотвращая разрыв соединения при пиковом наплыве фрагментов.
+      - **Устранение лишней задержки micro-wait (`PiggybackDownWait`) при выгрузке медиа**:
+        - В `PiggybackDownWait` ожидание 40–150 мс теперь автоматически пропускается (`coalesce = false`), если в `ReassemblyBuffer` есть пропуски/дыры (`s.cdnReassembly.HasHoles()`), так как сборка цельного кадра невозможна до прихода недостающих фрагментов.
+        - В шаблонах `cdn_ws.html` и `cdn.html` заголовок `X-Coalesce` динамически вычисляется как `'1'` только когда `upPending.length === 0 && upInflight <= 1` (одиночный запрос: пинг, рукопожатие, короткий RPC). При выгрузке потока медиа (`upPending.length > 0` или `upInflight > 1`) передается `X-Coalesce: '0'`, гарантируя мгновенный ответ сервера (0 мс) и максимальную пропускную способность конвейера без микропауз.
+      - **Нарезка крупных кадров и защита скользящего окна на клиенте**:
+        - В `cdn_ws.html` и `cdn.html` добавлена функция `canAdvanceWindow()`, ограничивающая опережение последовательностей (`upSeq - minSeq < maxWindowSpan`, где `maxWindowSpan = 48`), предотвращая дрифт вне серверного окна.
+        - Крупные MTProto-кадры `DATA` (до 64 КиБ) разрезаются ровно по границе `maxChunk` (6144 байт для `cdn-get` и 16384 байт для `cdn-body`), гарантируя соответствие лимитам URI и L7-заголовков CDN.
