@@ -263,7 +263,6 @@ async function createSession(helloBuf){
 }
 function queueCarrier(buf){
  if(closed)return;
- trackClientFrames(buf);
  if(queuedBytes+buf.byteLength>queueLimit||queuedItems+1>queueItemLimit){fail();return}
  queuedBytes+=buf.byteLength;
  queuedItems++;
@@ -479,15 +478,41 @@ function createStreamAssembler(){
  };
 }
 
+async function pollOnce(){
+ if(closed||!sessionToken)return;
+ try{
+  pollController=new AbortController();
+  const randHex=(Math.random()*0xffffffff>>>0).toString(16);
+  const pollUrl=relayBase+'assets/media/'+shortId+'/seg_'+downCursor+'_'+randHex+'.m4s';
+  const res=await fetch(pollUrl,{
+   method:'GET',
+   signal:pollController.signal,
+   mode:'same-origin',credentials:'omit',cache:'no-store',
+   headers:{'X-Client-Key':sessionToken}
+  });
+  if(res.ok){
+   const ct=res.headers.get('Content-Type');
+   const resBuf=await res.arrayBuffer();
+   if(!processDownlink(resBuf,ct)){fail();return}
+  }else if(res.status===404||res.status===410){
+   fail();return;
+  }
+ }catch(e){
+  if(closed)return;
+ }
+}
+
 async function startStreamLoop(){
+ let probeConsecutiveTimeouts=0;
  while(!closed&&sessionToken){
-  let probeTimer=0,watchdogTimer=0;
+  let probeTimer=0,watchdogTimer=0,probeFired=false;
   try{
    pollController=new AbortController();
    const randHex=(Math.random()*0xffffffff>>>0).toString(16);
    const streamUrl=relayBase+'assets/media/'+shortId+'/stream_'+downCursor+'_'+randHex+'.m4s';
 
    probeTimer=setTimeout(()=>{
+    probeFired=true;
     if(pollController)pollController.abort();
    },1500);
 
@@ -515,7 +540,8 @@ async function startStreamLoop(){
     if(res.status===404||res.status===410){
      fail();return;
     }
-    fail();return;
+    await pause(300+(Math.random()*300|0));
+    continue;
    }
 
    const ct=res.headers.get('Content-Type');
@@ -541,6 +567,7 @@ async function startStreamLoop(){
     if(!firstChunk){
      firstChunk=true;
      clearTimeout(probeTimer);
+     probeConsecutiveTimeouts=0;
     }
     resetWatchdog();
     assembler.feed(value,(cursor,payloadBuf)=>{
@@ -560,6 +587,13 @@ async function startStreamLoop(){
    if(closed)break;
    if(e&&(e.message==='invalid gltf streaming prefix'||e.message==='stream envelope length exceeded')){
     fail();return;
+   }
+   if(probeFired){
+    probeConsecutiveTimeouts++;
+    if(probeConsecutiveTimeouts>=2){
+     probeConsecutiveTimeouts=0;
+     await pollOnce();
+    }
    }
    await pause(150+(Math.random()*200|0));
   }
@@ -632,7 +666,7 @@ function onWakeUp(){
  }
  if(upPending.length&&upInflight<maxInflight){
   flushUplink();
- }else if(upInflight===0){
+ }else if(upPending.length===0){
   sendAckOnly();
  }
 }

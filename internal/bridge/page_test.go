@@ -320,3 +320,31 @@ func TestRenderCDNBridgeLifecycleAndRecovery(t *testing.T) {
 		}
 	}
 }
+func TestRenderCDNWSBridgeLifecycleAndRecovery(t *testing.T) {
+	page, err := Render("cdn.example.com", "", "bootstrap-token", "cdn-ws", 2*1024*1024)
+	if err != nil {
+		t.Fatalf("failed to render cdn-ws bridge: %v", err)
+	}
+	body := string(page.Body)
+	for _, expected := range []string{
+		"async function pollOnce()",
+		"let probeConsecutiveTimeouts=0",
+		"probeConsecutiveTimeouts++",
+		"await pollOnce()",
+		"else if(upPending.length===0)",
+		"sendAckOnly()",
+	} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("rendered cdn-ws bridge lacks expected snippet %q", expected)
+		}
+	}
+	// Ensure queueCarrier does not duplicate trackClientFrames
+	queueCarrierIdx := strings.Index(body, "function queueCarrier(buf){")
+	if queueCarrierIdx == -1 {
+		t.Fatal("rendered cdn-ws bridge missing queueCarrier")
+	}
+	queueCarrierBody := body[queueCarrierIdx : queueCarrierIdx+200]
+	if strings.Contains(queueCarrierBody, "trackClientFrames") {
+		t.Fatal("queueCarrier still contains duplicate trackClientFrames")
+	}
+}

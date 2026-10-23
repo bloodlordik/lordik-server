@@ -57,6 +57,9 @@ func (s *Server) serveCDNStreamDown(w http.ResponseWriter, r *http.Request, vhos
 	w.Header().Set("Pragma", "no-cache")
 	w.WriteHeader(http.StatusOK)
 
+	rc := http.NewResponseController(w)
+	_ = rc.SetWriteDeadline(time.Now().Add(15 * time.Second))
+
 	if err := session.WriteGLTFStreamPrefix(w); err != nil {
 		return
 	}
@@ -67,7 +70,6 @@ func (s *Server) serveCDNStreamDown(w http.ResponseWriter, r *http.Request, vhos
 	}
 	flusher.Flush()
 
-	rc := http.NewResponseController(w)
 	onBatch := func(cur uint64, body []byte) error {
 		_ = rc.SetWriteDeadline(time.Now().Add(15 * time.Second))
 		if err := session.WriteBatchEnvelope(w, cur, body); err != nil {

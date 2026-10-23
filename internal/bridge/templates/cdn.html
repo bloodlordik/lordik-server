@@ -263,7 +263,6 @@ async function createSession(helloBuf){
 }
 function queueCarrier(buf){
  if(closed)return;
- trackClientFrames(buf);
  if(queuedBytes+buf.byteLength>queueLimit||queuedItems+1>queueItemLimit){fail();return}
  queuedBytes+=buf.byteLength;
  queuedItems++;
@@ -519,7 +518,7 @@ function onWakeUp(){
  }
  if(upPending.length&&upInflight<maxInflight){
   flushUplink();
- }else if(upInflight===0){
+ }else if(upPending.length===0){
   sendAckOnly();
  }
 }
