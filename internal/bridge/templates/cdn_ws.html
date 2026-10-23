@@ -18,12 +18,12 @@ let queuedBytes=0,queuedItems=0,pollController=null;
 const streamControllers=new Set();
 let currentStreamId=0;
 let probeConsecutiveTimeouts=0;
-let activeMode='cdn-adaptive'; // cdn-adaptive, cdn-get, cdn-body
-let postConfirmed=false;
-const pending=[],upPending=[];
+const pending=[],upPending=[],fastPending=[];
+let slicingInProgress=false;
 const queueLimit=33554432,queueItemLimit=16384,batchLimit=__BATCH_LIMIT__;
 let upSeq=1,downCursor=0,upInflight=0,maxInflight=6;
-const maxWindowSpan=48;
+const maxChunkBytes=4500;
+const maxWindowSpan=14;
 const inflightSeqs=new Set();
 let debounceTimer=0;
 let lastSentAckCursor=0;
@@ -176,40 +176,6 @@ function processDownlink(resBuf,ct){
 
 let initDone=false;
 
-async function tryPostInit(helloBuf,timeoutMs){
- const ctrl=new AbortController();
- const timer=setTimeout(()=>ctrl.abort(),timeoutMs);
- try{
-  const postUrl=relayBase+'_next/data/'+buildId+'/collect.json?k='+encodeURIComponent(bootstrap.slice(0,8));
-  const res=await fetch(postUrl,{
-   method:'POST',
-   body:helloBuf,
-   signal:ctrl.signal,
-   mode:'same-origin',credentials:'omit',cache:'no-store',
-   headers:{'Content-Type':'application/octet-stream','X-Client-Key':bootstrap}
-  });
-  clearTimeout(timer);
-  if(res.ok&&!initDone&&!closed){
-   const tok=res.headers.get('X-Session-Token');
-   if(tok){
-    const welcomeBuf=await res.arrayBuffer();
-    if(!initDone&&!closed){
-     initDone=true;
-     postConfirmed=true;
-     sessionToken=tok;
-     resumeToken=res.headers.get('X-Resume-Token')||tok;
-     shortId=tok.slice(0,12);
-     activeMode='cdn-body';
-     deliver(welcomeBuf);
-     return true;
-    }
-   }
-  }
- }catch(e){}
- finally{clearTimeout(timer)}
- return false;
-}
-
 async function tryGetInit(helloBuf,timeoutMs){
  const ctrl=new AbortController();
  const timer=setTimeout(()=>ctrl.abort(),timeoutMs);
@@ -230,7 +196,6 @@ async function tryGetInit(helloBuf,timeoutMs){
     sessionToken=json.token;
     resumeToken=json.resume_token||json.token;
     shortId=json.short_id||json.token.slice(0,12);
-    activeMode='cdn-get';
     if(json.welcome)deliver(fromBase64Url(json.welcome));
     return true;
    }
@@ -242,38 +207,10 @@ async function tryGetInit(helloBuf,timeoutMs){
 
 async function createSession(helloBuf){
  status('connecting');
- let ok=false;
-
- if(carrierMode==='cdn-body'){
-  ok=await tryPostInit(helloBuf,1500);
- }else if(carrierMode==='cdn-get'){
-  ok=await tryGetInit(helloBuf,5000);
- }else{
-  const postPromise=tryPostInit(helloBuf,2000);
-  const timeoutPromise=pause(60).then(()=>'timeout');
-  const raceResult=await Promise.race([postPromise,timeoutPromise]);
-  if(raceResult===true){
-   ok=true;
-  }else if(raceResult===false){
-   ok=await tryGetInit(helloBuf,5000);
-  }else{
-   const secondRace=await Promise.race([postPromise,pause(120).then(()=>'timeout')]);
-   if(secondRace===true){
-    ok=true;
-   }else{
-    const getPromise=tryGetInit(helloBuf,5000);
-    const winner=await Promise.race([
-     postPromise.then(v=>v?'post':null),
-     getPromise.then(v=>v?'get':null)
-    ]);
-    if(winner){
-     ok=true;
-    }else{
-     const second=await Promise.all([postPromise,getPromise]);
-     ok=second[0]||second[1];
-    }
-   }
-  }
+ let ok=await tryGetInit(helloBuf,5000);
+ if(!ok&&!closed){
+  await pause(60);
+  if(!closed)ok=await tryGetInit(helloBuf,5000);
  }
 
  if(!ok||closed){
@@ -295,12 +232,23 @@ function canAdvanceWindow(){
  return (upSeq-minSeq)<maxWindowSpan;
 }
 
+function hasPendingUplink(){
+ return fastPending.length>0||upPending.length>0;
+}
+
 function queueCarrier(buf){
  if(closed)return;
  if(queuedBytes+buf.byteLength>queueLimit||queuedItems+1>queueItemLimit){fail();return}
  queuedBytes+=buf.byteLength;
  queuedItems++;
- upPending.push(new Uint8Array(buf));
+ const arr=new Uint8Array(buf);
+ // Короткие интерактивные и управляющие кадры (OPEN, CLOSE, WINDOW, мелкие RPC <= 1024 байт)
+ // идут в приоритетную очередь fastPending, чтобы не стоять за 64 КиБ чанками медиа!
+ if(arr.byteLength<=1024){
+  fastPending.push(arr);
+ }else{
+  upPending.push(arr);
+ }
  if(sessionToken&&upInflight===0&&!debounceTimer){
   flushUplink();
  }else{
@@ -313,30 +261,41 @@ function scheduleFlush(){
  debounceTimer=setTimeout(()=>{
   debounceTimer=0;
   flushUplink();
- },3);
+ },2);
 }
 
 function flushUplink(){
- while(!closed&&sessionToken&&upPending.length>0&&upInflight<maxInflight&&canAdvanceWindow()){
-  const maxChunk=activeMode==='cdn-body'?16384:6144;
+ while(!closed&&sessionToken&&hasPendingUplink()&&upInflight<maxInflight&&canAdvanceWindow()){
+  // Если есть тяжелые медиа-кадры, оставляем 1 резервный слот для быстрых кадров (WINDOW/OPEN/Text),
+  // если сейчас мы на границе целого кадра (!slicingInProgress) и fastPending пуст.
+  if(!slicingInProgress&&fastPending.length===0&&upPending.length>0&&upInflight>=maxInflight-1&&maxInflight>1){
+   break;
+  }
+
   let total=0;
   const parts=[];
 
-  while(upPending.length>0&&total<maxChunk&&parts.length<64){
-   const head=upPending[0];
-   const need=maxChunk-total;
+  while(hasPendingUplink()&&total<maxChunkBytes&&parts.length<64){
+   // Берем из fastPending только тогда, когда мы НЕ находимся внутри разрезанного 64 КиБ кадра!
+   // Это гарантирует, что заголовок и тело крупного кадра никогда не разорвутся чужим кадром.
+   const useFast=!slicingInProgress&&fastPending.length>0;
+   const queue=useFast?fastPending:upPending;
+   const head=queue[0];
+   const need=maxChunkBytes-total;
+
    if(head.byteLength<=need){
     parts.push(head);
     total+=head.byteLength;
     queuedBytes-=head.byteLength;
     queuedItems--;
-    upPending.shift();
+    queue.shift();
+    if(!useFast)slicingInProgress=false;
    }else{
-    // Крупный кадр (например, 64 КиБ DATA при загрузке медиа) разрезается точно по maxChunk!
     parts.push(head.subarray(0,need));
-    upPending[0]=head.subarray(need);
+    queue[0]=head.subarray(need);
     total+=need;
     queuedBytes-=need;
+    if(!useFast)slicingInProgress=true;
     break;
    }
   }
@@ -364,95 +323,63 @@ function flushUplink(){
 }
 
 async function sendChunkWithBackoff(seq,buf,retry){
+ const b64=toBase64Url(buf);
+ const urlPart=b64.slice(0,2000);
+ const remaining=b64.slice(2000);
+ const dataHeaders=[];
+ let roff=0,hidx=0;
+ while(roff<remaining.length&&hidx<8){
+  dataHeaders.push(['X-Client-Data-'+hidx,remaining.slice(roff,roff+2048)]);
+  roff+=2048;hidx++;
+ }
+
  while(!closed){
   const cur=downCursor;
   lastSentAckCursor=cur;
-  const reqId=seq+'.'+cur+'.0';
+  const reqId=seq+'.'+cur+'.'+retry;
   let success=false;
-  let statusCode=0;
   const ctrl=new AbortController();
-  const reqTimer=setTimeout(()=>ctrl.abort(),10000);
+  // Короткий таймаут 3500 мс на первой попытке быстро сбрасывает "залипшие" потоки CDN без 10-секундных фризов!
+  const timeoutMs=retry===0?3500:5500;
+  const reqTimer=setTimeout(()=>ctrl.abort(),timeoutMs);
   upControllers.add(ctrl);
   try{
-   if(activeMode==='cdn-body'){
-    const postUrl=relayBase+'_next/data/'+buildId+'/sync/'+shortId+'/'+seq+'.bin';
-    const res=await fetch(postUrl,{
-     method:'POST',
-     body:buf,
-     signal:ctrl.signal,
-     mode:'same-origin',credentials:'omit',cache:'no-store',
-     headers:{
-      'Content-Type':'application/octet-stream',
-      'X-Client-Key':sessionToken,
-      'X-Request-ID':reqId,
-      'X-Down-Cursor':String(cur),
-      'X-Coalesce':(upPending.length===0&&upInflight<=1)?'1':'0'
-     }
-    });
-    clearTimeout(reqTimer);
-    if(res.ok){
-     const ct=res.headers.get('Content-Type');
-     const resBuf=await res.arrayBuffer();
-     if(!processDownlink(resBuf,ct)){
-      inflightSeqs.delete(seq);
-      upInflight--;
-      fail();
-      return;
-     }
-     postConfirmed=true;
-     success=true;
-    }else if(res.status===404||res.status===410){
-     inflightSeqs.delete(seq);
-      upInflight--;
-     fail();
-     return;
-    }else if(!postConfirmed&&carrierMode!=='cdn-body'&&(res.status===400||res.status===403||res.status===405||res.status===413)&&buf.byteLength<=6144){
-     activeMode='cdn-get';
-    }
-   }else{
-    const b64=toBase64Url(buf);
-    const urlPart=b64.slice(0,2048);
-    const remaining=b64.slice(2048);
-    const headers={
-     'X-Client-Key':sessionToken,
-     'X-Request-ID':reqId,
-     'X-Down-Cursor':String(cur),
-     'X-Coalesce':(upPending.length===0&&upInflight<=1)?'1':'0'
-    };
-    let roff=0,hidx=0;
-    while(roff<remaining.length&&hidx<8){
-     headers['X-Client-Data-'+hidx]=remaining.slice(roff,roff+3072);
-     roff+=3072;hidx++;
-    }
-    const getUrl=relayBase+'assets/chunks/'+shortId+'/'+seq+'.bin?p='+encodeURIComponent(urlPart);
-    const res=await fetch(getUrl,{
-     method:'GET',
-     signal:ctrl.signal,
-     mode:'same-origin',credentials:'omit',cache:'no-store',
-     headers
-    });
-    clearTimeout(reqTimer);
-    if(res.ok){
-     const ct=res.headers.get('Content-Type');
-     const resBuf=await res.arrayBuffer();
-     if(!processDownlink(resBuf,ct)){
-      inflightSeqs.delete(seq);
-      upInflight--;
-      fail();
-      return;
-     }
-     success=true;
-    }else if(res.status===404||res.status===410){
+   const headers={
+    'X-Client-Key':sessionToken,
+    'X-Request-ID':reqId,
+    'X-Down-Cursor':String(cur),
+    'X-Coalesce':(upPending.length===0&&upInflight<=1)?'1':'0'
+   };
+   for(let i=0;i<dataHeaders.length;i++){
+    headers[dataHeaders[i][0]]=dataHeaders[i][1];
+   }
+   // При retry > 0 добавляем уникальный суффикс &r=, чтобы CDN не склеивал ретрай с зависшим первым запросом
+   const retrySuffix=retry>0?'&r='+retry+'_'+((Math.random()*0xffff)|0).toString(16):'';
+   const getUrl=relayBase+'assets/chunks/'+shortId+'/'+seq+'.bin?p='+encodeURIComponent(urlPart)+retrySuffix;
+   const res=await fetch(getUrl,{
+    method:'GET',
+    signal:ctrl.signal,
+    mode:'same-origin',credentials:'omit',cache:'no-store',
+    headers
+   });
+   clearTimeout(reqTimer);
+   if(res.ok){
+    const ct=res.headers.get('Content-Type');
+    const resBuf=await res.arrayBuffer();
+    if(!processDownlink(resBuf,ct)){
      inflightSeqs.delete(seq);
      upInflight--;
      fail();
      return;
     }
+    success=true;
+   }else if(res.status===404||res.status===410){
+    inflightSeqs.delete(seq);
+    upInflight--;
+    fail();
+    return;
    }
   }catch(e){
-   if(!ctrl.signal.aborted&&!postConfirmed&&activeMode==='cdn-body'&&carrierMode!=='cdn-body'&&buf.byteLength<=6144){
-    activeMode='cdn-get';
-   }
   }finally{
    clearTimeout(reqTimer);
    upControllers.delete(ctrl);
@@ -461,7 +388,7 @@ async function sendChunkWithBackoff(seq,buf,retry){
   if(success){
    inflightSeqs.delete(seq);
    upInflight--;
-   if(upPending.length)flushUplink();
+   if(hasPendingUplink())flushUplink();
    return;
   }
 
@@ -472,14 +399,15 @@ async function sendChunkWithBackoff(seq,buf,retry){
   }
 
   const isBg=(typeof document!=='undefined'&&document.visibilityState==='hidden')||(typeof navigator!=='undefined'&&navigator.onLine===false);
-  retry=isBg?retry:retry+1;
-  if(retry>8){
+  const nextRetry=isBg?retry:retry+1;
+  retry=nextRetry;
+  if(retry>10){
    inflightSeqs.delete(seq);
    upInflight--;
    fail();
    return;
   }
-  const delay=isBg?2000:Math.min(1500,50*(1<<Math.min(retry,5)))+(Math.random()*50|0);
+  const delay=isBg?2000:Math.min(1200,40*(1<<Math.min(retry,5)))+(Math.random()*40|0);
   await pause(delay);
  }
  inflightSeqs.delete(seq);
@@ -493,7 +421,7 @@ async function sendAckOnly(){
  const randHex=(Math.random()*0xffffffff>>>0).toString(16);
  const ackUrl=relayBase+'assets/chunks/'+shortId+'/0.bin?p=&r='+randHex;
  const ctrl=new AbortController();
- const timer=setTimeout(()=>ctrl.abort(),5000);
+ const timer=setTimeout(()=>ctrl.abort(),4000);
  try{
   const res=await fetch(ackUrl,{
    method:'GET',
@@ -693,7 +621,7 @@ async function runStream(streamId){
     const isNew=((cursor-downCursor|0)>0)||downCursor===0;
     if(isNew)downCursor=cursor;
     if(isNew&&payloadBuf&&payloadBuf.byteLength>0)deliver(payloadBuf);
-    if((downCursor-lastSentAckCursor)>=16&&upInflight===0&&upPending.length===0){
+    if((downCursor-lastSentAckCursor)>=8&&upInflight===0&&!hasPendingUplink()){
      lastSentAckCursor=downCursor;
      sendAckOnly();
     }
@@ -740,11 +668,11 @@ function close(notifyServer){
  if(closed)return;
  closed=true;
  failing=true;
-if(pollController)pollController.abort();
-for(const sCtrl of Array.from(streamControllers)){
- try{sCtrl.abort()}catch(e){}
-}
-streamControllers.clear();
+ if(pollController)pollController.abort();
+ for(const sCtrl of Array.from(streamControllers)){
+  try{sCtrl.abort()}catch(e){}
+ }
+ streamControllers.clear();
  abortInflightUplinks();
  if(notifyServer&&sessionToken&&shortId){
   const unloadUrl=relayBase+'_next/data/'+buildId+'/unload/'+shortId+'.json?t='+Date.now();
@@ -820,7 +748,7 @@ function onWakeUp(isOnline){
   wakingUp=true;
   startStreamLoop();
  }
- if(upPending.length&&upInflight<maxInflight){
+ if(hasPendingUplink()&&upInflight<maxInflight){
   flushUplink();
  }else if(upPending.length===0&&(isOnline||slept)){
   sendAckOnly();
