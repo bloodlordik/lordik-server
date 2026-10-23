@@ -15,6 +15,9 @@ const fragment=location.hash,androidNonce=/^#android=([A-Za-z0-9_-]{43})$/.exec(
 history.replaceState(null,'',location.pathname);
 let initialized=false,closed=false,port=null,sessionToken='',resumeToken='',shortId='',createStarted=false;
 let queuedBytes=0,queuedItems=0,pollController=null;
+const streamControllers=new Set();
+let currentStreamId=0;
+let probeConsecutiveTimeouts=0;
 let activeMode='cdn-adaptive'; // cdn-adaptive, cdn-get, cdn-body
 const pending=[],upPending=[];
 const queueLimit=33554432,queueItemLimit=16384,batchLimit=__BATCH_LIMIT__;
@@ -626,105 +629,138 @@ async function pollOnce(){
  }
 }
 
-async function startStreamLoop(){
- let probeConsecutiveTimeouts=0;
- while(!closed&&sessionToken){
-  let probeTimer=0,watchdogTimer=0,probeFired=false;
-  try{
-   pollController=new AbortController();
-   const randHex=(Math.random()*0xffffffff>>>0).toString(16);
-   const streamUrl=relayBase+'assets/media/'+shortId+'/stream_'+downCursor+'_'+randHex+'.m4s';
+function startStreamLoop(){
+ currentStreamId++;
+ runStream(currentStreamId);
+}
 
-   probeTimer=setTimeout(()=>{
-    probeFired=true;
-    if(pollController)pollController.abort();
-   },1500);
+async function runStream(streamId){
+ if(closed||!sessionToken)return;
+ let probeTimer=0,watchdogTimer=0,overlapTimer=0,probeFired=false,overlapTriggered=false;
+ const ctrl=new AbortController();
+ streamControllers.add(ctrl);
 
-   const resetWatchdog=()=>{
-    clearTimeout(watchdogTimer);
-    watchdogTimer=setTimeout(()=>{
-     if(pollController)pollController.abort();
-    },16000);
-   };
+ const cleanup=()=>{
+  clearTimeout(probeTimer);
+  clearTimeout(watchdogTimer);
+  clearTimeout(overlapTimer);
+  streamControllers.delete(ctrl);
+ };
+
+ try{
+  const randHex=(Math.random()*0xffffffff>>>0).toString(16);
+  const streamUrl=relayBase+'assets/media/'+shortId+'/stream_'+downCursor+'_'+randHex+'.m4s';
+
+  probeTimer=setTimeout(()=>{
+   probeFired=true;
+   try{ctrl.abort()}catch(e){}
+  },1500);
+
+  const resetWatchdog=()=>{
+   clearTimeout(watchdogTimer);
+   watchdogTimer=setTimeout(()=>{
+    try{ctrl.abort()}catch(e){}
+   },16000);
+  };
+  resetWatchdog();
+
+  const res=await fetch(streamUrl,{
+   method:'GET',
+   signal:ctrl.signal,
+   mode:'same-origin',credentials:'omit',cache:'no-store',
+   headers:{
+    'X-Client-Key':sessionToken,
+    'X-Stream-Poll':'1'
+   }
+  });
+
+  if(!res.ok){
+   cleanup();
+   if(res.status===404||res.status===410){
+    fail();return;
+   }
+   if(streamId===currentStreamId&&!closed){
+    await pause(300+(Math.random()*300|0));
+    if(streamId===currentStreamId&&!closed){
+     currentStreamId++;
+     runStream(currentStreamId);
+    }
+   }
+   return;
+  }
+
+  const ct=res.headers.get('Content-Type');
+  if(ct&&ct.includes('text/html')){
+   cleanup();fail();return;
+  }
+
+  if(!res.body||typeof res.body.getReader!=='function'){
+   cleanup();fail();return;
+  }
+
+  const reader=res.body.getReader();
+  const assembler=createStreamAssembler();
+  let firstChunk=false;
+
+  while(!closed&&sessionToken){
+   const {done,value}=await reader.read();
+   if(done)break;
+   if(!firstChunk){
+    firstChunk=true;
+    clearTimeout(probeTimer);
+    probeConsecutiveTimeouts=0;
+    overlapTimer=setTimeout(()=>{
+     overlapTriggered=true;
+     if(!closed&&sessionToken&&streamId===currentStreamId){
+      currentStreamId++;
+      runStream(currentStreamId);
+     }
+    },38000);
+   }
    resetWatchdog();
-
-   const res=await fetch(streamUrl,{
-    method:'GET',
-    signal:pollController.signal,
-    mode:'same-origin',credentials:'omit',cache:'no-store',
-    headers:{
-     'X-Client-Key':sessionToken,
-     'X-Stream-Poll':'1'
+   assembler.feed(value,(cursor,payloadBuf)=>{
+    const isNew=((cursor-downCursor|0)>0)||downCursor===0;
+    if(isNew)downCursor=cursor;
+    if(isNew&&payloadBuf&&payloadBuf.byteLength>0)deliver(payloadBuf);
+    if((downCursor-lastSentAckCursor)>=16&&upInflight===0&&upPending.length===0){
+     lastSentAckCursor=downCursor;
+     sendAckOnly();
     }
    });
+  }
+  cleanup();
 
-   if(!res.ok){
-    clearTimeout(probeTimer);
-    clearTimeout(watchdogTimer);
-    if(res.status===404||res.status===410){
-     fail();return;
-    }
-    await pause(300+(Math.random()*300|0));
-    continue;
-   }
-
-   const ct=res.headers.get('Content-Type');
-   if(ct&&ct.includes('text/html')){
-    clearTimeout(probeTimer);
-    clearTimeout(watchdogTimer);
-    fail();return;
-   }
-
-   if(!res.body||typeof res.body.getReader!=='function'){
-    clearTimeout(probeTimer);
-    clearTimeout(watchdogTimer);
-    fail();return;
-   }
-
-   const reader=res.body.getReader();
-   const assembler=createStreamAssembler();
-   let firstChunk=false;
-
-   while(!closed&&sessionToken){
-    const {done,value}=await reader.read();
-    if(done)break;
-    if(!firstChunk){
-     firstChunk=true;
-     clearTimeout(probeTimer);
-     probeConsecutiveTimeouts=0;
-    }
-    resetWatchdog();
-    assembler.feed(value,(cursor,payloadBuf)=>{
-     if((cursor-downCursor|0)>0||downCursor===0)downCursor=cursor;
-     if(payloadBuf&&payloadBuf.byteLength>0)deliver(payloadBuf);
-     if((downCursor-lastSentAckCursor)>=16&&upInflight===0&&upPending.length===0){
-      lastSentAckCursor=downCursor;
-      sendAckOnly();
-     }
-    });
-   }
-   clearTimeout(probeTimer);
-   clearTimeout(watchdogTimer);
-  }catch(e){
-   clearTimeout(probeTimer);
-   clearTimeout(watchdogTimer);
-   if(closed)break;
-   if(e&&(e.message==='invalid gltf streaming prefix'||e.message==='stream envelope length exceeded')){
-    fail();return;
-   }
-   if(wakingUp){
-    wakingUp=false;
+  if(!overlapTriggered&&streamId===currentStreamId&&!closed&&sessionToken){
+   currentStreamId++;
+   runStream(currentStreamId);
+  }
+ }catch(e){
+  cleanup();
+  if(closed)return;
+  if(e&&(e.message==='invalid gltf streaming prefix'||e.message==='stream envelope length exceeded')){
+   fail();return;
+  }
+  if(streamId!==currentStreamId)return;
+  if(wakingUp){
+   wakingUp=false;
+   probeConsecutiveTimeouts=0;
+   currentStreamId++;
+   runStream(currentStreamId);
+   return;
+  }
+  if(probeFired){
+   probeConsecutiveTimeouts++;
+   if(probeConsecutiveTimeouts>=2){
     probeConsecutiveTimeouts=0;
-    continue;
+    await pollOnce();
    }
-   if(probeFired){
-    probeConsecutiveTimeouts++;
-    if(probeConsecutiveTimeouts>=2){
-     probeConsecutiveTimeouts=0;
-     await pollOnce();
-    }
-   }
+  }
+  if(streamId===currentStreamId&&!closed){
    await pause(150+(Math.random()*200|0));
+   if(streamId===currentStreamId&&!closed){
+    currentStreamId++;
+    runStream(currentStreamId);
+   }
   }
  }
 }
@@ -733,7 +769,11 @@ function close(notifyServer){
  if(closed)return;
  closed=true;
  failing=true;
- if(pollController)pollController.abort();
+if(pollController)pollController.abort();
+for(const sCtrl of Array.from(streamControllers)){
+ try{sCtrl.abort()}catch(e){}
+}
+streamControllers.clear();
  abortInflightUplinks();
  if(notifyServer&&sessionToken&&shortId){
   const unloadUrl=relayBase+'_next/data/'+buildId+'/unload/'+shortId+'.json?t='+Date.now();
@@ -796,9 +836,13 @@ function onWakeUp(isOnline){
  lastTick=now;
  wakingUp=true;
  for(const wake of Array.from(wakeSignals))wake();
- if(pollController){
-  try{pollController.abort()}catch(e){}
- }
+if(pollController){
+ try{pollController.abort()}catch(e){}
+}
+for(const sCtrl of Array.from(streamControllers)){
+ try{sCtrl.abort()}catch(e){}
+}
+streamControllers.clear();
  if(isOnline||slept){
   abortInflightUplinks();
  }
