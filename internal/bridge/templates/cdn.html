@@ -20,7 +20,6 @@ const pending=[],upPending=[];
 const queueLimit=33554432,queueItemLimit=16384,batchLimit=__BATCH_LIMIT__;
 let upSeq=1,downCursor=0,upInflight=0,maxInflight=6;
 let debounceTimer=0;
-let streamSupported=typeof ReadableStream!=='undefined'&&typeof AbortController!=='undefined';
 let lastSentAckCursor=0;
 let failing=false;
 const activeStreams=new Set();
@@ -259,11 +258,7 @@ async function createSession(helloBuf){
  }
 
  status('connected');
- if(streamSupported){
-  startStreamLoop();
- }else{
-  startPollLoop();
- }
+ startPollLoop();
  scheduleFlush();
 }
 function queueCarrier(buf){
@@ -426,156 +421,6 @@ async function sendAckOnly(){
    fail();
   }
  }catch(e){}
-}
-
-function createStreamAssembler(){
- let buf=new Uint8Array(65536);
- let readOff=0,writeOff=0;
- let headerParsed=false;
- return {
-  feed(chunk,onEnvelope){
-   if(writeOff+chunk.byteLength>buf.length){
-    const needed=writeOff-readOff+chunk.byteLength;
-    if(needed>buf.length){
-     let newCap=buf.length*2;
-     while(newCap<needed)newCap*=2;
-     const newBuf=new Uint8Array(newCap);
-     newBuf.set(buf.subarray(readOff,writeOff),0);
-     writeOff-=readOff;readOff=0;
-     buf=newBuf;
-    }else{
-     buf.copyWithin(0,readOff,writeOff);
-     writeOff-=readOff;readOff=0;
-    }
-   }
-   buf.set(chunk,writeOff);
-   writeOff+=chunk.byteLength;
-
-   if(!headerParsed){
-    if(writeOff-readOff<12)return;
-    const view=new DataView(buf.buffer,buf.byteOffset+readOff,12);
-    if(view.getUint8(0)!==0x67||view.getUint8(1)!==0x6c||view.getUint8(2)!==0x54||view.getUint8(3)!==0x46){
-     throw new Error('invalid gltf streaming prefix');
-    }
-    const ver=view.getUint32(4,true);
-    if(ver!==2)throw new Error('invalid gltf version');
-    readOff+=12;
-    headerParsed=true;
-   }
-
-   while(writeOff-readOff>=8){
-    const view=new DataView(buf.buffer,buf.byteOffset+readOff,8);
-    const cursor=view.getUint32(0,false);
-    const length=view.getUint32(4,false);
-    if(length>2*1024*1024)throw new Error('stream envelope length exceeded');
-    if(writeOff-readOff<8+length)break;
-    let payloadBuf=null;
-    if(length>0){
-     payloadBuf=buf.buffer.slice(buf.byteOffset+readOff+8,buf.byteOffset+readOff+8+length);
-    }
-    readOff+=8+length;
-    onEnvelope(cursor,payloadBuf);
-   }
-
-   if(readOff===writeOff){
-    readOff=0;writeOff=0;
-   }
-  }
- };
-}
-
-async function startStreamLoop(){
- while(!closed&&sessionToken&&streamSupported){
-  let probeTimer=0,watchdogTimer=0;
-  try{
-   pollController=new AbortController();
-   const randHex=(Math.random()*0xffffffff>>>0).toString(16);
-   const streamUrl=relayBase+'assets/media/'+shortId+'/stream_'+downCursor+'_'+randHex+'.m4s';
-
-   probeTimer=setTimeout(()=>{
-    streamSupported=false;
-    if(pollController)pollController.abort();
-   },1500);
-
-   const resetWatchdog=()=>{
-    clearTimeout(watchdogTimer);
-    watchdogTimer=setTimeout(()=>{
-     if(pollController)pollController.abort();
-    },16000);
-   };
-   resetWatchdog();
-
-   const res=await fetch(streamUrl,{
-    method:'GET',
-    signal:pollController.signal,
-    mode:'same-origin',credentials:'omit',cache:'no-store',
-    headers:{
-     'X-Client-Key':sessionToken,
-     'X-Stream-Poll':'1'
-    }
-   });
-
-   if(!res.ok){
-    clearTimeout(probeTimer);
-    clearTimeout(watchdogTimer);
-    if(res.status===404||res.status===410){
-     fail();return;
-    }
-    streamSupported=false;
-    break;
-   }
-
-   const ct=res.headers.get('Content-Type');
-   if(ct&&ct.includes('text/html')){
-    clearTimeout(probeTimer);
-    clearTimeout(watchdogTimer);
-    fail();return;
-   }
-
-   if(!res.body||typeof res.body.getReader!=='function'){
-    clearTimeout(probeTimer);
-    clearTimeout(watchdogTimer);
-    streamSupported=false;
-    break;
-   }
-
-   const reader=res.body.getReader();
-   const assembler=createStreamAssembler();
-   let firstChunk=false;
-
-   while(!closed&&sessionToken){
-    const {done,value}=await reader.read();
-    if(done)break;
-    if(!firstChunk){
-     firstChunk=true;
-     clearTimeout(probeTimer);
-    }
-    resetWatchdog();
-    assembler.feed(value,(cursor,payloadBuf)=>{
-     if((cursor-downCursor|0)>0||downCursor===0)downCursor=cursor;
-     if(payloadBuf&&payloadBuf.byteLength>0)deliver(payloadBuf);
-     if((downCursor-lastSentAckCursor)>=16&&upInflight===0&&upPending.length===0){
-      lastSentAckCursor=downCursor;
-      sendAckOnly();
-     }
-    });
-   }
-   clearTimeout(probeTimer);
-   clearTimeout(watchdogTimer);
-  }catch(e){
-   clearTimeout(probeTimer);
-   clearTimeout(watchdogTimer);
-   if(closed)break;
-   if(e&&(e.message==='invalid gltf streaming prefix'||e.message==='stream envelope length exceeded'||!streamSupported)){
-    streamSupported=false;
-    break;
-   }
-   await pause(150+(Math.random()*200|0));
-  }
- }
- if(!streamSupported&&!closed&&sessionToken){
-  startPollLoop();
- }
 }
 
 async function startPollLoop(){

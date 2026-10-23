@@ -154,3 +154,57 @@ func TestFactoryErrorHandling(t *testing.T) {
 		t.Fatal("expected error on non-existent template")
 	}
 }
+
+func TestFactoryCDNModesResolutionAndContent(t *testing.T) {
+	factory := DefaultFactory()
+
+	// cdn-ws must resolve to cdn_ws.html
+	if resolved := factory.ResolveTemplateName(Options{CarrierMode: "cdn-ws"}); resolved != "cdn_ws.html" {
+		t.Fatalf("expected cdn_ws.html for cdn-ws, got %q", resolved)
+	}
+
+	// Other CDN modes must resolve to cdn.html
+	for _, mode := range []string{"cdn-adaptive", "cdn-get", "cdn-body", "cdn"} {
+		if resolved := factory.ResolveTemplateName(Options{CarrierMode: mode}); resolved != "cdn.html" {
+			t.Fatalf("expected cdn.html for %s, got %q", mode, resolved)
+		}
+	}
+
+	// Render cdn-ws and verify streaming content
+	wsPage, err := factory.Render(Options{
+		Hostname:       "example.com",
+		BasePath:       "",
+		BootstrapToken: "tok",
+		CarrierMode:    "cdn-ws",
+		BatchBytes:     65536,
+	})
+	if err != nil {
+		t.Fatalf("failed to render cdn-ws: %v", err)
+	}
+	wsBody := string(wsPage.Body)
+	if !strings.Contains(wsBody, "startStreamLoop") || !strings.Contains(wsBody, "createStreamAssembler") {
+		t.Fatal("cdn-ws template missing streaming components")
+	}
+	if strings.Contains(wsBody, "startPollLoop") {
+		t.Fatal("cdn-ws template must not contain startPollLoop")
+	}
+
+	// Render cdn-adaptive and verify pure polling content
+	adaptivePage, err := factory.Render(Options{
+		Hostname:       "example.com",
+		BasePath:       "",
+		BootstrapToken: "tok",
+		CarrierMode:    "cdn-adaptive",
+		BatchBytes:     65536,
+	})
+	if err != nil {
+		t.Fatalf("failed to render cdn-adaptive: %v", err)
+	}
+	adaptiveBody := string(adaptivePage.Body)
+	if !strings.Contains(adaptiveBody, "startPollLoop") {
+		t.Fatal("cdn-adaptive template missing startPollLoop")
+	}
+	if strings.Contains(adaptiveBody, "startStreamLoop") || strings.Contains(adaptiveBody, "createStreamAssembler") {
+		t.Fatal("cdn-adaptive template must not contain streaming components")
+	}
+}

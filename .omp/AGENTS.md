@@ -439,3 +439,10 @@ lordik-server/
       - **Валидация decoy-ответов (`processDownlink`) и сохранение downlink в `sendAckOnly`**:
         - `processDownlink` валидирует `Content-Type`: `text/html` немедленно распознается как fallback маскировочного сайта и инициирует `fail()`; `model/gltf-binary` парсится и доставляет полезную нагрузку; `application/json` проверяет флаг `s === 1`; пустые ответы (0 байт) считаются валидными ACK.
         - `sendAckOnly` переведена в `async`, читает `arrayBuffer()` и передает ответ в `processDownlink`, предотвращая потерю кадров и рассинхронизацию.
+22. **Выделение cdn-ws streaming в самостоятельные модули и шаблон (`cdn_stream.go`, `cdn_ws.html`)**:
+    - **Компоненты**: `internal/server/cdn_stream.go`, `internal/server/cdn.go`, `internal/bridge/templates/cdn_ws.html`, `internal/bridge/templates/cdn.html`.
+    - **Суть изменения**:
+      - Серверный обработчик стриминга `serveCDNStreamDown` вынесен из монолитного `cdn.go` в отдельный файл `internal/server/cdn_stream.go`.
+      - Для режима `carrier_mode = "cdn-ws"` создан специализированный шаблон `internal/bridge/templates/cdn_ws.html`, использующий непрерывный стриминг `ReadableStream` (`startStreamLoop`, `createStreamAssembler`) без отката на поллинг (ошибки стрима сразу инициируют `fail()`).
+      - Из общего шаблона `cdn.html` (для режимов `cdn-adaptive`, `cdn-get`, `cdn-body`) удален избыточный код стриминга (`createStreamAssembler`, `startStreamLoop`, переменная `streamSupported`). Шаблон переведен на прямой запуск долгого поллинга (`startPollLoop()`), исключая 1500 мс задержки на пробное подключение в окружениях без поддержки стриминга.
+      - Разрешение шаблона в `bridge.Factory.ResolveTemplateName` работает нативно через правило сопоставления префикса и замены дефиса (`modeUnder` -> `cdn_ws.html`).
