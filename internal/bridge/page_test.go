@@ -294,6 +294,8 @@ func TestRenderCDNBridgeLifecycleAndRecovery(t *testing.T) {
 		for _, expected := range []string{
 			"activeStreams=new Set()",
 			"wakeSignals=new Set()",
+			"upControllers=new Set()",
+			"function abortInflightUplinks()",
 			"function encodeFrame(type,streamId,payloadBytes)",
 			"function trackClientFrames(buf)",
 			"encodeFrame(0x03,streamId,null)",
@@ -305,14 +307,20 @@ func TestRenderCDNBridgeLifecycleAndRecovery(t *testing.T) {
 			"model/gltf-binary",
 			"async function sendAckOnly()",
 			"processDownlink(resBuf,ct)",
-			"function onWakeUp()",
+			"function onWakeUp(isOnline)",
 			"now-lastWakeAt<250",
+			"slept=(now-lastTick>2500)",
 			"visibilitychange",
-			"addEventListener('focus',onWakeUp)",
-			"addEventListener('online',onWakeUp)",
-			"addEventListener('pageshow',onWakeUp)",
+			"addEventListener('focus',()=>onWakeUp(false))",
+			"addEventListener('online',()=>onWakeUp(true))",
+			"addEventListener('pageshow',()=>onWakeUp(false))",
 			"isBg=(typeof document!=='undefined'&&document.visibilityState==='hidden')",
 			"nextRetry=isBg?retry:retry+1",
+			"pause(60)",
+			"wakingUp",
+			"abortInflightUplinks()",
+			"ackInflight",
+			"'X-Coalesce':(upPending.length===0&&upInflight<=1)?'1':'0'",
 		} {
 			if !strings.Contains(body, expected) {
 				t.Fatalf("rendered %s bridge lacks expected snippet %q", mode, expected)
@@ -333,6 +341,16 @@ func TestRenderCDNWSBridgeLifecycleAndRecovery(t *testing.T) {
 		"await pollOnce()",
 		"else if(upPending.length===0)",
 		"sendAckOnly()",
+		"upControllers=new Set()",
+		"function abortInflightUplinks()",
+		"pause(60)",
+		"wakingUp",
+		"ackInflight",
+		"function onWakeUp(isOnline)",
+		"addEventListener('focus',()=>onWakeUp(false))",
+		"addEventListener('online',()=>onWakeUp(true))",
+		"addEventListener('pageshow',()=>onWakeUp(false))",
+		"'X-Coalesce':(upPending.length===0&&upInflight<=1)?'1':'0'",
 	} {
 		if !strings.Contains(body, expected) {
 			t.Fatalf("rendered cdn-ws bridge lacks expected snippet %q", expected)

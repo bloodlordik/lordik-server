@@ -26,6 +26,16 @@ let lastSentAckCursor=0;
 let failing=false;
 const activeStreams=new Set();
 const wakeSignals=new Set();
+const upControllers=new Set();
+let ackInflight=false;
+let wakingUp=false;
+
+function abortInflightUplinks(){
+ for(const ctrl of Array.from(upControllers)){
+  try{ctrl.abort()}catch(e){}
+ }
+ upControllers.clear();
+}
 
 const status=state=>{if(port&&!closed)port.postMessage({t:'status',state})};
 function pause(ms){
@@ -235,7 +245,7 @@ async function createSession(helloBuf){
   ok=await tryGetInit(helloBuf,5000);
  }else{
   const postPromise=tryPostInit(helloBuf,2000);
-  const timeoutPromise=pause(250).then(()=>null);
+  const timeoutPromise=pause(60).then(()=>null);
   const raceResult=await Promise.race([postPromise,timeoutPromise]);
   if(raceResult===true){
    ok=true;
@@ -350,6 +360,7 @@ async function sendChunkWithBackoff(seq,buf,retry){
   let statusCode=0;
   const ctrl=new AbortController();
   const reqTimer=setTimeout(()=>ctrl.abort(),10000);
+  upControllers.add(ctrl);
   try{
    if(activeMode==='cdn-body'&&buf.byteLength<=6144){
     const postUrl=relayBase+'_next/data/'+buildId+'/sync/'+shortId+'/'+seq+'.bin';
@@ -470,6 +481,7 @@ async function sendChunkWithBackoff(seq,buf,retry){
    if(activeMode==='cdn-body'&&carrierMode!=='cdn-body')activeMode='cdn-get';
   }finally{
    clearTimeout(reqTimer);
+   upControllers.delete(ctrl);
   }
 
   if(success){
@@ -501,13 +513,17 @@ async function sendChunkWithBackoff(seq,buf,retry){
 }
 
 async function sendAckOnly(){
- if(closed||!sessionToken||upInflight>0)return;
+ if(closed||!sessionToken||ackInflight)return;
+ ackInflight=true;
  const cur=downCursor;
  const randHex=(Math.random()*0xffffffff>>>0).toString(16);
  const ackUrl=relayBase+'assets/chunks/'+shortId+'/0.bin?p=&r='+randHex;
+ const ctrl=new AbortController();
+ const timer=setTimeout(()=>ctrl.abort(),5000);
  try{
   const res=await fetch(ackUrl,{
    method:'GET',
+   signal:ctrl.signal,
    mode:'same-origin',credentials:'omit',cache:'no-store',
    headers:{
     'X-Client-Key':sessionToken,
@@ -515,6 +531,7 @@ async function sendAckOnly(){
     'X-Down-Cursor':String(cur)
    }
   });
+  clearTimeout(timer);
   if(res.ok){
    const ct=res.headers.get('Content-Type');
    const resBuf=await res.arrayBuffer();
@@ -523,6 +540,10 @@ async function sendAckOnly(){
    fail();
   }
  }catch(e){}
+ finally{
+  clearTimeout(timer);
+  ackInflight=false;
+ }
 }
 
 function createStreamAssembler(){
@@ -691,6 +712,11 @@ async function startStreamLoop(){
    if(e&&(e.message==='invalid gltf streaming prefix'||e.message==='stream envelope length exceeded')){
     fail();return;
    }
+   if(wakingUp){
+    wakingUp=false;
+    probeConsecutiveTimeouts=0;
+    continue;
+   }
    if(probeFired){
     probeConsecutiveTimeouts++;
     if(probeConsecutiveTimeouts>=2){
@@ -708,6 +734,7 @@ function close(notifyServer){
  closed=true;
  failing=true;
  if(pollController)pollController.abort();
+ abortInflightUplinks();
  if(notifyServer&&sessionToken&&shortId){
   const unloadUrl=relayBase+'_next/data/'+buildId+'/unload/'+shortId+'.json?t='+Date.now();
   fetch(unloadUrl,{
@@ -757,15 +784,23 @@ if(!initialized&&androidNonce&&androidBridge&&typeof androidBridge.postMessage==
  activatePort(androidPort);androidBridge.postMessage(JSON.stringify({t:'tproxy-android-init',v:1,nonce:androidNonce}));
 }
 
-let lastWakeAt=0;
-function onWakeUp(){
+let lastWakeAt=0,lastTick=Date.now();
+setInterval(()=>{lastTick=Date.now()},1000);
+
+function onWakeUp(isOnline){
  if(closed||!sessionToken)return;
  const now=Date.now();
  if(now-lastWakeAt<250)return;
  lastWakeAt=now;
+ const slept=(now-lastTick>2500);
+ lastTick=now;
+ wakingUp=true;
  for(const wake of Array.from(wakeSignals))wake();
  if(pollController){
   try{pollController.abort()}catch(e){}
+ }
+ if(isOnline||slept){
+  abortInflightUplinks();
  }
  if(upPending.length&&upInflight<maxInflight){
   flushUplink();
@@ -776,13 +811,13 @@ function onWakeUp(){
 
 if(typeof document!=='undefined'){
  document.addEventListener('visibilitychange',()=>{
-  if(document.visibilityState==='visible')onWakeUp();
+  if(document.visibilityState==='visible')onWakeUp(false);
  });
 }
 if(typeof addEventListener==='function'){
- addEventListener('focus',onWakeUp);
- addEventListener('online',onWakeUp);
- addEventListener('pageshow',onWakeUp);
+ addEventListener('focus',()=>onWakeUp(false));
+ addEventListener('online',()=>onWakeUp(true));
+ addEventListener('pageshow',()=>onWakeUp(false));
 }
 
 addEventListener('pagehide',()=>close(true),{once:true});
