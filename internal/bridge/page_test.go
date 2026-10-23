@@ -339,7 +339,7 @@ func TestRenderCDNWSBridgeLifecycleAndRecovery(t *testing.T) {
 		"let probeConsecutiveTimeouts=0",
 		"probeConsecutiveTimeouts++",
 		"await pollOnce()",
-		"else if(upPending.length===0)",
+		"else if(upPending.length===0&&(isOnline||slept))",
 		"sendAckOnly()",
 		"upControllers=new Set()",
 		"streamControllers=new Set()",

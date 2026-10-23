@@ -16,6 +16,7 @@ history.replaceState(null,'',location.pathname);
 let initialized=false,closed=false,port=null,sessionToken='',resumeToken='',shortId='',createStarted=false;
 let queuedBytes=0,queuedItems=0,pollController=null;
 let activeMode='cdn-adaptive'; // cdn-adaptive, cdn-get, cdn-body
+let postConfirmed=false;
 const pending=[],upPending=[];
 const queueLimit=33554432,queueItemLimit=16384,batchLimit=__BATCH_LIMIT__;
 let upSeq=1,downCursor=0,upInflight=0,maxInflight=6;
@@ -191,6 +192,7 @@ async function tryPostInit(helloBuf,timeoutMs){
     const welcomeBuf=await res.arrayBuffer();
     if(!initDone&&!closed){
      initDone=true;
+     postConfirmed=true;
      sessionToken=tok;
      resumeToken=res.headers.get('X-Resume-Token')||tok;
      shortId=tok.slice(0,12);
@@ -245,21 +247,28 @@ async function createSession(helloBuf){
   ok=await tryGetInit(helloBuf,5000);
  }else{
   const postPromise=tryPostInit(helloBuf,2000);
-  const timeoutPromise=pause(60).then(()=>null);
+  const timeoutPromise=pause(60).then(()=>'timeout');
   const raceResult=await Promise.race([postPromise,timeoutPromise]);
   if(raceResult===true){
    ok=true;
+  }else if(raceResult===false){
+   ok=await tryGetInit(helloBuf,5000);
   }else{
-   const getPromise=tryGetInit(helloBuf,5000);
-   const winner=await Promise.race([
-    postPromise.then(v=>v?'post':null),
-    getPromise.then(v=>v?'get':null)
-   ]);
-   if(winner){
+   const secondRace=await Promise.race([postPromise,pause(120).then(()=>'timeout')]);
+   if(secondRace===true){
     ok=true;
    }else{
-    const second=await Promise.all([postPromise,getPromise]);
-    ok=second[0]||second[1];
+    const getPromise=tryGetInit(helloBuf,5000);
+    const winner=await Promise.race([
+     postPromise.then(v=>v?'post':null),
+     getPromise.then(v=>v?'get':null)
+    ]);
+    if(winner){
+     ok=true;
+    }else{
+     const second=await Promise.all([postPromise,getPromise]);
+     ok=second[0]||second[1];
+    }
    }
   }
  }
@@ -377,14 +386,16 @@ async function sendChunkWithBackoff(seq,buf,retry){
    clearTimeout(reqTimer);
    if(res.ok){
     const ct=res.headers.get('Content-Type');
-    const resBuf=await res.arrayBuffer();
     if(!processDownlink(resBuf,ct)){fail();return}
+    postConfirmed=true;
     success=true;
-  }else if(res.status===404||res.status===410){
-   inflightSeqs.delete(seq);
-   upInflight--;
-   fail();return;
-  }
+   }else if(res.status===404||res.status===410){
+    inflightSeqs.delete(seq);
+    upInflight--;
+    fail();return;
+   }else if(!postConfirmed&&carrierMode!=='cdn-body'&&(res.status===400||res.status===403||res.status===405||res.status===413)&&buf.byteLength<=6144){
+    activeMode='cdn-get';
+   }
   }else{
    const b64=toBase64Url(buf);
    const urlPart=b64.slice(0,3072);
@@ -420,6 +431,9 @@ async function sendChunkWithBackoff(seq,buf,retry){
    }
   }
  }catch(e){
+  if(!ctrl.signal.aborted&&!postConfirmed&&activeMode==='cdn-body'&&carrierMode!=='cdn-body'&&buf.byteLength<=6144){
+   activeMode='cdn-get';
+  }
  }finally{
   clearTimeout(reqTimer);
   upControllers.delete(ctrl);
@@ -583,17 +597,17 @@ function onWakeUp(isOnline){
  lastWakeAt=now;
  const slept=(now-lastTick>2500);
  lastTick=now;
- wakingUp=true;
  for(const wake of Array.from(wakeSignals))wake();
- if(pollController){
-  try{pollController.abort()}catch(e){}
- }
  if(isOnline||slept){
+  wakingUp=true;
+  if(pollController){
+   try{pollController.abort()}catch(e){}
+  }
   abortInflightUplinks();
  }
  if(upPending.length&&upInflight<maxInflight){
   flushUplink();
- }else if(upPending.length===0){
+ }else if(upPending.length===0&&(isOnline||slept)){
   sendAckOnly();
  }
 }
