@@ -324,6 +324,10 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if suffix, ok := vhost.transportSuffix(r.URL.Path); ok && r.URL.EscapedPath() == r.URL.Path {
+		if strings.HasPrefix(suffix, "_yc/") {
+			s.serveYCWS(w, r, vhost, suffix)
+			return
+		}
 		if strings.HasPrefix(suffix, "_next/data/") || strings.HasPrefix(suffix, "assets/") {
 			s.serveCDN(w, r, vhost, suffix)
 			return
@@ -1217,6 +1221,9 @@ func (vh *VHost) transportSuffix(requestPath string) (string, bool) {
 				return suffix, true
 			}
 			if strings.HasPrefix(suffix, "_next/data/") || strings.HasPrefix(suffix, "assets/") {
+				return suffix, true
+			}
+			if strings.HasPrefix(suffix, "_yc/") {
 				return suffix, true
 			}
 		}

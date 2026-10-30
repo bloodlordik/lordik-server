@@ -82,6 +82,7 @@ type Manager struct {
 	sessions             map[[sha256.Size]byte]*Session
 	resumeSessions       map[[sha256.Size]byte]*Session
 	shortSessions        map[string]*Session
+	ycWSConns            map[string]*Session
 	closedTokens         map[[sha256.Size]byte]time.Time
 	sessionsPerIP        map[string]int
 	sessionsPerProfile   map[string]int
@@ -131,6 +132,7 @@ func NewManager(value config.Config, tokenKey [sha256.Size]byte) *Manager {
 		sessions:            make(map[[sha256.Size]byte]*Session),
 		resumeSessions:      make(map[[sha256.Size]byte]*Session),
 		shortSessions:       make(map[string]*Session),
+		ycWSConns:           make(map[string]*Session),
 		closedTokens:        make(map[[sha256.Size]byte]time.Time),
 		sessionsPerIP:       make(map[string]int),
 		sessionsPerProfile:  make(map[string]int),
@@ -191,7 +193,7 @@ func (m *Manager) IssueBootstrap(profile *config.Profile, clientIP string) (stri
 		return "", ErrClosed
 	}
 	m.removeExpiredBootstrapsLocked(now)
-	skipIPLimit := profile != nil && (profile.CarrierMode.IsCDN() || profile.DisableIPRateLimit)
+	skipIPLimit := profile != nil && (profile.CarrierMode.IsCDN() || profile.CarrierMode.IsYC() || profile.DisableIPRateLimit)
 	if (!skipIPLimit && m.config.Limits.MaxBootstrapsPerIP != 0 &&
 		m.bootstrapsPerIP[clientIP] >= m.config.Limits.MaxBootstrapsPerIP) || !allowRateLocked(
 		&m.bootstrapRate,
@@ -244,7 +246,7 @@ func (m *Manager) Create(token, clientIP string, body []byte) (CreateResult, err
 		}, nil
 	}
 	profileLimits := entry.profile.Limits
-	skipIPLimit := entry.profile != nil && (entry.profile.CarrierMode.IsCDN() || entry.profile.DisableIPRateLimit)
+	skipIPLimit := entry.profile != nil && (entry.profile.CarrierMode.IsCDN() || entry.profile.CarrierMode.IsYC() || entry.profile.DisableIPRateLimit)
 	if m.closed ||
 		len(m.sessions) >= m.config.Limits.MaxSessionsGlobal ||
 		m.sessionsPerProfile[entry.profile.Name] >= profileLimits.MaxSessions ||
@@ -376,7 +378,7 @@ func (m *Manager) Resume(token, clientIP string) (*Session, error) {
 		return nil, ErrAuthentication
 	}
 	if clientIP != "" && sess.clientIP != clientIP {
-		skipIPLimit := sess.profile != nil && (sess.profile.CarrierMode.IsCDN() || sess.profile.DisableIPRateLimit)
+		skipIPLimit := sess.profile != nil && (sess.profile.CarrierMode.IsCDN() || sess.profile.CarrierMode.IsYC() || sess.profile.DisableIPRateLimit)
 		if !skipIPLimit && m.config.Limits.MaxSessionsPerIP != 0 {
 			if m.sessionsPerIP[clientIP] >= m.config.Limits.MaxSessionsPerIP {
 				m.limitHits.Add(1)
@@ -408,7 +410,44 @@ func (m *Manager) GetByShortID(shortID string) (*Session, error) {
 	return result, nil
 }
 
+// BindYCWSConn maps a Yandex Cloud API Gateway connection ID to a Session.
+func (m *Manager) BindYCWSConn(connID string, s *Session) {
+	if connID == "" || s == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s.ycConnID != "" && s.ycConnID != connID {
+		delete(m.ycWSConns, s.ycConnID)
+	}
+	s.ycConnID = connID
+	m.ycWSConns[connID] = s
+}
 
+// GetYCWSConn retrieves the Session mapped to a Yandex Cloud API Gateway connection ID.
+func (m *Manager) GetYCWSConn(connID string) *Session {
+	if connID == "" {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ycWSConns[connID]
+}
+
+// UnbindYCWSConn unmaps a Yandex Cloud API Gateway connection ID.
+func (m *Manager) UnbindYCWSConn(connID string) {
+	if connID == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if sess, ok := m.ycWSConns[connID]; ok && sess != nil {
+		if sess.ycConnID == connID {
+			sess.ycConnID = ""
+		}
+	}
+	delete(m.ycWSConns, connID)
+}
 func (m *Manager) CloseToken(token string) error {
 	hash, err := tokenHash(token)
 	if err != nil {
@@ -478,6 +517,10 @@ func (m *Manager) Shutdown() {
 
 func (m *Manager) sessionFinished(value *Session) {
 	m.mu.Lock()
+	if value.ycConnID != "" {
+		delete(m.ycWSConns, value.ycConnID)
+		value.ycConnID = ""
+	}
 	var hash [sha256.Size]byte
 	var found bool
 	if value.tokenHash != [sha256.Size]byte{} {

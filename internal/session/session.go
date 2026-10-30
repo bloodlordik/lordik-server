@@ -152,6 +152,7 @@ type Session struct {
 	bootstrapHash         [sha256.Size]byte
 	shortID               string
 	rawSecret             []byte
+	ycConnID              string
 	finishOnce            sync.Once
 	backendWG             sync.WaitGroup
 	onFinished            func(*Session)
@@ -196,7 +197,7 @@ func newSession(options sessionOptions) *Session {
 	if carrier == config.CarrierHTTPSLanes {
 		result.carrierLanes[0] = newCarrierLane()
 	}
-	if carrier.IsCDN() {
+	if carrier.IsCDN() || carrier.IsYC() {
 		windowSize := uint64(options.limits.CDNUplinkWindowSize)
 		if windowSize == 0 {
 			windowSize = 64
@@ -243,6 +244,32 @@ func (s *Session) DownCursor() uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.downCursor
+}
+
+// AckDownCDN acknowledges client received bytes up to cursor.
+func (s *Session) AckDownCDN(cursor uint32) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrClosed
+	}
+	if uint64(cursor) > s.downCursor {
+		s.protocolFailure()
+		return ErrProtocol
+	}
+	s.lastActivity = time.Now()
+	s.ackCursorLocked(uint64(cursor))
+	return nil
+}
+
+// NextUpSeq returns the next expected uplink sequence number.
+func (s *Session) NextUpSeq() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cdnReassembly != nil {
+		return s.cdnReassembly.ExpectedUpSeq()
+	}
+	return s.lastUpSequence + 1
 }
 
 func (s *Session) ReleaseWebSocket() {

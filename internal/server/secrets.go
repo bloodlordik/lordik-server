@@ -47,6 +47,9 @@ func (s *Server) bridgeProfileForVHost(r *http.Request, vhost *VHost) *config.Pr
 // headers, malformed queries, cookies, referrers, or wrong-path requests. Bodies
 // and trailers are deliberately not read: public uploads must remain streaming.
 func (s *Server) hasInternalSecret(r *http.Request) bool {
+	if connID := r.Header.Get("X-Yc-Apigateway-Websocket-Connection-Id"); connID != "" && s.manager.GetYCWSConn(connID) != nil {
+		return true
+	}
 	scan := secretScan{manager: s.manager}
 	if scan.carrierCredential(r, s.config.LegacyTokenDrain) {
 		return true

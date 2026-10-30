@@ -524,3 +524,27 @@ lordik-server/
         - Прерывание активных сокетов (`streamControllers`, `pollController`, `abortInflightUplinks`) выполняется **только** при реальном выходе устройства из сна (`slept = now - lastTick > 2500`) или смене сетевого интерфейса (`isOnline === true`).
         - Обычные события `focus`, переключение вкладок или клик по окну не трогают качающиеся потоки и не шлют холостые `sendAckOnly()`.
       - **Чистая архитектура `sendChunkWithBackoff`**: устранено дублирование веток, `cdn-body` обрабатывается единым изолированным блоком.
+28. **Изолированный транспортный режим `yc-ws` для Yandex Cloud API Gateway**:
+    - **Компоненты**: `internal/config/config.go`, `internal/session/session.go`, `internal/session/manager.go`, `internal/server/server.go`, `internal/server/secrets.go`, `internal/server/yc_ws.go`, `internal/bridge/factory.go`, `internal/bridge/templates/yc_ws.html`.
+    - **Архитектура и назначение**:
+      - Новый специализированный режим сетевого транспорта (`carrier_mode: "yc-ws"`) для развертывания поверх Yandex Cloud API Gateway.
+      - В YC API Gateway веб-сокеты работают по event-driven модели: шлюз принимает `wss://` от клиента и отправляет события на бэкенд в виде HTTP POST запросов (`$connect`, `$disconnect`, `$default`/сообщения), при этом ответы на `$default` не транслируются обратно в сокет клиенту.
+      - Для обеспечения полнодуплексной связи с минимальной задержкой без использования IAM-ключей реализована гибридная схема:
+        - **Uplink**: клиент отправляет кадры через WebSocket (`ws.send()`) в YC API Gateway, который шлет `POST /_yc/ws/message` на `tproxy-server` (0 мс мобильной очереди). При сбое сокета автоматически задействуется HTTP POST fallback (`POST /_yc/up/{short_id}/{seq}.bin`).
+        - **Downlink**: непрерывный HTTP GET стриминг `GET /_yc/stream/{short_id}/stream_{cursor}_{rand}.m4s` (`ReadableStream` + `http.Flusher`) с авто-откатом на Long-Poll `GET /_yc/poll/{short_id}/seg_{cursor}_{rand}.m4s`.
+    - **Привязка соединений и маршрутизация (`Manager.ycWSConns`)**:
+      - При установке соединения (`$connect` -> `POST /_yc/ws/connect`) шлюз передает заголовок `X-Yc-Apigateway-Websocket-Connection-Id`, который сервер связывает с объектом `Session`.
+      - Сообщения и отключения разрешают сессию за $O(1)$ по connection ID без передачи токенов в каждом сообщении.
+    - **Zero-Loss WebSocket Retransmit Window и Flow Control**:
+      - В шаблоне `yc_ws.html` клиент отслеживает отправленные по WebSocket чанки в `wsRecentChunks` (размер окна ограничен 10 слотами согласно серверному ReassemblyBuffer). При разрыве сокета клиент немедленно повторно отправляет неподтвержденные чанки через fallback HTTP POST `/_yc/up/...`, исключая потерю пакетов во время переподключения.
+      - **Коалесценция и нарезка кадров**: в `queueCarrier` кадры крупнее 32 КиБ нарезаются по 32768 байт. Функция `pullChunk` склеивает мелкие кадры из `fastPending` и `upPending` в пакеты до 32 КиБ (WS) или 64 КиБ (HTTP fallback), предотвращая переполнение окна `seq` и не превышая лимит размера сообщений YC API Gateway (128 КиБ).
+      - При отправке чанка обновляется `lastSentAckCursor = downCursor`, предотвращая отправку избыточных холостых `sendAckOnly()`.
+    - **Контракт нативного моста Telegram и надежное завершение**:
+      - В `yc_ws.html` инициализация порта строго следует нативному контракту `globalThis.TelegramWebProxy` (с fallback на `TelegramWebviewProxy`), отправляя `{"t":"tproxy-android-init","v":1,"nonce":androidNonce}`, и принимает `message` с типом `'tproxy-init'` или `'init'`.
+      - При вызове `close()` запрос `POST /_yc/unload/...` отправляется с флагом `keepalive: true`.
+    - **Оптимизация `decodeYCPayload` на сервере**:
+      - Разбор полезной нагрузки в `internal/server/yc_ws.go` работает через байтовые срезы без аллокаций `string(...)`. Проверяется вхождение байт в Base64url/Base64 алфавит с декодированием in-place и прозрачным пропуском сырых бинарных кадров.
+    - **Защита от активного зондирования (Active Probing Resistance)**:
+      - Маршруты `/_yc/...` строго изолированы. Любой неавторизованный запрос, невалидный заголовок соединения или несовпадение VHost перенаправляет запрос на маскировочный decoy-сайт (`vhost.servePublic`) с кодом 404 без раскрытия прокси-сервера.
+    - **Полная изоляция существующих режимов**:
+      - Все существующие шаблоны (`cdn.html`, `cdn_ws.html`, `websocket.html`, `https.html`) и режимы (`cdn*`, `websocket*`, `https*`) остались полностью нетронутыми.

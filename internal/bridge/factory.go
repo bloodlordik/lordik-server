@@ -153,6 +153,9 @@ func (f *Factory) ResolveTemplateName(opts Options) string {
 		if strings.HasPrefix(mode, "cdn") {
 			candidates = append(candidates, "cdn.html")
 		}
+		if strings.HasPrefix(mode, "yc") {
+			candidates = append(candidates, "yc_ws.html")
+		}
 		for _, candidate := range candidates {
 			if f.HasTemplate(candidate) {
 				return candidate

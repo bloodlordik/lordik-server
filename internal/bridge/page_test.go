@@ -369,3 +369,53 @@ func TestRenderCDNWSBridgeLifecycleAndRecovery(t *testing.T) {
 		t.Fatal("queueCarrier still contains duplicate trackClientFrames")
 	}
 }
+
+func TestRenderYCWSBridge(t *testing.T) {
+	page, err := Render("yc.example.com", "", "bootstrap-token", "yc-ws", 2*1024*1024)
+	if err != nil {
+		t.Fatalf("failed to render yc-ws bridge: %v", err)
+	}
+	body := string(page.Body)
+	if page.Nonce == "" || !strings.Contains(body, `script nonce="`+page.Nonce+`"`) {
+		t.Fatal("rendered yc-ws bridge missing nonce binding")
+	}
+	for _, expected := range []string{
+		"connectWebSocket()",
+		"_yc/ws",
+		"_yc/session",
+		"_yc/stream",
+		"_yc/poll",
+		"_yc/up",
+		"toBase64Url",
+		"fromBase64Url",
+		"fastPending",
+		"wsRecentChunks",
+		"sendHttpChunkWithBackoff",
+		"createStreamAssembler",
+		"status('failed')",
+		"status('connected')",
+		"model/gltf-binary",
+		"text/html",
+		"globalThis.TelegramWebProxy",
+		"tproxy-android-init",
+		"tproxy-init",
+		"pullChunk",
+		"keepalive:true",
+		"wsRecentChunks.size>10",
+		"32768",
+	} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("rendered yc-ws bridge lacks expected snippet %q", expected)
+		}
+	}
+	for _, placeholder := range []string{
+		"__NONCE__",
+		"__BOOTSTRAP__",
+		"__BATCH_LIMIT__",
+		"__CARRIER_MODE__",
+	} {
+		if strings.Contains(body, placeholder) {
+			t.Fatalf("rendered yc-ws bridge retained unreplaced placeholder %q", placeholder)
+		}
+	}
+}
