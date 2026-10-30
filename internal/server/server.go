@@ -1250,6 +1250,13 @@ func (s *Server) resolveRequestHost(r *http.Request) string {
 					fwd = host
 				}
 				fwd = strings.TrimSuffix(strings.ToLower(fwd), ".")
+				if fwd == "{host}" {
+					for targetHost, targetVH := range s.trustedHostVHosts {
+						if strings.EqualFold(targetVH.TrustedHostHeader, vh.TrustedHostHeader) {
+							return targetHost
+						}
+					}
+				}
 				if targetVH, ok := s.trustedHostVHosts[fwd]; ok && strings.EqualFold(targetVH.TrustedHostHeader, vh.TrustedHostHeader) {
 					return fwd
 				}
