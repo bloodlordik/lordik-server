@@ -750,8 +750,8 @@ function onWakeUp(isOnline){
  }
  if(hasPendingUplink()&&upInflight<maxInflight){
   flushUplink();
- }else if(upPending.length===0){
-  if(isOnline||slept)sendAckOnly();
+ }else if(upPending.length===0&&(isOnline||slept)){
+  sendAckOnly();
  }
 }
 

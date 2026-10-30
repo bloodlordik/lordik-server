@@ -568,3 +568,17 @@ lordik-server/
         - В секции `headers` для операций `x-yc-apigateway-websocket-*` **НЕЛЬЗЯ** указывать `'*': '*'`: это приводит к пересылке клиентских заголовков `Connection: Upgrade` и `Upgrade: websocket` в запросе `POST /_yc/ws/connect` по протоколу HTTP/2, что нарушает RFC 7540 и вызывает ошибку Nginx `RST_STREAM (PROTOCOL_ERROR)` (в логах Envoy: `502 reset reason: protocol error`).
         - Заголовок `X-Yc-Apigateway-Websocket-Connection-Id` шлюз передает **автоматически**. Указывать `X-Yc-Apigateway-Websocket-Connection-Id: '{connectionId}'` нельзя, так как `{connectionId}` не является переменной подстановки в OpenAPI и передается как буквальная строка `"{connectionId}"`.
         - Обязательно указывать явный домен `X-Forwarded-Host: d5d9....apigw.yandexcloud.net`.
+30. **Модульная декомпозиция пакета `internal/session` (`session.go`)**:
+    - **Компоненты**: `internal/session/session.go`, `internal/session/backend.go`, `internal/session/batch.go`, `internal/session/budget.go`, `internal/session/cdn_session.go`, `internal/session/lanes.go`, `internal/session/transfer.go`.
+    - **Суть изменения**:
+      - Исходный монолитный файл `session.go` (~2542 строки) декомпозирован на 7 логически изолированных файлов в рамках того же пакета `session`:
+        - `session.go` (~269 строк): структура `Session`, опции создания `sessionOptions`, конструктор `newSession`, базовые геттеры, общий жизненный цикл (`Close`, `closeLocked`, `protocolFailure`, `rememberClosedLocked`) и тестовые хуки.
+        - `backend.go` (~423 строки): структуры `backendStream` и `streamState`, цикл подключения/дозвона (TCP / UNIX domain socket / Direct / Telemt), поддержка PROXY protocol, чтение/запись (`readLoop`, `writeLoop`), пулинг буферов (`readBufferPool`), учет дренажа и управление потоками сокета.
+        - `batch.go` (~236 строк): структуры `queuedFrame` и `downBatch`, кодирование и постановка кадров в очередь (`queueFrameLocked`), валидация батчей клиента (`validateBatchLocked`) и применение батчей (`applyBatchLocked`).
+        - `budget.go` (~173 строки): расчет лимитов и резервов очередей (`ValidateBudget`, `pendingControlReserve`, `pendingUplinkReserve`), учет кредитов и квот (`reservePendingLocked`, `releasePendingLocked`, `dataFrameAllowanceLocked`).
+        - `lanes.go` (~542 строки): структура `carrierLane` и логика работы с мультиплексированными линиями (`usesCarrierLanes`, `AcquireWebSocketLane`, `ReleaseWebSocketLane`, `ProcessUpLane`, `PollLane`, `ResumeLane`, `takeLaneDownBatchLocked`).
+        - `cdn_session.go` (~640 строк): сессионные методы CDN-транспорта (`ProcessUpCDN`, `PiggybackDown`, `PiggybackDownWait`, `PollCDN`, `StreamCDN`, `AckDownCDN`, скользящее окно подтверждений `sentBatch` / `ackCursorLocked`).
+        - `transfer.go` (~316 строк): стандартные операции одиночного транспорта (`ProcessUp`, `Poll`, `Resume`, `AcquireWebSocket`, `AcquireWebSocketTakeover`, `ReleaseWebSocket`, `takeDownBatchLocked`).
+    - **Сохранность функционала и обратная совместимость**:
+      - Публичные API, сигнатуры экспортируемых методов и структур полностью сохранены.
+      - Все существующие тесты (`session_test.go`, `cdn_test.go`, `direct_test.go`, `token_test.go`, `proxy_protocol_test.go`) и полный набор тестов репозитория (`go test ./...`) выполняются без единой ошибки.
