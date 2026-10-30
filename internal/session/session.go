@@ -22,6 +22,7 @@ type sessionOptions struct {
 	onStreamRejected      func()
 	onUp                  func(int)
 	onDown                func(int)
+	warmDCPool            *WarmDCPool
 }
 
 type Session struct {
@@ -78,6 +79,7 @@ type Session struct {
 	onStreamRejected      func()
 	onUp                  func(int)
 	onDown                func(int)
+	warmDCPool            *WarmDCPool
 }
 
 func newSession(options sessionOptions) *Session {
@@ -109,6 +111,7 @@ func newSession(options sessionOptions) *Session {
 		onStreamRejected:      options.onStreamRejected,
 		onUp:                  options.onUp,
 		onDown:                options.onDown,
+		warmDCPool:            options.warmDCPool,
 	}
 	if carrier == config.CarrierHTTPSLanes {
 		result.carrierLanes[0] = newCarrierLane()
@@ -133,6 +136,10 @@ func (s *Session) CarrierMode() config.CarrierMode {
 
 func (s *Session) ShortID() string {
 	return s.shortID
+}
+
+func (s *Session) WarmDCPool() *WarmDCPool {
+	return s.warmDCPool
 }
 
 func (s *Session) RawSecret() []byte {

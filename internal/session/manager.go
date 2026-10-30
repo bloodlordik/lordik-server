@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -109,6 +110,7 @@ type Manager struct {
 	bytesUp             atomic.Uint64
 	bytesDown           atomic.Uint64
 	limitHits           atomic.Uint64
+	warmDCPool          *WarmDCPool
 }
 
 func NewManager(value config.Config, tokenKey [sha256.Size]byte) *Manager {
@@ -146,6 +148,64 @@ func NewManager(value config.Config, tokenKey [sha256.Size]byte) *Manager {
 	for i := range value.Profiles {
 		result.capabilityPrefixes[capabilityPrefix(value.Profiles[i].Capability[:])] = struct{}{}
 	}
+	hasDirect := false
+	preferIPv6 := false
+	maxWarmSize := 0
+	targetSet := make(map[string]struct{})
+
+	if value.BackendType == config.BackendDirect {
+		hasDirect = true
+		if value.PreferIPv6 {
+			preferIPv6 = true
+		}
+		if value.Limits.WarmDCPoolSize > maxWarmSize {
+			maxWarmSize = value.Limits.WarmDCPoolSize
+		}
+	}
+
+	for _, p := range value.Profiles {
+		if p.BackendType == config.BackendDirect {
+			hasDirect = true
+			if p.PreferIPv6 {
+				preferIPv6 = true
+			}
+			poolSize := p.Limits.WarmDCPoolSize
+			if poolSize > maxWarmSize {
+				maxWarmSize = poolSize
+			}
+			b := strings.TrimSpace(p.Backend)
+			if b != "" && b != "auto" {
+				if _, err := strconv.Atoi(b); err != nil {
+					targetSet[b] = struct{}{}
+				}
+			}
+		}
+	}
+
+	if hasDirect && maxWarmSize > 0 {
+		var defaultTargets []string
+		if preferIPv6 {
+			defaultTargets = DefaultWarmDCTargetsIPv6
+		} else {
+			defaultTargets = DefaultWarmDCTargetsIPv4
+		}
+		for _, tgt := range defaultTargets {
+			targetSet[tgt] = struct{}{}
+		}
+		targets := make([]string, 0, len(targetSet))
+		for tgt := range targetSet {
+			targets = append(targets, tgt)
+		}
+		result.warmDCPool = NewWarmDCPool(WarmDCPoolOptions{
+			Targets:       targets,
+			SizePerTarget: maxWarmSize,
+			MaxIdleAge:    45 * time.Second,
+			DialTimeout:   value.Timeouts.BackendDial.Value(),
+			CheckInterval: 5 * time.Second,
+			AllowLoopback: false,
+		})
+	}
+
 	go result.cleanupLoop()
 	return result
 }
@@ -296,6 +356,7 @@ func (m *Manager) Create(token, clientIP string, body []byte) (CreateResult, err
 		},
 		onUp:   func(count int) { m.bytesUp.Add(uint64(count)) },
 		onDown: func(count int) { m.bytesDown.Add(uint64(count)) },
+		warmDCPool: m.warmDCPool,
 	})
 	created.tokenHash = sessionHash
 	created.resumeHash = resumeHash
@@ -513,6 +574,13 @@ func (m *Manager) Shutdown() {
 		value.wait()
 	}
 	<-m.done
+	if m.warmDCPool != nil {
+		m.warmDCPool.Close()
+	}
+}
+
+func (m *Manager) WarmDCPool() *WarmDCPool {
+	return m.warmDCPool
 }
 
 func (m *Manager) sessionFinished(value *Session) {

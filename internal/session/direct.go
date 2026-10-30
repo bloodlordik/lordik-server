@@ -1,6 +1,7 @@
 package session
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -12,8 +13,9 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
-
 	"github.com/telegramdesktop/tproxy-server/internal/config"
 	"github.com/telegramdesktop/tproxy-server/internal/logger"
 )
@@ -423,21 +425,37 @@ func (s *backendStream) runDirect() {
 		"target", targetAddress,
 	)
 
-	// 4. Dial target DC
-	dialer := net.Dialer{
-		Timeout:   s.session.timeouts.BackendDial.Value(),
-		KeepAlive: 30 * time.Second,
+	// 4. Dial target DC (or take pre-warmed connection from pool)
+	var connection net.Conn
+	if s.session.warmDCPool != nil {
+		connection = s.session.warmDCPool.Get(targetAddress)
 	}
-	connection, err := dialer.DialContext(s.ctx, "tcp", targetAddress)
-	dialAccounted = true
-	s.session.backendDialFinished(err != nil && s.ctx.Err() == nil)
-	if err != nil {
-		if s.ctx.Err() == nil {
-			logger.Warn("direct telegram dc dial failed", "stream_id", s.id, "target", targetAddress, "dc", hsRes.DCIdx, "err", err)
+	if connection != nil {
+		dialAccounted = true
+		s.session.backendDialFinished(false)
+		logger.Debug("direct telegram dc using warm pooled connection", "stream_id", s.id, "target", targetAddress, "dc", hsRes.DCIdx)
+	} else {
+		dialer := net.Dialer{
+			Timeout:   s.session.timeouts.BackendDial.Value(),
+			KeepAlive: 30 * time.Second,
 		}
-		return
+		var err error
+		connection, err = dialer.DialContext(s.ctx, "tcp", targetAddress)
+		dialAccounted = true
+		s.session.backendDialFinished(err != nil && s.ctx.Err() == nil)
+		if err != nil {
+			if s.ctx.Err() == nil {
+				logger.Warn("direct telegram dc dial failed", "stream_id", s.id, "target", targetAddress, "dc", hsRes.DCIdx, "err", err)
+			}
+			return
+		}
+		if tcpConn, ok := connection.(*net.TCPConn); ok {
+			_ = tcpConn.SetNoDelay(true)
+			_ = tcpConn.SetKeepAlive(true)
+			_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		}
+		logger.Debug("direct telegram dc connected", "stream_id", s.id, "target", targetAddress, "dc", hsRes.DCIdx)
 	}
-	logger.Debug("direct telegram dc connected", "stream_id", s.id, "target", targetAddress, "dc", hsRes.DCIdx)
 	s.connMu.Lock()
 	if s.ctx.Err() != nil {
 		s.connMu.Unlock()
@@ -594,4 +612,420 @@ func (s *backendStream) directReadLoop(connection net.Conn, clientEnc, tgDec cip
 			return
 		}
 	}
+}
+
+// DefaultWarmDCTargetsIPv4 contains standard Telegram DC endpoints for pre-warming.
+var DefaultWarmDCTargetsIPv4 = []string{
+	"149.154.167.51:443",  // DC 2 (Main)
+	"149.154.167.151:443", // DC -2 (Media DC2)
+	"149.154.167.91:443",  // DC 4 (Main)
+	"149.154.166.120:443", // DC -4 (Media DC4)
+	"149.154.175.50:443",  // DC 1 / DC -1
+	"149.154.175.100:443", // DC 3 / DC -3
+	"149.154.171.5:443",   // DC 5 / DC -5
+}
+
+// DefaultWarmDCTargetsIPv6 contains standard IPv6 Telegram DC endpoints for pre-warming.
+var DefaultWarmDCTargetsIPv6 = []string{
+	"[2001:67c:04e8:f002::a]:443", // DC 2 / DC -2
+	"[2001:67c:04e8:f004::a]:443", // DC 4 / DC -4
+	"[2001:b28:f23d:f001::a]:443", // DC 1 / DC -1
+	"[2001:b28:f23d:f003::a]:443", // DC 3 / DC -3
+	"[2001:b28:f23f:f005::a]:443", // DC 5 / DC -5
+}
+
+// WarmDCPoolOptions configures background pre-warmed TCP connections to Telegram DCs.
+type WarmDCPoolOptions struct {
+	Targets       []string
+	SizePerTarget int
+	MaxIdleAge    time.Duration
+	DialTimeout   time.Duration
+	CheckInterval time.Duration
+	AllowLoopback bool
+}
+
+type warmItem struct {
+	conn      net.Conn
+	createdAt time.Time
+}
+
+// WarmDCPool maintains pre-connected TCP sockets to Telegram DCs to eliminate dial latency.
+type WarmDCPool struct {
+	mu           sync.Mutex
+	opts         WarmDCPoolOptions
+	queues       map[string]chan *warmItem
+	inFlight     map[string]int
+	lastFail     map[string]time.Time
+	refillSignal chan string
+	stop         chan struct{}
+	cancel       context.CancelFunc
+	ctx          context.Context
+	wg           sync.WaitGroup
+	closed       bool
+	hits         atomic.Uint64
+	misses       atomic.Uint64
+}
+
+func isLoopbackTarget(target string) bool {
+	host, _, err := net.SplitHostPort(target)
+	if err != nil {
+		host = target
+	}
+	host = strings.Trim(host, "[]")
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" || strings.HasPrefix(host, "127.") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func isConnAlive(conn net.Conn) bool {
+	if conn == nil {
+		return false
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(500 * time.Microsecond))
+	var b [1]byte
+	n, err := conn.Read(b[:])
+	_ = conn.SetReadDeadline(time.Time{})
+	if n > 0 {
+		return false
+	}
+	if err != nil {
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return true
+		}
+		return false
+	}
+	return true
+}
+
+// NewWarmDCPool creates and starts a background pool of pre-warmed TCP sockets to Telegram DCs.
+func NewWarmDCPool(opts WarmDCPoolOptions) *WarmDCPool {
+	if opts.SizePerTarget <= 0 {
+		return nil
+	}
+	if opts.MaxIdleAge <= 0 {
+		opts.MaxIdleAge = 45 * time.Second
+	}
+	if opts.DialTimeout <= 0 {
+		opts.DialTimeout = 5 * time.Second
+	}
+	if opts.CheckInterval <= 0 {
+		opts.CheckInterval = 5 * time.Second
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	pool := &WarmDCPool{
+		opts:         opts,
+		queues:       make(map[string]chan *warmItem),
+		inFlight:     make(map[string]int),
+		lastFail:     make(map[string]time.Time),
+		refillSignal: make(chan string, 128),
+		stop:         make(chan struct{}),
+		ctx:          ctx,
+		cancel:       cancel,
+	}
+
+	for _, target := range opts.Targets {
+		target = strings.TrimSpace(target)
+		if target == "" {
+			continue
+		}
+		if !opts.AllowLoopback && isLoopbackTarget(target) {
+			continue
+		}
+		pool.queues[target] = make(chan *warmItem, opts.SizePerTarget)
+	}
+
+	pool.wg.Add(1)
+	go pool.run()
+
+	for target := range pool.queues {
+		select {
+		case pool.refillSignal <- target:
+		default:
+		}
+	}
+
+	return pool
+}
+
+// Get retrieves an idle, pre-warmed connection to the target DC, or nil if none is ready.
+func (p *WarmDCPool) Get(target string) net.Conn {
+	if p == nil {
+		return nil
+	}
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return nil
+	}
+
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil
+	}
+
+	ch, ok := p.queues[target]
+	if !ok {
+		if !p.opts.AllowLoopback && isLoopbackTarget(target) {
+			p.mu.Unlock()
+			return nil
+		}
+		ch = make(chan *warmItem, p.opts.SizePerTarget)
+		p.queues[target] = ch
+		select {
+		case p.refillSignal <- target:
+		default:
+		}
+	}
+	p.mu.Unlock()
+
+	maxAge := p.opts.MaxIdleAge
+	if maxAge <= 0 {
+		maxAge = 45 * time.Second
+	}
+
+	for {
+		var item *warmItem
+		select {
+		case item = <-ch:
+		default:
+			p.misses.Add(1)
+			select {
+			case p.refillSignal <- target:
+			default:
+			}
+			return nil
+		}
+
+		if item == nil || item.conn == nil {
+			continue
+		}
+
+		if time.Since(item.createdAt) > maxAge {
+			_ = item.conn.Close()
+			continue
+		}
+
+		if !isConnAlive(item.conn) {
+			_ = item.conn.Close()
+			continue
+		}
+
+		p.hits.Add(1)
+		select {
+		case p.refillSignal <- target:
+		default:
+		}
+		return item.conn
+	}
+}
+
+func (p *WarmDCPool) run() {
+	defer p.wg.Done()
+	ticker := time.NewTicker(p.opts.CheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-p.stop:
+			return
+		case <-p.ctx.Done():
+			return
+		case target := <-p.refillSignal:
+			p.refillTarget(target)
+		case <-ticker.C:
+			p.periodicMaintenance()
+		}
+	}
+}
+
+func (p *WarmDCPool) refillTarget(target string) {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
+	ch, ok := p.queues[target]
+	if !ok || ch == nil {
+		p.mu.Unlock()
+		return
+	}
+	if len(ch)+p.inFlight[target] >= p.opts.SizePerTarget {
+		p.mu.Unlock()
+		return
+	}
+	if failTime, failed := p.lastFail[target]; failed && time.Since(failTime) < 10*time.Second {
+		p.mu.Unlock()
+		return
+	}
+	p.inFlight[target]++
+	p.wg.Add(1)
+	p.mu.Unlock()
+
+	go func() {
+		defer p.wg.Done()
+		p.dialOne(target)
+	}()
+}
+
+func (p *WarmDCPool) dialOne(target string) {
+	dialTimeout := p.opts.DialTimeout
+	if dialTimeout <= 0 {
+		dialTimeout = 5 * time.Second
+	}
+	dialer := net.Dialer{
+		Timeout:   dialTimeout,
+		KeepAlive: 30 * time.Second,
+	}
+	dialCtx, cancel := context.WithTimeout(p.ctx, dialTimeout)
+	conn, err := dialer.DialContext(dialCtx, "tcp", target)
+	cancel()
+
+	p.mu.Lock()
+	p.inFlight[target]--
+	if err != nil {
+		p.lastFail[target] = time.Now()
+		p.mu.Unlock()
+		logger.Debug("warm dc pool dial failed", "target", target, "err", err)
+		return
+	}
+	delete(p.lastFail, target)
+
+	if p.closed {
+		p.mu.Unlock()
+		_ = conn.Close()
+		return
+	}
+
+	ch, ok := p.queues[target]
+	if !ok {
+		p.mu.Unlock()
+		_ = conn.Close()
+		return
+	}
+
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+
+	select {
+	case ch <- &warmItem{conn: conn, createdAt: time.Now()}:
+		needMore := len(ch)+p.inFlight[target] < p.opts.SizePerTarget
+		p.mu.Unlock()
+		if needMore {
+			select {
+			case p.refillSignal <- target:
+			default:
+			}
+		}
+	default:
+		p.mu.Unlock()
+		_ = conn.Close()
+	}
+}
+
+func (p *WarmDCPool) periodicMaintenance() {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
+	targets := make([]string, 0, len(p.queues))
+	for target := range p.queues {
+		targets = append(targets, target)
+	}
+	maxAge := p.opts.MaxIdleAge
+	p.mu.Unlock()
+
+	if maxAge <= 0 {
+		maxAge = 45 * time.Second
+	}
+
+	for _, target := range targets {
+		p.mu.Lock()
+		ch := p.queues[target]
+		p.mu.Unlock()
+		if ch == nil {
+			continue
+		}
+
+		numItems := len(ch)
+		for i := 0; i < numItems; i++ {
+			var item *warmItem
+			select {
+			case item = <-ch:
+			default:
+				break
+			}
+			if item == nil || item.conn == nil {
+				continue
+			}
+			if time.Since(item.createdAt) > maxAge || !isConnAlive(item.conn) {
+				_ = item.conn.Close()
+				continue
+			}
+			select {
+			case ch <- item:
+			default:
+				_ = item.conn.Close()
+			}
+		}
+
+		p.refillTarget(target)
+	}
+}
+
+// Close gracefully shuts down the pool and closes all open idle sockets.
+func (p *WarmDCPool) Close() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
+	p.closed = true
+	p.cancel()
+	close(p.stop)
+	p.mu.Unlock()
+
+	p.wg.Wait()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, ch := range p.queues {
+		for {
+			select {
+			case item := <-ch:
+				if item != nil && item.conn != nil {
+					_ = item.conn.Close()
+				}
+			default:
+				goto drained
+			}
+		}
+	drained:
+	}
+}
+
+// Hits returns the count of successful warm connection acquisitions.
+func (p *WarmDCPool) Hits() uint64 {
+	if p == nil {
+		return 0
+	}
+	return p.hits.Load()
+}
+
+// Misses returns the count of times a connection was not immediately available in the pool.
+func (p *WarmDCPool) Misses() uint64 {
+	if p == nil {
+		return 0
+	}
+	return p.misses.Load()
 }

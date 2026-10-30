@@ -476,3 +476,345 @@ func TestDirectBackendStreamEndToEnd(t *testing.T) {
 		t.Fatalf("downlink decrypted payload mismatch: expected %q, got %q", dcPlainResp, decryptedDownlink)
 	}
 }
+
+func TestWarmDCPoolBasic(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer ln.Close()
+
+	var serverConns []net.Conn
+	stopServer := make(chan struct{})
+	defer func() {
+		close(stopServer)
+		for _, c := range serverConns {
+			_ = c.Close()
+		}
+	}()
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			serverConns = append(serverConns, conn)
+		}
+	}()
+
+	target := ln.Addr().String()
+	pool := NewWarmDCPool(WarmDCPoolOptions{
+		Targets:       []string{target},
+		SizePerTarget: 2,
+		MaxIdleAge:    5 * time.Second,
+		DialTimeout:   time.Second,
+		CheckInterval: 50 * time.Millisecond,
+		AllowLoopback: true,
+	})
+	if pool == nil {
+		t.Fatal("expected non-nil pool")
+	}
+	defer pool.Close()
+
+	// Wait for pool to pre-warm connection
+	var conn net.Conn
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		conn = pool.Get(target)
+		if conn != nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if conn == nil {
+		t.Fatal("expected warm connection from pool, got nil")
+	}
+	_ = conn.Close()
+
+	if pool.Hits() < 1 {
+		t.Fatalf("expected at least 1 hit, got %d", pool.Hits())
+	}
+
+	// Non-existent target should miss immediately
+	missConn := pool.Get("127.0.0.1:1")
+	if missConn != nil {
+		_ = missConn.Close()
+		t.Fatal("expected nil connection for unreachable target")
+	}
+	if pool.Misses() < 1 {
+		t.Fatalf("expected at least 1 miss, got %d", pool.Misses())
+	}
+}
+
+func TestWarmDCPoolStaleEviction(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan net.Conn, 10)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			accepted <- conn
+		}
+	}()
+
+	target := ln.Addr().String()
+	pool := NewWarmDCPool(WarmDCPoolOptions{
+		Targets:       []string{target},
+		SizePerTarget: 1,
+		MaxIdleAge:    100 * time.Millisecond,
+		DialTimeout:   time.Second,
+		CheckInterval: 50 * time.Millisecond,
+		AllowLoopback: true,
+	})
+	if pool == nil {
+		t.Fatal("expected non-nil pool")
+	}
+	defer pool.Close()
+
+	// Wait for first connection to arrive on server side
+	var srvConn net.Conn
+	select {
+	case srvConn = <-accepted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for server connection")
+	}
+
+	// Remote closes the socket (FIN)
+	_ = srvConn.Close()
+	time.Sleep(20 * time.Millisecond)
+
+	// Get() should detect EOF via isConnAlive, discard dead socket, and return nil
+	deadConn := pool.Get(target)
+	if deadConn != nil {
+		_ = deadConn.Close()
+		t.Fatal("expected dead connection to be evicted, got non-nil")
+	}
+}
+
+func TestWarmDCPoolShutdown(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+
+	pool := NewWarmDCPool(WarmDCPoolOptions{
+		Targets:       []string{ln.Addr().String()},
+		SizePerTarget: 4,
+		MaxIdleAge:    5 * time.Second,
+		DialTimeout:   time.Second,
+		CheckInterval: time.Second,
+		AllowLoopback: true,
+	})
+
+	time.Sleep(50 * time.Millisecond)
+	start := time.Now()
+	pool.Close()
+	elapsed := time.Since(start)
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("pool.Close took too long: %v", elapsed)
+	}
+
+	if c := pool.Get(ln.Addr().String()); c != nil {
+		_ = c.Close()
+		t.Fatal("expected nil after pool closed")
+	}
+}
+
+func TestDirectWithWarmPoolEndToEnd(t *testing.T) {
+	dcListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer dcListener.Close()
+	dcAddr := dcListener.Addr().String()
+
+	clientPlainMsg := []byte("hello from telegram client via warm pool")
+	dcPlainResp := []byte("rpc_result_from_dc_via_warm_pool")
+	dcDone := make(chan struct{})
+
+	go func() {
+		defer close(dcDone)
+		conn, err := dcListener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		tgHeader := make([]byte, 64)
+		if _, err := io.ReadFull(conn, tgHeader); err != nil {
+			t.Errorf("failed to read TG header: %v", err)
+			return
+		}
+
+		decPrekey := tgHeader[8:40]
+		decIV := tgHeader[40:56]
+		encPrekeyIV := make([]byte, 48)
+		for i := range encPrekeyIV {
+			encPrekeyIV[i] = tgHeader[55-i]
+		}
+		encPrekey := encPrekeyIV[:32]
+		encIV := encPrekeyIV[32:48]
+
+		readBlock, _ := aes.NewCipher(decPrekey)
+		readStream := cipher.NewCTR(readBlock, decIV)
+		writeBlock, _ := aes.NewCipher(encPrekey)
+		writeStream := cipher.NewCTR(writeBlock, encIV)
+
+		dummy := make([]byte, 64)
+		readStream.XORKeyStream(dummy, dummy)
+
+		encPayload := make([]byte, len(clientPlainMsg))
+		if _, err := io.ReadFull(conn, encPayload); err != nil {
+			t.Errorf("failed to read encrypted payload: %v", err)
+			return
+		}
+		decryptedClientMsg := make([]byte, len(encPayload))
+		readStream.XORKeyStream(decryptedClientMsg, encPayload)
+
+		if !bytes.Equal(decryptedClientMsg, clientPlainMsg) {
+			t.Errorf("TG DC received payload mismatch: expected %q, got %q", clientPlainMsg, decryptedClientMsg)
+			return
+		}
+
+		encResp := make([]byte, len(dcPlainResp))
+		writeStream.XORKeyStream(encResp, dcPlainResp)
+		_, _ = conn.Write(encResp)
+	}()
+
+	pool := NewWarmDCPool(WarmDCPoolOptions{
+		Targets:       []string{dcAddr},
+		SizePerTarget: 2,
+		MaxIdleAge:    5 * time.Second,
+		DialTimeout:   time.Second,
+		CheckInterval: 50 * time.Millisecond,
+		AllowLoopback: true,
+	})
+	if pool == nil {
+		t.Fatal("failed to initialize warm dc pool")
+	}
+	defer pool.Close()
+
+	// Wait for pool to connect
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		pool.mu.Lock()
+		ch := pool.queues[dcAddr]
+		count := len(ch)
+		pool.mu.Unlock()
+		if count > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	secretHex := "000102030405060708090a0b0c0d0e0f"
+	secretBytes, _ := hex.DecodeString(secretHex)
+
+	cfg := testConfig(dcAddr)
+	cfg.Profiles[0].BackendType = config.BackendDirect
+	cfg.Profiles[0].Secret = secretHex
+	cfg.Profiles[0].Backend = dcAddr
+	cfg.Timeouts.BackendDial = config.Duration(5 * time.Second)
+
+	sess := newSession(sessionOptions{
+		profile:    &cfg.Profiles[0],
+		limits:     cfg.Limits,
+		timeouts:   cfg.Timeouts,
+		warmDCPool: pool,
+	})
+	defer sess.Close()
+
+	openFrame := frame.Encode(frame.Open, 1, nil)
+	if _, err := sess.ProcessUp(1, openFrame); err != nil {
+		t.Fatalf("ProcessUp OPEN failed: %v", err)
+	}
+
+	clientHandshakeHeader := createTestClientHandshake(TagIntermediate, 2, secretBytes)
+	cDecPrekey := clientHandshakeHeader[8:40]
+	cDecIV := clientHandshakeHeader[40:56]
+	readHash := sha256.Sum256(append(append([]byte(nil), cDecPrekey...), secretBytes...))
+	cBlock, _ := aes.NewCipher(readHash[:])
+	cStream := cipher.NewCTR(cBlock, cDecIV)
+	dummy := make([]byte, 64)
+	cStream.XORKeyStream(dummy, dummy)
+	encClientMsg := make([]byte, len(clientPlainMsg))
+	cStream.XORKeyStream(encClientMsg, clientPlainMsg)
+
+	uplinkPayload := append(append([]byte(nil), clientHandshakeHeader...), encClientMsg...)
+	dataFrame := frame.Encode(frame.Data, 1, uplinkPayload)
+	if _, err := sess.ProcessUp(2, dataFrame); err != nil {
+		t.Fatalf("ProcessUp DATA failed: %v", err)
+	}
+
+	select {
+	case <-dcDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("mock TG DC timed out")
+	}
+
+	if pool.Hits() < 1 {
+		t.Fatalf("expected warm dc pool hits >= 1, got %d", pool.Hits())
+	}
+
+	// Poll downlink from session
+	cursor := uint64(0)
+	var receivedCiphertext []byte
+	pollDeadline := time.Now().Add(3 * time.Second)
+	for len(receivedCiphertext) == 0 && time.Now().Before(pollDeadline) {
+		downBatch, nextCursor, err := sess.Poll(context.Background(), cursor)
+		if err != nil {
+			t.Fatalf("Poll failed: %v", err)
+		}
+		cursor = nextCursor
+		frames, err := frame.ParseAll(downBatch, frame.MaxPayload)
+		if err != nil {
+			t.Fatalf("ParseAll downlink failed: %v", err)
+		}
+		for _, f := range frames {
+			if f.Type == frame.Data && f.StreamID == 1 {
+				receivedCiphertext = append(receivedCiphertext, f.Payload...)
+			}
+		}
+		if len(receivedCiphertext) == 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if len(receivedCiphertext) == 0 {
+		t.Fatal("no DATA frames received in downlink")
+	}
+
+	encPrekeyIV := make([]byte, 48)
+	for i := range encPrekeyIV {
+		encPrekeyIV[i] = clientHandshakeHeader[55-i]
+	}
+	writeHash := sha256.Sum256(append(append([]byte(nil), encPrekeyIV[:32]...), secretBytes...))
+	clientRespBlock, _ := aes.NewCipher(writeHash[:])
+	clientRespStream := cipher.NewCTR(clientRespBlock, encPrekeyIV[32:48])
+
+	decryptedDownlink := make([]byte, len(receivedCiphertext))
+	clientRespStream.XORKeyStream(decryptedDownlink, receivedCiphertext)
+
+	if !bytes.Equal(decryptedDownlink, dcPlainResp) {
+		t.Fatalf("downlink decrypted payload mismatch: expected %q, got %q", dcPlainResp, decryptedDownlink)
+	}
+}

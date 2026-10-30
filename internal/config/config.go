@@ -232,6 +232,7 @@ type Limits struct {
 	CDNStreamMaxDurationSecs  int `json:"cdn_stream_max_duration_secs"`
 	CDNStreamHeartbeatSecs    int `json:"cdn_stream_heartbeat_secs"`
 	CDNMaxUnackedBatches      int `json:"cdn_max_unacked_batches"`
+	WarmDCPoolSize            int `json:"warm_dc_pool_size"`
 }
 
 type Timeouts struct {
@@ -332,6 +333,7 @@ type ProfileLimits struct {
 	CDNStreamMaxDurationSecs int `json:"cdn_stream_max_duration_secs"`
 	CDNStreamHeartbeatSecs   int `json:"cdn_stream_heartbeat_secs"`
 	CDNMaxUnackedBatches     int `json:"cdn_max_unacked_batches"`
+	WarmDCPoolSize           int `json:"warm_dc_pool_size"`
 }
 
 type Profile struct {
@@ -423,6 +425,9 @@ func (limits ProfileLimits) WithDefaults(global Limits) ProfileLimits {
 	if result.CDNMaxUnackedBatches == 0 {
 		result.CDNMaxUnackedBatches = global.CDNMaxUnackedBatches
 	}
+	if result.WarmDCPoolSize == 0 {
+		result.WarmDCPoolSize = global.WarmDCPoolSize
+	}
 	return result
 }
 
@@ -464,6 +469,7 @@ func Defaults() Config {
 			CDNStreamMaxDurationSecs:  45,
 			CDNStreamHeartbeatSecs:    10,
 			CDNMaxUnackedBatches:      32,
+			WarmDCPoolSize:            2,
 		},
 		Timeouts: Timeouts{
 			BackendDial:       Duration(5 * time.Second),
@@ -603,6 +609,9 @@ func (c Config) validate() error {
 	}
 	if c.Limits.CDNMaxUnackedBatches < 4 || c.Limits.CDNMaxUnackedBatches > 128 {
 		return errors.New("cdn_max_unacked_batches must be between 4 and 128")
+	}
+	if c.Limits.WarmDCPoolSize < 0 {
+		return errors.New("warm_dc_pool_size must be non-negative")
 	}
 	values := []int{
 		c.Limits.MaxStreamsPerSession, c.Limits.MaxClosedStreamIDs,
@@ -1108,6 +1117,9 @@ func validateProfileLimits(value ProfileLimits, global Limits) error {
 	}
 	if value.CDNMaxUnackedBatches < 0 || value.CDNMaxUnackedBatches > 128 {
 		return errors.New("cdn_max_unacked_batches must be between 0 and 128")
+	}
+	if value.WarmDCPoolSize < 0 {
+		return errors.New("warm_dc_pool_size must be non-negative")
 	}
 	resolved := value.WithDefaults(global)
 	if resolved.MaxStreamsPerSession > resolved.MaxStreams {
