@@ -14,10 +14,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
-	"runtime"
 	"time"
+
 	"github.com/telegramdesktop/tproxy-server/internal/logger"
 )
 
@@ -161,6 +162,7 @@ func (p *BackendProxyProtocol) UnmarshalJSON(input []byte) error {
 	*p = normalized
 	return nil
 }
+
 type StaticDC string
 
 func (s *StaticDC) UnmarshalJSON(input []byte) error {
@@ -250,6 +252,7 @@ type LoggingConfig struct {
 	Prefix  string `json:"prefix"`
 	MaxDays int    `json:"max_days"`
 }
+
 func (l LoggingConfig) ToLoggerOptions() logger.Options {
 	prefix := l.Prefix
 	if prefix == "" {
@@ -265,8 +268,6 @@ func (l LoggingConfig) ToLoggerOptions() logger.Options {
 		MaxDays: l.MaxDays,
 	}
 }
-
-
 
 type Config struct {
 	PublicHostname       string               `json:"public_hostname"`
@@ -316,18 +317,18 @@ type profileInput struct {
 }
 
 type ProfileLimits struct {
-	MaxSessions             int `json:"max_sessions"`
-	MaxStreams              int `json:"max_streams"`
-	MaxBackendDialsInFlight int `json:"max_backend_dials_in_flight"`
-	NewSessionsPerMinute    int `json:"new_sessions_per_minute"`
-	NewSessionsBurst        int `json:"new_sessions_burst"`
-	NewStreamsPerMinute     int `json:"new_streams_per_minute"`
-	NewStreamsBurst         int `json:"new_streams_burst"`
-	MaxStreamsPerSession    int `json:"max_streams_per_session"`
-	MaxPendingPerSession    int `json:"max_pending_per_session"`
-	CDNPollTimeoutSecs      int `json:"cdn_poll_timeout_secs"`
-	CDNMaxDownBatchBytes    int `json:"cdn_max_down_batch_bytes"`
-	CDNUplinkWindowSize     int `json:"cdn_uplink_window_size"`
+	MaxSessions              int `json:"max_sessions"`
+	MaxStreams               int `json:"max_streams"`
+	MaxBackendDialsInFlight  int `json:"max_backend_dials_in_flight"`
+	NewSessionsPerMinute     int `json:"new_sessions_per_minute"`
+	NewSessionsBurst         int `json:"new_sessions_burst"`
+	NewStreamsPerMinute      int `json:"new_streams_per_minute"`
+	NewStreamsBurst          int `json:"new_streams_burst"`
+	MaxStreamsPerSession     int `json:"max_streams_per_session"`
+	MaxPendingPerSession     int `json:"max_pending_per_session"`
+	CDNPollTimeoutSecs       int `json:"cdn_poll_timeout_secs"`
+	CDNMaxDownBatchBytes     int `json:"cdn_max_down_batch_bytes"`
+	CDNUplinkWindowSize      int `json:"cdn_uplink_window_size"`
 	CDNStreamMaxDurationSecs int `json:"cdn_stream_max_duration_secs"`
 	CDNStreamHeartbeatSecs   int `json:"cdn_stream_heartbeat_secs"`
 	CDNMaxUnackedBatches     int `json:"cdn_max_unacked_batches"`

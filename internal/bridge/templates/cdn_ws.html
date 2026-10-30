@@ -21,9 +21,9 @@ let probeConsecutiveTimeouts=0;
 const pending=[],upPending=[],fastPending=[];
 let slicingInProgress=false;
 const queueLimit=33554432,queueItemLimit=16384,batchLimit=__BATCH_LIMIT__;
-let upSeq=1,downCursor=0,upInflight=0,maxInflight=6;
-const maxChunkBytes=4500;
-const maxWindowSpan=14;
+let upSeq=1,downCursor=0,upInflight=0,maxInflight=8;
+const maxChunkBytes=6000;
+const maxWindowSpan=32;
 const inflightSeqs=new Set();
 let debounceTimer=0;
 let lastSentAckCursor=0;
@@ -131,7 +131,7 @@ function deliver(batchBuf){
  try{frames=splitFrames(batchBuf)}catch(e){return}
  for(const frame of frames){
   if(frame.type===0x03)activeStreams.delete(frame.id);
-  port.postMessage(frame.data);
+  port.postMessage(frame.data,[frame.data]);
  }
 }
 
@@ -220,7 +220,7 @@ async function createSession(helloBuf){
 
  status('connected');
  startStreamLoop();
- scheduleFlush();
+ flushUplink();
 }
 
 function canAdvanceWindow(){
@@ -242,8 +242,6 @@ function queueCarrier(buf){
  queuedBytes+=buf.byteLength;
  queuedItems++;
  const arr=new Uint8Array(buf);
- // Короткие интерактивные и управляющие кадры (OPEN, CLOSE, WINDOW, мелкие RPC <= 1024 байт)
- // идут в приоритетную очередь fastPending, чтобы не стоять за 64 КиБ чанками медиа!
  if(arr.byteLength<=1024){
   fastPending.push(arr);
  }else{
@@ -266,8 +264,6 @@ function scheduleFlush(){
 
 function flushUplink(){
  while(!closed&&sessionToken&&hasPendingUplink()&&upInflight<maxInflight&&canAdvanceWindow()){
-  // Если есть тяжелые медиа-кадры, оставляем 1 резервный слот для быстрых кадров (WINDOW/OPEN/Text),
-  // если сейчас мы на границе целого кадра (!slicingInProgress) и fastPending пуст.
   if(!slicingInProgress&&fastPending.length===0&&upPending.length>0&&upInflight>=maxInflight-1&&maxInflight>1){
    break;
   }
@@ -276,8 +272,6 @@ function flushUplink(){
   const parts=[];
 
   while(hasPendingUplink()&&total<maxChunkBytes&&parts.length<64){
-   // Берем из fastPending только тогда, когда мы НЕ находимся внутри разрезанного 64 КиБ кадра!
-   // Это гарантирует, что заголовок и тело крупного кадра никогда не разорвутся чужим кадром.
    const useFast=!slicingInProgress&&fastPending.length>0;
    const queue=useFast?fastPending:upPending;
    const head=queue[0];
@@ -329,8 +323,8 @@ async function sendChunkWithBackoff(seq,buf,retry){
  const dataHeaders=[];
  let roff=0,hidx=0;
  while(roff<remaining.length&&hidx<8){
-  dataHeaders.push(['X-Client-Data-'+hidx,remaining.slice(roff,roff+2048)]);
-  roff+=2048;hidx++;
+  dataHeaders.push(['X-Client-Data-'+hidx,remaining.slice(roff,roff+3000)]);
+  roff+=3000;hidx++;
  }
 
  while(!closed){
@@ -339,8 +333,7 @@ async function sendChunkWithBackoff(seq,buf,retry){
   const reqId=seq+'.'+cur+'.'+retry;
   let success=false;
   const ctrl=new AbortController();
-  // Короткий таймаут 3500 мс на первой попытке быстро сбрасывает "залипшие" потоки CDN без 10-секундных фризов!
-  const timeoutMs=retry===0?3500:5500;
+  const timeoutMs=retry===0?2500:5000;
   const reqTimer=setTimeout(()=>ctrl.abort(),timeoutMs);
   upControllers.add(ctrl);
   try{
@@ -353,7 +346,6 @@ async function sendChunkWithBackoff(seq,buf,retry){
    for(let i=0;i<dataHeaders.length;i++){
     headers[dataHeaders[i][0]]=dataHeaders[i][1];
    }
-   // При retry > 0 добавляем уникальный суффикс &r=, чтобы CDN не склеивал ретрай с зависшим первым запросом
    const retrySuffix=retry>0?'&r='+retry+'_'+((Math.random()*0xffff)|0).toString(16):'';
    const getUrl=relayBase+'assets/chunks/'+shortId+'/'+seq+'.bin?p='+encodeURIComponent(urlPart)+retrySuffix;
    const res=await fetch(getUrl,{
@@ -407,7 +399,7 @@ async function sendChunkWithBackoff(seq,buf,retry){
    fail();
    return;
   }
-  const delay=isBg?2000:Math.min(1200,40*(1<<Math.min(retry,5)))+(Math.random()*40|0);
+  const delay=isBg?2000:Math.min(1000,35*(1<<Math.min(retry,5)))+(Math.random()*35|0);
   await pause(delay);
  }
  inflightSeqs.delete(seq);
@@ -418,6 +410,7 @@ async function sendAckOnly(){
  if(closed||!sessionToken||ackInflight)return;
  ackInflight=true;
  const cur=downCursor;
+ lastSentAckCursor=cur;
  const randHex=(Math.random()*0xffffffff>>>0).toString(16);
  const ackUrl=relayBase+'assets/chunks/'+shortId+'/0.bin?p=&r='+randHex;
  const ctrl=new AbortController();
@@ -445,6 +438,10 @@ async function sendAckOnly(){
  finally{
   clearTimeout(timer);
   ackInflight=false;
+  if(!closed&&sessionToken&&(downCursor-lastSentAckCursor)>=4){
+   if(hasPendingUplink()&&upInflight<maxInflight)flushUplink();
+   else sendAckOnly();
+  }
  }
 }
 
@@ -579,7 +576,7 @@ async function runStream(streamId){
     fail();return;
    }
    if(streamId===currentStreamId&&!closed){
-    await pause(300+(Math.random()*300|0));
+    await pause(150+(Math.random()*150|0));
     if(streamId===currentStreamId&&!closed){
      currentStreamId++;
      runStream(currentStreamId);
@@ -621,9 +618,12 @@ async function runStream(streamId){
     const isNew=((cursor-downCursor|0)>0)||downCursor===0;
     if(isNew)downCursor=cursor;
     if(isNew&&payloadBuf&&payloadBuf.byteLength>0)deliver(payloadBuf);
-    if((downCursor-lastSentAckCursor)>=8&&upInflight===0&&!hasPendingUplink()){
-     lastSentAckCursor=downCursor;
-     sendAckOnly();
+    if((downCursor-lastSentAckCursor)>=4){
+     if(hasPendingUplink()&&upInflight<maxInflight){
+      flushUplink();
+     }else{
+      sendAckOnly();
+     }
     }
    });
   }
@@ -655,7 +655,7 @@ async function runStream(streamId){
    }
   }
   if(streamId===currentStreamId&&!closed){
-   await pause(150+(Math.random()*200|0));
+   await pause(20+(Math.random()*30|0));
    if(streamId===currentStreamId&&!closed){
     currentStreamId++;
     runStream(currentStreamId);
@@ -750,8 +750,8 @@ function onWakeUp(isOnline){
  }
  if(hasPendingUplink()&&upInflight<maxInflight){
   flushUplink();
- }else if(upPending.length===0&&(isOnline||slept)){
-  sendAckOnly();
+ }else if(upPending.length===0){
+  if(isOnline||slept)sendAckOnly();
  }
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -452,7 +453,6 @@ func (s *Server) writeCDNDownlinkResponse(w http.ResponseWriter, batch []byte, c
 	_, _ = io.WriteString(w, resp)
 }
 
-
 func (s *Server) handleCDNSessionError(w http.ResponseWriter, r *http.Request, vhost *VHost, err error) {
 	if errors.Is(err, session.ErrBackpressure) || errors.Is(err, session.ErrConcurrent) || errors.Is(err, session.ErrLimit) {
 		w.Header().Set("Cache-Control", "no-store")
@@ -473,4 +473,41 @@ func (s *Server) serveCDNLegacy(w http.ResponseWriter, r *http.Request, suffix s
 		vhost = s.defaultVHost
 	}
 	s.serveCDN(w, r, vhost, suffix)
+}
+
+func writeCDNDownlinkResponse(w http.ResponseWriter, batch []byte, cursor uint64) {
+	h := w.Header()
+	h.Set("Cache-Control", "private, no-store, no-cache, max-age=0, must-revalidate")
+	h.Set("CDN-Cache-Control", "no-store")
+	h.Set("Cloudflare-CDN-Cache-Control", "no-store")
+	h.Set("Surrogate-Control", "no-store")
+	h.Set("Pragma", "no-cache")
+	h.Set("X-Accel-Buffering", "no")
+
+	var curBuf [24]byte
+	curStr := string(strconv.AppendUint(curBuf[:0], cursor, 10))
+	h.Set("X-Down-Cursor", curStr)
+
+	if len(batch) > 0 {
+		h.Set("Content-Type", "model/gltf-binary")
+		h.Set("Content-Length", strconv.Itoa(session.GLTFHeaderSize+len(batch)))
+		w.WriteHeader(http.StatusOK)
+
+		var hdr [12]byte
+		hdr[0], hdr[1], hdr[2], hdr[3] = 'g', 'l', 'T', 'F'
+		binary.LittleEndian.PutUint32(hdr[4:8], 2)
+		binary.BigEndian.PutUint32(hdr[8:12], uint32(cursor))
+		_, _ = w.Write(hdr[:])
+		_, _ = w.Write(batch)
+		return
+	}
+
+	h.Set("Content-Type", "application/json; charset=utf-8")
+	var jsonBuf [48]byte
+	b := append(jsonBuf[:0], `{"s":1,"c":`...)
+	b = strconv.AppendUint(b, cursor, 10)
+	b = append(b, '}')
+	h.Set("Content-Length", strconv.Itoa(len(b)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(b)
 }

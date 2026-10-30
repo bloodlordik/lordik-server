@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+
 	"github.com/telegramdesktop/tproxy-server/internal/config"
 	"github.com/telegramdesktop/tproxy-server/internal/frame"
 	"github.com/telegramdesktop/tproxy-server/internal/logger"
@@ -222,17 +223,18 @@ func (s *Session) ShortID() string {
 func (s *Session) RawSecret() []byte {
 	return s.rawSecret
 }
+
 func (s *Session) ResumeToken() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.resumeToken
 }
+
 func (s *Session) IsClosed() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.closed
 }
-
 
 func (s *Session) LastUpSequence() uint64 {
 	s.mu.Lock()
@@ -386,6 +388,7 @@ func (s *Session) Resume(upSeq, downCursor uint64) (serverUpSeq, serverDownCurso
 	serverUpSeq = s.lastUpSequence + 1
 	return serverUpSeq, serverDownCursor, replay, nil
 }
+
 func (s *Session) ResumeLane(laneID uint32, upSeq, downCursor uint64) (serverUpSeq, serverDownCursor uint64, replay []byte, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -425,7 +428,6 @@ func (s *Session) ResumeLane(laneID uint32, upSeq, downCursor uint64) (serverUpS
 	serverUpSeq = lane.lastUpSequence + 1
 	return serverUpSeq, serverDownCursor, replay, nil
 }
-
 
 func (s *Session) AcquireWebSocket() bool {
 	s.mu.Lock()
@@ -610,11 +612,6 @@ func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (ui
 	if lane == nil {
 		if laneID != 0 && len(frames) != 0 && frames[0].Type != frame.Open &&
 			s.onlyLateFrames(frames) {
-			// The lane's tombstone has already been evicted (or the client
-			// remembers a close the relay no longer does): well-formed late
-			// DATA, WINDOW or CLOSE frames are ignored and acknowledged, the
-			// same as for a remembered tombstone, instead of killing the
-			// session.
 			s.lastActivity = time.Now()
 			s.mu.Unlock()
 			return sequence, nil
@@ -725,11 +722,6 @@ func (s *Session) Poll(ctx context.Context, cursor uint64) ([]byte, uint64, erro
 		s.protocolFailure()
 		return nil, cursor, ErrProtocol
 	}
-	// Newest poll wins: a poll arriving while another one is parked (its
-	// connection most likely died silently) takes over, and the older waiter
-	// returns an empty batch with its own cursor — harmless if that
-	// connection is still alive, unobserved if it is dead — instead of the
-	// newer poll being refused.
 	if s.downActive && s.superseded != nil {
 		close(s.superseded)
 	}
@@ -796,7 +788,6 @@ func (s *Session) Poll(ctx context.Context, cursor uint64) ([]byte, uint64, erro
 		case <-s.notify:
 			s.mu.Lock()
 			if s.superseded != mine {
-				// This wake-up belonged to the poll that took over.
 				signal(s.notify)
 			}
 		}
@@ -937,6 +928,7 @@ func (s *Session) PollLane(ctx context.Context, laneID uint32, cursor uint64) ([
 		}
 	}
 }
+
 // ProcessUpCDN processes a numbered uplink chunk for CDN carriers using ReassemblyBuffer.
 // Returns readyFramesCount (number of complete frames applied), or an error.
 func (s *Session) ProcessUpCDN(sequence uint64, chunk []byte) (int, error) {
@@ -1022,8 +1014,6 @@ func (s *Session) PiggybackDown(cursor uint64) ([]byte, uint64, error) {
 	return s.PiggybackDownWait(cursor, false)
 }
 
-// PiggybackDownWait attempts a harvest of downlink frames, optionally micro-waiting up to 5ms
-// if coalesce is true, no poll is active, and no frames are immediately available.
 func (s *Session) ackCursorLocked(ackCursor uint64) {
 	if ackCursor > s.downCursor {
 		return
@@ -1035,6 +1025,7 @@ func (s *Session) ackCursorLocked(ackCursor uint64) {
 		if s.unackedBatches[i].cursor <= ackCursor {
 			freedCost += s.unackedBatches[i].cost
 			freedItems += s.unackedBatches[i].items
+			s.unackedBatches[i] = sentBatch{} // Явно очищаем ссылку на слайс body для GC
 			freedCount++
 		} else {
 			break
@@ -1043,6 +1034,9 @@ func (s *Session) ackCursorLocked(ackCursor uint64) {
 	if freedCount > 0 {
 		s.releasePendingLocked(freedCost, freedItems)
 		s.unackedBatches = s.unackedBatches[freedCount:]
+		if len(s.unackedBatches) == 0 {
+			s.unackedBatches = nil
+		}
 		s.unackedCost -= freedCost
 		s.unackedItems -= freedItems
 		if s.unackedCost < 0 {
@@ -1074,8 +1068,8 @@ func (s *Session) ackCursorLocked(ackCursor uint64) {
 	}
 }
 
-// PiggybackDownWait attempts a harvest of downlink frames, optionally micro-waiting up to 5ms
-// if coalesce is true, no poll is active, and no frames are immediately available.
+// PiggybackDownWait attempts a harvest of downlink frames, optionally micro-waiting
+// if coalesce is true, no poll/stream is active, and no frames are immediately available.
 func (s *Session) PiggybackDownWait(cursor uint64, coalesce bool) ([]byte, uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1107,7 +1101,7 @@ func (s *Session) PiggybackDownWait(cursor uint64, coalesce bool) ([]byte, uint6
 	// 5. Adaptive micro-wait when requested by client and no poll is active:
 	// wait for backend DATA/CLOSE frame to bundle with WINDOW ack.
 	// For direct backend, TCP dial + MTProto resPQ takes ~30-100ms.
-	if coalesce && !s.hasPendingDataOrCloseLocked() && !s.cdnReassembly.HasHoles() {
+	if coalesce && !s.hasPendingDataOrCloseLocked() && (s.cdnReassembly == nil || !s.cdnReassembly.HasHoles()) {
 		waitDur := 40 * time.Millisecond
 		if s.profile != nil && s.profile.BackendType == config.BackendDirect {
 			waitDur = 150 * time.Millisecond
@@ -1348,11 +1342,12 @@ func (s *Session) StreamCDN(ctx context.Context, startCursor uint64, onBatch fun
 		s.mu.Unlock()
 	}()
 
-	// 1. Zero-Loss Replay for any remaining unacknowledged batches
+	// 1. Zero-Loss Replay for any remaining unacknowledged batches with cursor > startCursor
 	var toReplay []sentBatch
-	if len(s.unackedBatches) > 0 {
-		toReplay = make([]sentBatch, len(s.unackedBatches))
-		copy(toReplay, s.unackedBatches)
+	for _, b := range s.unackedBatches {
+		if b.cursor > startCursor {
+			toReplay = append(toReplay, b)
+		}
 	}
 	s.mu.Unlock()
 
@@ -1540,7 +1535,6 @@ func (s *Session) takeDownBatchLimitLocked(maxBytes int) downBatch {
 	}
 	return downBatch{body: result, cost: cost, items: count}
 }
-
 
 func (s *Session) LastActivity() time.Time {
 	s.mu.Lock()
@@ -1787,6 +1781,7 @@ func (s *Session) nextWrite(id uint32, done <-chan struct{}) ([]byte, bool) {
 		}
 	}
 }
+
 func (s *Session) nextWrites(id uint32, done <-chan struct{}) ([][]byte, bool) {
 	for {
 		s.mu.Lock()
@@ -1816,7 +1811,6 @@ func (s *Session) nextWrites(id uint32, done <-chan struct{}) ([][]byte, bool) {
 		}
 	}
 }
-
 
 func (s *Session) backendDrained(id uint32, amount int) bool {
 	s.mu.Lock()
@@ -2036,9 +2030,6 @@ func (s *Session) queueLaneFrameLocked(t frame.Type, id uint32, payload []byte) 
 	return true
 }
 
-// ValidateBudget rejects a configuration whose per-session control reserve,
-// multiplied across every session, would leave the global data budget at zero
-// (bytes or items) — a silent footgun that would starve every data frame.
 func ValidateBudget(cfg config.Config) error {
 	reserveCost, reserveItems := pendingControlReserve(cfg.Limits)
 	sessions := cfg.Limits.MaxSessionsGlobal
@@ -2234,10 +2225,6 @@ func (s *Session) rememberClosedLocked(id uint32) {
 	}
 }
 
-// releaseLaneLocked returns an evicted lane's still-charged pending and
-// unacked budget to the session and global pools and wakes any parked poller
-// so it observes the eviction instead of blocking until its deadline. Late
-// frames for the tombstoned id are then no-ops per PROTOCOL.md.
 func (s *Session) releaseLaneLocked(lane *carrierLane) {
 	cost := lane.unackedCost
 	items := lane.unackedItems
@@ -2416,6 +2403,9 @@ func (s *backendStream) run() {
 			logger.Warn("backend dial failed", "network", network, "target", target, "stream_id", s.id, "err", err)
 		}
 		return
+	}
+	if tcpConn, ok := connection.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
 	}
 	logger.Debug("backend connected", "network", network, "target", target, "stream_id", s.id)
 	s.connMu.Lock()
