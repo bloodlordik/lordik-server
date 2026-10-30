@@ -57,6 +57,18 @@
       "public_upstream": "http://127.0.0.1:8080",
       "trusted_host_header": "X-Forwarded-Host",
       "trusted_ip_header": "X-Forwarded-For"
+    },
+    {
+      "name": "yandex-cloud-gateway",
+      "secret": "707172737475767778797a7b7c7d7e7f",
+      "carrier_mode": "yc-ws",
+      "backend_type": "direct",
+      "backend": "auto",
+      "hostname": "gateway.yandexcloud.example.com",
+      "public_dir": "/var/www/decoy-yc",
+      "trusted_host_header": "X-Forwarded-Host",
+      "trusted_ip_header": "X-Forwarded-For",
+      "disable_ip_rate_limit": true
     }
   ]
 }

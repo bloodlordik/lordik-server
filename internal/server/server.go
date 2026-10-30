@@ -1236,7 +1236,7 @@ func (s *Server) resolveRequestHost(r *http.Request) string {
 	if host, _, err := net.SplitHostPort(directHost); err == nil {
 		directHost = host
 	}
-	directHost = strings.ToLower(directHost)
+	directHost = strings.TrimSuffix(strings.ToLower(directHost), ".")
 
 	// If directHost matches a trusted VHost or any VHost accepts a trusted host header
 	for _, vh := range s.trustedHostVHosts {
@@ -1249,7 +1249,7 @@ func (s *Server) resolveRequestHost(r *http.Request) string {
 				if host, _, err := net.SplitHostPort(fwd); err == nil {
 					fwd = host
 				}
-				fwd = strings.ToLower(fwd)
+				fwd = strings.TrimSuffix(strings.ToLower(fwd), ".")
 				if targetVH, ok := s.trustedHostVHosts[fwd]; ok && strings.EqualFold(targetVH.TrustedHostHeader, vh.TrustedHostHeader) {
 					return fwd
 				}

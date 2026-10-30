@@ -611,7 +611,8 @@ client secret, and numeric loopback backend:
 | `https-lanes` | independent POST sequence and long poll for every logical stream | mirrors Telegram TCP sessions and isolates latency; relies on HTTP/2 for many concurrent polls |
 | `websocket` | one ordered WebSocket multiplexing all streams | removes HTTP stop-and-wait with one connection; all streams share its TCP congestion and failure domain |
 | `websocket-lanes` | one ordered WebSocket for every logical stream | isolates browser and relay queues so bulk media does not block interactive streams; increases connection and handshake count |
-
+| `cdn-adaptive` / `cdn-ws` | Next.js/glTF mimicry with header sharding and HTTP streaming downlink | bypasses aggressive cloud CDN/WAF restrictions; see [`docs/CDN_TRANSPORT_SPEC.md`](docs/CDN_TRANSPORT_SPEC.md) |
+| `yc-ws` | Yandex Cloud API Gateway hybrid carrier (WebSocket uplink + HTTP streaming downlink) | enables full duplex operation over YC API Gateway without IAM service keys; see [`docs/YC_WS_SPEC.md`](docs/YC_WS_SPEC.md) |
 The mode is selected through the secret/profile, so existing Desktop, Android, and
 iOS proof-of-concept clients need no new setting or client-side transport code. Use
 different secrets when exposing several modes on one hostname.

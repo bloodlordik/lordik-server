@@ -548,3 +548,22 @@ lordik-server/
       - Маршруты `/_yc/...` строго изолированы. Любой неавторизованный запрос, невалидный заголовок соединения или несовпадение VHost перенаправляет запрос на маскировочный decoy-сайт (`vhost.servePublic`) с кодом 404 без раскрытия прокси-сервера.
     - **Полная изоляция существующих режимов**:
       - Все существующие шаблоны (`cdn.html`, `cdn_ws.html`, `websocket.html`, `https.html`) и режимы (`cdn*`, `websocket*`, `https*`) остались полностью нетронутыми.
+29. **Особенности проксирования через Yandex Cloud API Gateway (HTTP Integration & Headers)**:
+    - **Компоненты**: Yandex Cloud API Gateway OpenAPI YAML, `internal/server/yc_ws.go`, `internal/server/server.go`, `internal/server/secrets.go`.
+    - **Специфика интеграции `x-yc-apigateway-integration: http`**:
+      - По умолчанию YC API Gateway **НЕ пересылает** query-параметры (кроме указанных явно) и заголовки клиента (кроме `User-Agent`). Запрос к `/?bridge=...` при стандартном `url: https://backend/` доходит до бэкенда с пустым query-стрингом, из-за чего `bridgeProfileForVHost` и `hasInternalSecret` возвращают `false` и отдают decoy/404.
+      - Для маршрутов `/:` и `/{proxy+}` в секции интеграции API Gateway **обязательно** указывать:
+        ```yaml
+        query:
+          '*': '*'
+        headers:
+          X-Forwarded-Host: '{host}'
+          X-Forwarded-For: '{sourceIp}'
+          X-Forwarded-Proto: 'https'
+          '*': '*'
+        ```
+      - Заголовок `X-Forwarded-Host: '{host}'` критичен для изоляции виртуальных хостов (VHost): без него `tproxy-server` получает `Host: gutter.locuslm.online` и отклоняет сессии профиля `d5d9....apigw.yandexcloud.net`.
+      - Для WebSocket эндпоинта `/_yc/ws` обязателен `query: '*': '*'` (для передачи токена сессии `?k=...` в `$connect`) и `headers: X-Yc-Apigateway-Websocket-Connection-Id: '{connectionId}'` (для связывания сокета с `Session`).
+      - **Критично при использовании `headers: '*': '*'`**:
+        Если в секции `headers` указан wildcard `'*': '*'`, YC API Gateway пересылает клиентский заголовок `Host` (`d5d9....apigw.yandexcloud.net`) на бэкенд и проверяет валидность SSL-сертификата апстрима против этого имени. Поскольку сертификат сервера выписан на `gutter.locuslm.online`, шлюз падает с ошибкой `503 Service Unavailable` (`Hostname/IP does not match certificate's altnames`).
+        **Решение**: в секции `headers` каждого маршрута интеграции необходимо явно переопределять `Host: gutter.locuslm.online` перед wildcard `'*': '*'`.
