@@ -247,7 +247,7 @@ func (s *Server) serveYCWSConnect(w http.ResponseWriter, r *http.Request, vhost 
 			token = tok
 		}
 	}
-	if connID == "" || token == "" {
+	if token == "" {
 		vhost.servePublic(w, r)
 		return
 	}
@@ -267,7 +267,9 @@ func (s *Server) serveYCWSConnect(w http.ResponseWriter, r *http.Request, vhost 
 		return
 	}
 
-	s.manager.BindYCWSConn(connID, sess)
+	if connID != "" {
+		s.manager.BindYCWSConn(connID, sess)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "private, no-store, no-cache, max-age=0, must-revalidate")
@@ -315,6 +317,9 @@ func (s *Server) serveYCWSMessage(w http.ResponseWriter, r *http.Request, vhost 
 	}
 	if sess == nil {
 		sess = s.resolveSession(r, "", vhost)
+		if sess != nil && connID != "" {
+			s.manager.BindYCWSConn(connID, sess)
+		}
 	}
 	if sess == nil || sess.IsClosed() {
 		vhost.servePublic(w, r)
