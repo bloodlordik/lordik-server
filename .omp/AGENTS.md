@@ -557,14 +557,14 @@ lordik-server/
         query:
           '*': '*'
         headers:
-          X-Forwarded-Host: '{host}'
+          X-Forwarded-Host: d5d9....apigw.yandexcloud.net
           X-Forwarded-For: '{sourceIp}'
           X-Forwarded-Proto: 'https'
           '*': '*'
         ```
-      - Заголовок `X-Forwarded-Host: '{host}'` критичен для изоляции виртуальных хостов (VHost): без него `tproxy-server` получает `Host: gutter.locuslm.online` и отклоняет сессии профиля `d5d9....apigw.yandexcloud.net`.
+      - Заголовок `X-Forwarded-Host: d5d9....apigw.yandexcloud.net` критичен для изоляции виртуальных хостов (VHost): без него `tproxy-server` получает `Host: gutter.locuslm.online` и отклоняет сессии профиля `d5d9....apigw.yandexcloud.net`. Плейсхолдер `{host}` шлюзом не интерполируется и передается буквально `"{host}"`.
       - **Специфика WebSocket эндпоинта `/_yc/ws`**:
         - Для `$connect` обязателен `query: '*': '*'` (для передачи токена сессии `?k=...`).
         - В секции `headers` для операций `x-yc-apigateway-websocket-*` **НЕЛЬЗЯ** указывать `'*': '*'`: это приводит к пересылке клиентских заголовков `Connection: Upgrade` и `Upgrade: websocket` в запросе `POST /_yc/ws/connect` по протоколу HTTP/2, что нарушает RFC 7540 и вызывает ошибку Nginx `RST_STREAM (PROTOCOL_ERROR)` (в логах Envoy: `502 reset reason: protocol error`).
         - Заголовок `X-Yc-Apigateway-Websocket-Connection-Id` шлюз передает **автоматически**. Указывать `X-Yc-Apigateway-Websocket-Connection-Id: '{connectionId}'` нельзя, так как `{connectionId}` не является переменной подстановки в OpenAPI и передается как буквальная строка `"{connectionId}"`.
-        - Рекомендуется указывать явный домен `X-Forwarded-Host: d5d9....apigw.yandexcloud.net`, либо использовать `{host}` (в `tproxy-server` добавлена авто-обработка плейсхолдера `{host}`).
+        - Обязательно указывать явный домен `X-Forwarded-Host: d5d9....apigw.yandexcloud.net`.

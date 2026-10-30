@@ -73,9 +73,13 @@ paths:
         url: http://<BACKEND_HOST_OR_IP>:<BACKEND_PORT>/
         method: GET
         headers:
+          Host: '<BACKEND_HOST_OR_IP>'
           X-Forwarded-For: '{sourceIp}'
-          X-Forwarded-Host: '{host}'
+          X-Forwarded-Host: '<GATEWAY_DOMAIN>'
           X-Forwarded-Proto: 'https'
+          '*': '*'
+        query:
+          '*': '*'
 
   # -------------------------------------------------------------
   # 2. WebSocket endpoint (/_yc/ws)
@@ -89,10 +93,12 @@ paths:
           url: http://<BACKEND_HOST_OR_IP>:<BACKEND_PORT>/_yc/ws/connect
           method: POST
           headers:
-            X-Yc-Apigateway-Websocket-Connection-Id: '{connectionId}'
+            Host: '<BACKEND_HOST_OR_IP>'
             X-Forwarded-For: '{sourceIp}'
-            X-Forwarded-Host: '{host}'
+            X-Forwarded-Host: '<GATEWAY_DOMAIN>'
             X-Forwarded-Proto: 'https'
+        query:
+          '*': '*'
 
       # Передача сообщений от клиента (Uplink frames)
       $default:
@@ -101,9 +107,9 @@ paths:
           url: http://<BACKEND_HOST_OR_IP>:<BACKEND_PORT>/_yc/ws/message
           method: POST
           headers:
-            X-Yc-Apigateway-Websocket-Connection-Id: '{connectionId}'
+            Host: '<BACKEND_HOST_OR_IP>'
             X-Forwarded-For: '{sourceIp}'
-            X-Forwarded-Host: '{host}'
+            X-Forwarded-Host: '<GATEWAY_DOMAIN>'
             X-Forwarded-Proto: 'https'
 
       # Закрытие соединения
@@ -113,9 +119,9 @@ paths:
           url: http://<BACKEND_HOST_OR_IP>:<BACKEND_PORT>/_yc/ws/disconnect
           method: POST
           headers:
-            X-Yc-Apigateway-Websocket-Connection-Id: '{connectionId}'
+            Host: '<BACKEND_HOST_OR_IP>'
             X-Forwarded-For: '{sourceIp}'
-            X-Forwarded-Host: '{host}'
+            X-Forwarded-Host: '<GATEWAY_DOMAIN>'
             X-Forwarded-Proto: 'https'
 
   # -------------------------------------------------------------
@@ -135,12 +141,16 @@ paths:
         url: http://<BACKEND_HOST_OR_IP>:<BACKEND_PORT>/{proxy}
         method: '{httpMethod}'
         headers:
+          Host: '<BACKEND_HOST_OR_IP>'
           X-Forwarded-For: '{sourceIp}'
-          X-Forwarded-Host: '{host}'
+          X-Forwarded-Host: '<GATEWAY_DOMAIN>'
           X-Forwarded-Proto: 'https'
+          '*': '*'
+        query:
+          '*': '*'
 ```
 
-> **Важно**: Заголовки `X-Forwarded-For: '{sourceIp}'`, `X-Forwarded-Host: '{host}'` и `X-Yc-Apigateway-Websocket-Connection-Id: '{connectionId}'` обязательны. По ним `tproxy-server` авторизует сессии, связывает WebSocket с потоками Telegram и изолирует виртуальные хосты.
+> **Важно**: В секции `headers` необходимо указывать `Host: <BACKEND_HOST_OR_IP>` (для корректной валидации TLS-сертификата апстрима) и `X-Forwarded-Host: <GATEWAY_DOMAIN>` (для корректного сопоставления VHost). В маршрутах WebSocket (`/_yc/ws`) не указывайте `'*': '*'`, чтобы предотвратить сброс HTTP/2 потоков в Nginx.
 
 ---
 
