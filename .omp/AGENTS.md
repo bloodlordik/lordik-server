@@ -563,7 +563,8 @@ lordik-server/
           '*': '*'
         ```
       - Заголовок `X-Forwarded-Host: '{host}'` критичен для изоляции виртуальных хостов (VHost): без него `tproxy-server` получает `Host: gutter.locuslm.online` и отклоняет сессии профиля `d5d9....apigw.yandexcloud.net`.
-      - Для WebSocket эндпоинта `/_yc/ws` обязателен `query: '*': '*'` (для передачи токена сессии `?k=...` в `$connect`) и `headers: X-Yc-Apigateway-Websocket-Connection-Id: '{connectionId}'` (для связывания сокета с `Session`).
-      - **Критично при использовании `headers: '*': '*'`**:
-        Если в секции `headers` указан wildcard `'*': '*'`, YC API Gateway пересылает клиентский заголовок `Host` (`d5d9....apigw.yandexcloud.net`) на бэкенд и проверяет валидность SSL-сертификата апстрима против этого имени. Поскольку сертификат сервера выписан на `gutter.locuslm.online`, шлюз падает с ошибкой `503 Service Unavailable` (`Hostname/IP does not match certificate's altnames`).
-        **Решение**: в секции `headers` каждого маршрута интеграции необходимо явно переопределять `Host: gutter.locuslm.online` перед wildcard `'*': '*'`.
+      - **Специфика WebSocket эндпоинта `/_yc/ws`**:
+        - Для `$connect` обязателен `query: '*': '*'` (для передачи токена сессии `?k=...`).
+        - В секции `headers` для операций `x-yc-apigateway-websocket-*` **НЕЛЬЗЯ** указывать `'*': '*'`: это приводит к пересылке клиентских заголовков `Connection: Upgrade` и `Upgrade: websocket` в запросе `POST /_yc/ws/connect` по протоколу HTTP/2, что нарушает RFC 7540 и вызывает ошибку Nginx `RST_STREAM (PROTOCOL_ERROR)` (в логах Envoy: `502 reset reason: protocol error`).
+        - Заголовок `X-Yc-Apigateway-Websocket-Connection-Id` шлюз передает **автоматически**. Указывать `X-Yc-Apigateway-Websocket-Connection-Id: '{connectionId}'` нельзя, так как `{connectionId}` не является переменной подстановки в OpenAPI и передается как буквальная строка `"{connectionId}"`.
+        - Рекомендуется указывать явный домен `X-Forwarded-Host: d5d9....apigw.yandexcloud.net`, либо использовать `{host}` (в `tproxy-server` добавлена авто-обработка плейсхолдера `{host}`).
