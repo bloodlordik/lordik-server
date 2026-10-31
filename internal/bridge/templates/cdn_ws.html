@@ -34,6 +34,15 @@ const upControllers=new Set();
 let ackInflight=false;
 let wakingUp=false;
 
+// Multi-Stream Downlink Reorder Buffer & Auto-Scaler for Video Streaming
+const downReorderMap=new Map();
+const maxDownReorderWindow=24;
+let reorderGapTimer=0;
+let turboStreamsActive=0;
+const maxTurboStreams=2; // Up to 2 extra parallel turbo-streams during heavy media/video (3-4 streams total)
+let lastHeavyMediaTime=0;
+let streamHealthy=false;
+
 function abortInflightUplinks(){
  for(const ctrl of Array.from(upControllers)){
   try{ctrl.abort()}catch(e){}
@@ -114,6 +123,8 @@ function trackClientFrames(buf){
 function fail(){
  if(failing||closed)return;
  failing=true;
+ if(reorderGapTimer){clearTimeout(reorderGapTimer);reorderGapTimer=0}
+ downReorderMap.clear();
  if(port){
   for(const streamId of activeStreams){
    try{port.postMessage(encodeFrame(0x03,streamId,null))}catch(e){}
@@ -135,6 +146,89 @@ function deliver(batchBuf){
  }
 }
 
+function scheduleGapHeal(){
+ if(reorderGapTimer||closed||downReorderMap.size===0)return;
+ reorderGapTimer=setTimeout(()=>{
+  reorderGapTimer=0;
+  if(!closed&&downReorderMap.size>0&&sessionToken){
+   // A sibling stream dropped a batch; pollOnce(downCursor) fetches the exact missing batch from unackedBatches
+   pollOnce();
+  }
+ },650);
+}
+
+// Delivers downlink batches strictly in cursor order across parallel CDN streams
+function deliverOrdered(cursor,payloadBuf){
+ if(closed)return;
+ const diff=(cursor-downCursor)|0;
+ if(diff<=0&&downCursor!==0)return;
+
+ const byteLen=payloadBuf?payloadBuf.byteLength:0;
+ if(byteLen>=32768){
+  lastHeavyMediaTime=Date.now();
+  if(streamHealthy&&turboStreamsActive<maxTurboStreams){
+   spawnTurboStream();
+   if(byteLen>=98304&&turboStreamsActive<maxTurboStreams){
+    spawnTurboStream();
+   }
+  }
+ }
+
+ if(cursor===downCursor+1||(downCursor===0&&cursor===1)){
+  downCursor=cursor;
+  if(byteLen>0)deliver(payloadBuf);
+
+  while(downReorderMap.has(downCursor+1)){
+   const nextCursor=downCursor+1;
+   const savedBuf=downReorderMap.get(nextCursor);
+   downReorderMap.delete(nextCursor);
+   downCursor=nextCursor;
+   if(savedBuf&&savedBuf.byteLength>0)deliver(savedBuf);
+  }
+
+  if(downReorderMap.size===0&&reorderGapTimer){
+   clearTimeout(reorderGapTimer);
+   reorderGapTimer=0;
+  }else if(downReorderMap.size>0){
+   if(reorderGapTimer){clearTimeout(reorderGapTimer);reorderGapTimer=0}
+   scheduleGapHeal();
+  }
+  return;
+ }
+
+ // Out-of-order batch arrived early on a faster parallel stream
+ if(diff>1&&diff<=maxDownReorderWindow){
+  if(!downReorderMap.has(cursor)){
+   downReorderMap.set(cursor,payloadBuf?payloadBuf.slice(0):null);
+  }
+  scheduleGapHeal();
+ }else if(diff>maxDownReorderWindow){
+  // Fallback if window is somehow exceeded: flush reorder map in ascending order
+  const keys=Array.from(downReorderMap.keys()).sort((a,b)=>a-b);
+  for(const k of keys){
+   const b=downReorderMap.get(k);
+   downReorderMap.delete(k);
+   if(k>downCursor){
+    downCursor=k;
+    if(b&&b.byteLength>0)deliver(b);
+   }
+  }
+  downCursor=cursor;
+  if(byteLen>0)deliver(payloadBuf);
+ }
+}
+
+function maybeSendDownAck(){
+ const unackedCount=(downCursor-lastSentAckCursor)|0;
+ if(unackedCount>=4){
+  if(hasPendingUplink()&&upInflight<maxInflight){
+   flushUplink();
+  }else if(!hasPendingUplink()||unackedCount>=10){
+   sendAckOnly();
+  }
+ }
+}
+
 function parseGLTF(buf){
  if(buf.byteLength<12)return null;
  const view=new DataView(buf);
@@ -152,8 +246,7 @@ function processDownlink(resBuf,ct){
   const parsed=parseGLTF(resBuf);
   if(!parsed)return false;
   if((parsed.cursor-downCursor|0)>0||downCursor===0){
-   downCursor=parsed.cursor;
-   deliver(parsed.payload);
+   deliverOrdered(parsed.cursor,parsed.payload);
   }
   return true;
  }
@@ -163,7 +256,7 @@ function processDownlink(resBuf,ct){
    if(!dec.trim())return true;
    const obj=JSON.parse(dec);
    if(!obj||typeof obj!=='object'||obj.s!==1)return false;
-   if(typeof obj.c==='number'&&((obj.c-downCursor|0)>0||downCursor===0)){
+   if(typeof obj.c==='number'&&((obj.c-downCursor|0)>0||downCursor===0)&&downReorderMap.size===0){
     downCursor=obj.c;
    }
    return true;
@@ -236,12 +329,43 @@ function hasPendingUplink(){
  return fastPending.length>0||upPending.length>0;
 }
 
+// Coalesces standalone 12-byte WINDOW (0x04) frames for the same streamId in fastPending
+// so rapid video playback window updates don't waste uplink slots.
+function tryCoalesceWindowFrame(arr){
+ if(arr.byteLength!==12||arr[0]!==0x04)return false;
+ const dv=new DataView(arr.buffer,arr.byteOffset,12);
+ if(dv.getUint32(4,false)!==4)return false;
+ const sid=(arr[1]<<16)|(arr[2]<<8)|arr[3];
+ const addCredit=dv.getUint32(8,false);
+ for(let i=fastPending.length-1;i>=0;i--){
+  const item=fastPending[i];
+  if(item.byteLength===12&&item[0]===0x04){
+   const isid=(item[1]<<16)|(item[2]<<8)|item[3];
+   if(isid===sid){
+    const idv=new DataView(item.buffer,item.byteOffset,12);
+    const prevCredit=idv.getUint32(8,false);
+    const sum=prevCredit+addCredit;
+    if(sum<=0xffffffff){
+     idv.setUint32(8,sum>>>0,false);
+     return true;
+    }
+   }
+  }
+ }
+ return false;
+}
+
 function queueCarrier(buf){
  if(closed)return;
+ const arr=new Uint8Array(buf);
+ if(tryCoalesceWindowFrame(arr)){
+  if(sessionToken&&upInflight===0&&!debounceTimer)flushUplink();
+  else scheduleFlush();
+  return;
+ }
  if(queuedBytes+buf.byteLength>queueLimit||queuedItems+1>queueItemLimit){fail();return}
  queuedBytes+=buf.byteLength;
  queuedItems++;
- const arr=new Uint8Array(buf);
  if(arr.byteLength<=1024){
   fastPending.push(arr);
  }else{
@@ -525,6 +649,73 @@ async function pollOnce(){
  }
 }
 
+// Spawns an on-demand parallel turbo stream worker during heavy video/media downloads.
+// Automatically parks itself when heavy traffic subsides for 10 seconds.
+async function spawnTurboStream(){
+ if(closed||!sessionToken||!streamHealthy||turboStreamsActive>=maxTurboStreams)return;
+ turboStreamsActive++;
+ const ctrl=new AbortController();
+ streamControllers.add(ctrl);
+ let watchdogTimer=0;
+
+ const resetWatchdog=()=>{
+  clearTimeout(watchdogTimer);
+  watchdogTimer=setTimeout(()=>{
+   try{ctrl.abort()}catch(e){}
+  },16000);
+ };
+
+ try{
+  while(!closed&&sessionToken&&streamHealthy){
+   if(Date.now()-lastHeavyMediaTime>10000&&downReorderMap.size===0){
+    break;
+   }
+   resetWatchdog();
+   const randHex=(Math.random()*0xffffffff>>>0).toString(16);
+   const streamUrl=relayBase+'assets/media/'+shortId+'/stream_'+downCursor+'_t'+randHex+'.m4s';
+   const res=await fetch(streamUrl,{
+    method:'GET',
+    signal:ctrl.signal,
+    mode:'same-origin',credentials:'omit',cache:'no-store',
+    headers:{
+     'X-Client-Key':sessionToken,
+     'X-Stream-Poll':'1'
+    }
+   });
+   if(!res.ok){
+    if(res.status===404||res.status===410){fail();break}
+    break;
+   }
+   const ct=res.headers.get('Content-Type');
+   if(ct&&ct.includes('text/html')){fail();break}
+   if(!res.body||typeof res.body.getReader!=='function')break;
+
+   const reader=res.body.getReader();
+   const assembler=createStreamAssembler();
+
+   while(!closed&&sessionToken){
+    const {done,value}=await reader.read();
+    if(done)break;
+    resetWatchdog();
+    assembler.feed(value,(cursor,payloadBuf)=>{
+     if(payloadBuf&&payloadBuf.byteLength>0){
+      deliverOrdered(cursor,payloadBuf);
+      maybeSendDownAck();
+     }
+    });
+   }
+  }
+ }catch(e){
+  if(!closed&&e&&(e.message==='invalid gltf streaming prefix'||e.message==='stream envelope length exceeded')){
+   fail();
+  }
+ }finally{
+  clearTimeout(watchdogTimer);
+  streamControllers.delete(ctrl);
+  turboStreamsActive--;
+ }
+}
+
 function startStreamLoop(){
  currentStreamId++;
  runStream(currentStreamId);
@@ -603,6 +794,7 @@ async function runStream(streamId){
    if(done)break;
    if(!firstChunk){
     firstChunk=true;
+    streamHealthy=true;
     clearTimeout(probeTimer);
     probeConsecutiveTimeouts=0;
     overlapTimer=setTimeout(()=>{
@@ -615,15 +807,11 @@ async function runStream(streamId){
    }
    resetWatchdog();
    assembler.feed(value,(cursor,payloadBuf)=>{
-    const isNew=((cursor-downCursor|0)>0)||downCursor===0;
-    if(isNew)downCursor=cursor;
-    if(isNew&&payloadBuf&&payloadBuf.byteLength>0)deliver(payloadBuf);
-    if((downCursor-lastSentAckCursor)>=4){
-     if(hasPendingUplink()&&upInflight<maxInflight){
-      flushUplink();
-     }else{
-      sendAckOnly();
-     }
+    if(payloadBuf&&payloadBuf.byteLength>0){
+     deliverOrdered(cursor,payloadBuf);
+     maybeSendDownAck();
+    }else if(((cursor-downCursor|0)>0||downCursor===0)&&downReorderMap.size===0){
+     downCursor=cursor;
     }
    });
   }
@@ -650,6 +838,7 @@ async function runStream(streamId){
   if(probeFired){
    probeConsecutiveTimeouts++;
    if(probeConsecutiveTimeouts>=2){
+    streamHealthy=false;
     probeConsecutiveTimeouts=0;
     await pollOnce();
    }
@@ -668,6 +857,8 @@ function close(notifyServer){
  if(closed)return;
  closed=true;
  failing=true;
+ if(reorderGapTimer){clearTimeout(reorderGapTimer);reorderGapTimer=0}
+ downReorderMap.clear();
  if(pollController)pollController.abort();
  for(const sCtrl of Array.from(streamControllers)){
   try{sCtrl.abort()}catch(e){}

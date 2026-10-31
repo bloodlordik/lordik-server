@@ -9,11 +9,19 @@ import (
 	"github.com/telegramdesktop/tproxy-server/internal/frame"
 )
 
+const (
+	maxParallelCDNStreams = 4
+	multiStreamBatchBytes = 131072 // 128 KiB per envelope when striping across multiple streams
+	interactiveDataLimit  = 4096   // <= 4 KiB DATA frames get priority ahead of bulk video chunks
+	staleUnackedReplayAge = 600 * time.Millisecond
+)
+
 type sentBatch struct {
 	cursor uint64
 	body   []byte
 	cost   int
 	items  int
+	sentAt time.Time
 }
 
 // AckDownCDN acknowledges client received bytes up to cursor.
@@ -179,7 +187,8 @@ func (s *Session) PiggybackDownWait(cursor uint64, coalesce bool) ([]byte, uint6
 	if s.closed {
 		return nil, cursor, ErrClosed
 	}
-	s.lastActivity = time.Now()
+	now := time.Now()
+	s.lastActivity = now
 
 	// 1. Future cursor is an invariant violation.
 	if cursor > s.downCursor {
@@ -196,8 +205,8 @@ func (s *Session) PiggybackDownWait(cursor uint64, coalesce bool) ([]byte, uint6
 		return nil, s.downCursor, nil
 	}
 
-	// 4. If PollCDN or StreamCDN is currently active, leave frames for the dedicated downlink poll.
-	if s.downActive {
+	// 4. If PollCDN or StreamCDN is currently active, leave frames for the dedicated downlink poll/stream.
+	if s.downActive || len(s.streamWorkers) > 0 {
 		return nil, s.downCursor, nil
 	}
 
@@ -210,7 +219,7 @@ func (s *Session) PiggybackDownWait(cursor uint64, coalesce bool) ([]byte, uint6
 			waitDur = 150 * time.Millisecond
 		}
 		deadline := time.Now().Add(waitDur)
-		for !s.hasPendingDataOrCloseLocked() && !s.closed && !s.downActive {
+		for !s.hasPendingDataOrCloseLocked() && !s.closed && !s.downActive && len(s.streamWorkers) == 0 {
 			rem := time.Until(deadline)
 			if rem <= 0 {
 				break
@@ -228,7 +237,7 @@ func (s *Session) PiggybackDownWait(cursor uint64, coalesce bool) ([]byte, uint6
 		if s.closed {
 			return nil, cursor, ErrClosed
 		}
-		if cursor != s.downCursor || len(s.unackedBatches) != 0 || len(s.unacked) != 0 || s.downActive {
+		if cursor != s.downCursor || len(s.unackedBatches) != 0 || len(s.unacked) != 0 || s.downActive || len(s.streamWorkers) > 0 {
 			return nil, s.downCursor, nil
 		}
 	}
@@ -254,6 +263,7 @@ func (s *Session) PiggybackDownWait(cursor uint64, coalesce bool) ([]byte, uint6
 		body:   batch.body,
 		cost:   batch.cost,
 		items:  batch.items,
+		sentAt: time.Now(),
 	})
 	next := s.downCursor
 	if s.onDown != nil {
@@ -286,11 +296,12 @@ func (s *Session) PollCDN(ctx context.Context, cursor uint64, timeout time.Durat
 	s.ackCursorLocked(cursor)
 
 	if cursor < s.downCursor {
-		// If retry of an unacknowledged batch
-		for _, b := range s.unackedBatches {
-			if b.cursor > cursor {
-				result := b.body
-				next := b.cursor
+		// If retry of an unacknowledged batch (or gap healing request from multi-stream client)
+		for i := range s.unackedBatches {
+			if s.unackedBatches[i].cursor > cursor {
+				s.unackedBatches[i].sentAt = time.Now()
+				result := s.unackedBatches[i].body
+				next := s.unackedBatches[i].cursor
 				s.mu.Unlock()
 				return result, next, nil
 			}
@@ -308,9 +319,16 @@ func (s *Session) PollCDN(ctx context.Context, cursor uint64, timeout time.Durat
 		return nil, next, nil
 	}
 
+	// Evict any active PollCDN or StreamCDN workers when falling back to PollCDN
 	if s.downActive && s.superseded != nil {
 		close(s.superseded)
+		s.superseded = nil
 	}
+	for _, ch := range s.streamWorkers {
+		close(ch)
+	}
+	s.streamWorkers = nil
+
 	mine := make(chan struct{})
 	s.superseded = mine
 	s.downActive = true
@@ -337,6 +355,7 @@ func (s *Session) PollCDN(ctx context.Context, cursor uint64, timeout time.Durat
 				body:   batch.body,
 				cost:   batch.cost,
 				items:  batch.items,
+				sentAt: time.Now(),
 			})
 			s.downActive = false
 			s.superseded = nil
@@ -387,6 +406,7 @@ func (s *Session) PollCDN(ctx context.Context, cursor uint64, timeout time.Durat
 					body:   batch.body,
 					cost:   batch.cost,
 					items:  batch.items,
+					sentAt: time.Now(),
 				})
 				s.downActive = false
 				s.superseded = nil
@@ -411,9 +431,24 @@ func (s *Session) PollCDN(ctx context.Context, cursor uint64, timeout time.Durat
 	}
 }
 
+// removeStreamWorkerLocked removes a specific worker channel from s.streamWorkers.
+func (s *Session) removeStreamWorkerLocked(mine chan struct{}) {
+	for i, ch := range s.streamWorkers {
+		if ch == mine {
+			copy(s.streamWorkers[i:], s.streamWorkers[i+1:])
+			s.streamWorkers[len(s.streamWorkers)-1] = nil
+			s.streamWorkers = s.streamWorkers[:len(s.streamWorkers)-1]
+			break
+		}
+	}
+	if len(s.streamWorkers) == 0 && s.superseded == nil {
+		s.downActive = false
+	}
+}
+
 // StreamCDN streams downlink frames continuously using binary stream envelopes.
-// It performs zero-loss replay for unacknowledged batches, handles periodic heartbeats,
-// and bounds unacknowledged memory via sliding window backpressure.
+// Supports up to maxParallelCDNStreams concurrent stream workers per session
+// for striped multi-stream throughput (especially effective for streaming video).
 func (s *Session) StreamCDN(ctx context.Context, startCursor uint64, onBatch func(cursor uint64, body []byte) error) error {
 	s.mu.Lock()
 	if s.closed {
@@ -425,31 +460,55 @@ func (s *Session) StreamCDN(ctx context.Context, startCursor uint64, onBatch fun
 		s.protocolFailure()
 		return ErrProtocol
 	}
-	s.lastActivity = time.Now()
+	now := time.Now()
+	s.lastActivity = now
 
 	s.ackCursorLocked(startCursor)
 
-	if s.downActive && s.superseded != nil {
+	// If a legacy single PollCDN was waiting, cancel it.
+	if s.superseded != nil {
 		close(s.superseded)
+		s.superseded = nil
 	}
+
+	hadActiveWorkers := len(s.streamWorkers) > 0
+
+	// If pool is full, evict the oldest stream worker (FIFO rotation / Make-Before-Break).
+	if len(s.streamWorkers) >= maxParallelCDNStreams {
+		oldest := s.streamWorkers[0]
+		close(oldest)
+		copy(s.streamWorkers[0:], s.streamWorkers[1:])
+		s.streamWorkers[len(s.streamWorkers)-1] = nil
+		s.streamWorkers = s.streamWorkers[:len(s.streamWorkers)-1]
+	}
+
 	mine := make(chan struct{})
-	s.superseded = mine
+	s.streamWorkers = append(s.streamWorkers, mine)
 	s.downActive = true
 
 	defer func() {
 		s.mu.Lock()
-		if s.superseded == mine {
-			s.downActive = false
-			s.superseded = nil
+		s.removeStreamWorkerLocked(mine)
+		if len(s.pendingFrames) > 0 && len(s.streamWorkers) > 0 {
+			signal(s.notify)
 		}
 		s.mu.Unlock()
 	}()
 
-	// 1. Zero-Loss Replay for any remaining unacknowledged batches with cursor > startCursor
+	// 1. Zero-Loss Replay:
+	// - If no other stream workers were active (!hadActiveWorkers), replay all unackedBatches > startCursor.
+	// - If other stream workers ARE active, replay only stale unackedBatches (> 600ms old) so a dropped
+	//   turbo-stream is automatically healed without duplicating fresh in-flight chunks on sibling streams.
 	var toReplay []sentBatch
-	for _, b := range s.unackedBatches {
-		if b.cursor > startCursor {
-			toReplay = append(toReplay, b)
+	if len(s.unackedBatches) > 0 {
+		for i := range s.unackedBatches {
+			b := &s.unackedBatches[i]
+			if b.cursor > startCursor {
+				if !hadActiveWorkers || b.sentAt.IsZero() || now.Sub(b.sentAt) >= staleUnackedReplayAge {
+					b.sentAt = now
+					toReplay = append(toReplay, *b)
+				}
+			}
 		}
 	}
 	s.mu.Unlock()
@@ -499,14 +558,24 @@ func (s *Session) StreamCDN(ctx context.Context, startCursor uint64, onBatch fun
 			s.mu.Unlock()
 			return ErrClosed
 		}
-		if s.superseded != mine {
+		select {
+		case <-mine:
 			s.mu.Unlock()
 			return nil
+		default:
 		}
 
 		// Backpressure check: don't take new frames if unacked queue is full or unackedCost >= 4 MiB
 		if len(s.pendingFrames) > 0 && len(s.unackedBatches) < maxUnacked && s.unackedCost < 4*1024*1024 {
-			batch := s.takeDownBatchLimitLocked(maxBatch)
+			// Adaptive batch striping: when multiple stream workers are active in parallel,
+			// cap each batch at 128 KiB so chunks are striped evenly across all parallel CDN streams.
+			effectiveMaxBatch := maxBatch
+			if len(s.streamWorkers) > 1 && effectiveMaxBatch > multiStreamBatchBytes {
+				effectiveMaxBatch = multiStreamBatchBytes
+			}
+
+			batch := s.takeDownBatchLimitLocked(effectiveMaxBatch)
+			sentTime := time.Now()
 			s.downCursor++
 			s.unackedBase = s.downCursor - 1
 			s.unacked = batch.body
@@ -517,13 +586,20 @@ func (s *Session) StreamCDN(ctx context.Context, startCursor uint64, onBatch fun
 				body:   batch.body,
 				cost:   batch.cost,
 				items:  batch.items,
+				sentAt: sentTime,
 			}
 			s.unackedBatches = append(s.unackedBatches, sb)
 			cur := s.downCursor
 			body := batch.body
-			s.lastActivity = time.Now()
+			s.lastActivity = sentTime
 			if s.onDown != nil {
 				s.onDown(len(body))
+			}
+
+			// Cascade wake-up: if more frames remain and sibling stream workers are open,
+			// immediately wake the next worker so it flushes the next video chunk in parallel!
+			if len(s.pendingFrames) > 0 && len(s.streamWorkers) > 1 {
+				signal(s.notify)
 			}
 			s.mu.Unlock()
 
@@ -554,9 +630,11 @@ func (s *Session) StreamCDN(ctx context.Context, startCursor uint64, onBatch fun
 				s.mu.Unlock()
 				return ErrClosed
 			}
-			if s.superseded != mine {
+			select {
+			case <-mine:
 				s.mu.Unlock()
 				return nil
+			default:
 			}
 			cur := s.downCursor
 			s.lastActivity = time.Now()
@@ -568,6 +646,10 @@ func (s *Session) StreamCDN(ctx context.Context, startCursor uint64, onBatch fun
 			s.mu.Lock()
 		case <-notify:
 			s.mu.Lock()
+			// If woken up and even more frames exist for another worker, keep the signal alive
+			if len(s.pendingFrames) > 0 && len(s.streamWorkers) > 1 {
+				signal(s.notify)
+			}
 		}
 	}
 }
@@ -607,34 +689,112 @@ func (s *Session) hasWorthwhilePiggybackLocked() bool {
 	return false
 }
 
+// takeDownBatchLimitLocked extracts up to maxBytes of frames.
+// When bulk media DATA frames are queued, it prioritizes control frames (OPEN, WINDOW, CLOSE)
+// and small interactive DATA frames (<= 4 KiB) from other streams so chat/UI traffic
+// never suffers Head-of-Line blocking behind heavy video chunks, while strictly preserving
+// per-stream frame ordering.
 func (s *Session) takeDownBatchLimitLocked(maxBytes int) downBatch {
+	n := len(s.pendingFrames)
+	if n == 0 {
+		return downBatch{}
+	}
+
+	// Fast path: check if all pending frames fit in maxBytes and frame.MaxBatchFrames
+	totalSize := 0
+	totalCost := 0
+	allFit := n <= frame.MaxBatchFrames
+	if allFit {
+		for i := 0; i < n; i++ {
+			totalSize += len(s.pendingFrames[i].encoded)
+			totalCost += s.pendingFrames[i].cost
+			if i != 0 && totalSize > maxBytes {
+				allFit = false
+				break
+			}
+		}
+	}
+	if allFit {
+		result := make([]byte, 0, totalSize)
+		for i := 0; i < n; i++ {
+			result = append(result, s.pendingFrames[i].encoded...)
+			s.pendingFrames[i] = queuedFrame{}
+		}
+		s.pendingFrames = nil
+		clear(s.pendingWindows)
+		return downBatch{body: result, cost: totalCost, items: n}
+	}
+
+	// Priority-aware selection preserving per-stream FIFO ordering:
+	// Pass 1 picks control frames (WINDOW, OPEN) and small interactive frames from streams
+	// that haven't had a frame skipped yet.
+	// Pass 2 fills the remaining budget in normal FIFO order.
+	picked := make([]bool, n)
+	blockedStream := make(map[uint32]bool)
 	size := 0
 	cost := 0
 	count := 0
-	for count < len(s.pendingFrames) && count < frame.MaxBatchFrames {
-		next := len(s.pendingFrames[count].encoded)
-		if count != 0 && size+next > maxBytes {
+
+	// Pass 1: VIP Control & Interactive frames
+	for i := 0; i < n && count < frame.MaxBatchFrames; i++ {
+		f := &s.pendingFrames[i]
+		isVIP := f.typeCode == frame.Window || f.typeCode == frame.Open ||
+			(f.typeCode == frame.Close && !blockedStream[f.streamID]) ||
+			(f.typeCode == frame.Data && len(f.encoded) <= frame.HeaderSize+interactiveDataLimit && !blockedStream[f.streamID])
+
+		if isVIP {
+			fLen := len(f.encoded)
+			if count == 0 || size+fLen <= maxBytes {
+				picked[i] = true
+				size += fLen
+				cost += f.cost
+				count++
+				continue
+			}
+		}
+		if f.typeCode == frame.Data || f.typeCode == frame.Close {
+			blockedStream[f.streamID] = true
+		}
+	}
+
+	// Pass 2: Bulk Media & Remaining frames in FIFO order
+	for i := 0; i < n && count < frame.MaxBatchFrames; i++ {
+		if picked[i] {
+			continue
+		}
+		f := &s.pendingFrames[i]
+		fLen := len(f.encoded)
+		if count != 0 && size+fLen > maxBytes {
 			break
 		}
-		size += next
-		cost += s.pendingFrames[count].cost
+		picked[i] = true
+		size += fLen
+		cost += f.cost
 		count++
 	}
+
 	result := make([]byte, 0, size)
-	for index := 0; index != count; index++ {
-		if s.pendingFrames[index].typeCode == frame.Window &&
-			s.pendingWindows[s.pendingFrames[index].streamID] == index {
-			delete(s.pendingWindows, s.pendingFrames[index].streamID)
+	writeIdx := 0
+	clear(s.pendingWindows)
+
+	for i := 0; i < n; i++ {
+		if picked[i] {
+			result = append(result, s.pendingFrames[i].encoded...)
+		} else {
+			s.pendingFrames[writeIdx] = s.pendingFrames[i]
+			if s.pendingFrames[writeIdx].typeCode == frame.Window {
+				s.pendingWindows[s.pendingFrames[writeIdx].streamID] = writeIdx
+			}
+			writeIdx++
 		}
-		result = append(result, s.pendingFrames[index].encoded...)
-		s.pendingFrames[index] = queuedFrame{}
 	}
-	s.pendingFrames = s.pendingFrames[count:]
-	for id, index := range s.pendingWindows {
-		s.pendingWindows[id] = index - count
+	for i := writeIdx; i < n; i++ {
+		s.pendingFrames[i] = queuedFrame{}
 	}
+	s.pendingFrames = s.pendingFrames[:writeIdx]
 	if len(s.pendingFrames) == 0 {
 		s.pendingFrames = nil
 	}
+
 	return downBatch{body: result, cost: cost, items: count}
 }

@@ -53,6 +53,7 @@ type Session struct {
 	upActive              bool
 	downActive            bool
 	superseded            chan struct{}
+	streamWorkers         []chan struct{} // пул параллельных StreamCDN воркеров
 	websocketActive       bool
 	wsSuperseded          chan struct{}
 	resumeToken           string
@@ -256,7 +257,16 @@ func (s *Session) closeLocked() {
 	s.unacked = nil
 	s.unackedCost = 0
 	s.unackedItems = 0
+	if s.superseded != nil {
+		close(s.superseded)
+		s.superseded = nil
+	}
+	for _, ch := range s.streamWorkers {
+		close(ch)
+	}
+	s.streamWorkers = nil
 	s.unackedBatches = nil
+
 	s.cdnReassembly = nil
 	s.cdnPendingFrames = nil
 	signal(s.notify)

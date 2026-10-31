@@ -1,6 +1,8 @@
 package server
 
 import (
+	"bufio"
+	"encoding/binary"
 	"net/http"
 	"strconv"
 	"strings"
@@ -60,19 +62,25 @@ func (s *Server) serveCDNStreamDown(w http.ResponseWriter, r *http.Request, vhos
 	rc := http.NewResponseController(w)
 	_ = rc.SetWriteDeadline(time.Now().Add(15 * time.Second))
 
-	if err := session.WriteGLTFStreamPrefix(w); err != nil {
+	// Объединяем 12 байт GLTFStreamHeader и 8 байт первого пустого конверта (length = 0)
+	// в единый 20-байтовый буфер на стеке и делаем ровно один Flush!
+	var initPkt [20]byte
+	copy(initPkt[0:12], session.GLTFStreamHeader[:])
+	binary.BigEndian.PutUint32(initPkt[12:16], uint32(cursor))
+	binary.BigEndian.PutUint32(initPkt[16:20], 0)
+	if _, err := w.Write(initPkt[:]); err != nil {
 		return
 	}
 	flusher.Flush()
 
-	if err := session.WriteBatchEnvelope(w, cursor, nil); err != nil {
-		return
-	}
-	flusher.Flush()
+	bw := bufio.NewWriterSize(w, 64*1024)
 
 	onBatch := func(cur uint64, body []byte) error {
 		_ = rc.SetWriteDeadline(time.Now().Add(15 * time.Second))
-		if err := session.WriteBatchEnvelope(w, cur, body); err != nil {
+		if err := session.WriteBatchEnvelope(bw, cur, body); err != nil {
+			return err
+		}
+		if err := bw.Flush(); err != nil {
 			return err
 		}
 		flusher.Flush()
