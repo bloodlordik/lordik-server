@@ -425,77 +425,165 @@ func (s *backendStream) runDirect() {
 		"target", targetAddress,
 	)
 
-	// 4. Dial target DC (or take pre-warmed connection from pool)
-	var connection net.Conn
-	if s.session.warmDCPool != nil {
-		connection = s.session.warmDCPool.Get(targetAddress)
+	// 4. Decrypt client's initial payload once to preserve plaintext for potential retry
+	var rawClientPayload []byte
+	if len(firstData) > 64 {
+		rawClientPayload = make([]byte, len(firstData)-64)
+		hsRes.ClientDecryptor.XORKeyStream(rawClientPayload, firstData[64:])
 	}
-	if connection != nil {
-		dialAccounted = true
-		s.session.backendDialFinished(false)
-		logger.Debug("direct telegram dc using warm pooled connection", "stream_id", s.id, "target", targetAddress, "dc", hsRes.DCIdx)
-	} else {
+
+	sendFirstPacket := func(conn net.Conn) (cipher.Stream, cipher.Stream, error) {
+		tgHandshake, tgEncryptor, tgDecryptor, err := CreateTelegramHandshake(hsRes.Tag, hsRes.DCIdx)
+		if err != nil {
+			return nil, nil, err
+		}
+		packet := make([]byte, 64+len(rawClientPayload))
+		copy(packet[:64], tgHandshake)
+		if len(rawClientPayload) > 0 {
+			tgEncryptor.XORKeyStream(packet[64:], rawClientPayload)
+		}
+		_ = conn.SetWriteDeadline(time.Now().Add(s.session.timeouts.BackendDial.Value()))
+		total := packet
+		for len(total) > 0 {
+			n, err := conn.Write(total)
+			if err != nil || n == 0 {
+				_ = conn.SetWriteDeadline(time.Time{})
+				return nil, nil, fmt.Errorf("write first packet: %w", err)
+			}
+			total = total[n:]
+		}
+		_ = conn.SetWriteDeadline(time.Time{})
+		return tgEncryptor, tgDecryptor, nil
+	}
+
+	dialFresh := func() (net.Conn, error) {
 		dialer := net.Dialer{
 			Timeout:   s.session.timeouts.BackendDial.Value(),
 			KeepAlive: 30 * time.Second,
 		}
+		conn, err := dialer.DialContext(s.ctx, "tcp", targetAddress)
+		if err != nil {
+			return nil, err
+		}
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			_ = tcpConn.SetNoDelay(true)
+			_ = tcpConn.SetKeepAlive(true)
+			_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+		}
+		return conn, nil
+	}
+
+	var connection net.Conn
+	var tgEncryptor, tgDecryptor cipher.Stream
+	fromWarmPool := false
+
+	if s.session.warmDCPool != nil {
+		connection = s.session.warmDCPool.Get(targetAddress)
+		if connection != nil {
+			if !isConnAlive(connection) {
+				_ = connection.Close()
+				connection = nil
+			} else {
+				fromWarmPool = true
+			}
+		}
+	}
+
+	if fromWarmPool {
+		logger.Debug("direct telegram dc using warm pooled connection", "stream_id", s.id, "target", targetAddress, "dc", hsRes.DCIdx)
+		s.connMu.Lock()
+		if s.ctx.Err() != nil {
+			s.connMu.Unlock()
+			_ = connection.Close()
+			return
+		}
+		s.conn = connection
+		s.connMu.Unlock()
+
 		var err error
-		connection, err = dialer.DialContext(s.ctx, "tcp", targetAddress)
+		tgEncryptor, tgDecryptor, err = sendFirstPacket(connection)
+		if err != nil {
+			logger.Warn("direct telegram dc warm connection failed on first write, falling back to fresh dial", "stream_id", s.id, "target", targetAddress, "err", err)
+			s.connMu.Lock()
+			_ = connection.Close()
+			s.conn = nil
+			if s.ctx.Err() != nil {
+				s.connMu.Unlock()
+				return
+			}
+			s.connMu.Unlock()
+
+			freshConn, dialErr := dialFresh()
+			dialAccounted = true
+			s.session.backendDialFinished(dialErr != nil && s.ctx.Err() == nil)
+			if dialErr != nil {
+				if s.ctx.Err() == nil {
+					logger.Warn("direct telegram dc fallback dial failed", "stream_id", s.id, "target", targetAddress, "dc", hsRes.DCIdx, "err", dialErr)
+				}
+				s.close()
+				return
+			}
+			s.connMu.Lock()
+			if s.ctx.Err() != nil {
+				s.connMu.Unlock()
+				_ = freshConn.Close()
+				return
+			}
+			s.conn = freshConn
+			connection = freshConn
+			s.connMu.Unlock()
+
+			tgEncryptor, tgDecryptor, err = sendFirstPacket(connection)
+			if err != nil {
+				logger.Warn("direct telegram dc fallback first packet failed", "stream_id", s.id, "target", targetAddress, "err", err)
+				s.connMu.Lock()
+				_ = connection.Close()
+				s.conn = nil
+				s.connMu.Unlock()
+				s.close()
+				return
+			}
+		} else {
+			dialAccounted = true
+			s.session.backendDialFinished(false)
+		}
+	} else {
+		freshConn, err := dialFresh()
 		dialAccounted = true
 		s.session.backendDialFinished(err != nil && s.ctx.Err() == nil)
 		if err != nil {
 			if s.ctx.Err() == nil {
 				logger.Warn("direct telegram dc dial failed", "stream_id", s.id, "target", targetAddress, "dc", hsRes.DCIdx, "err", err)
 			}
-			return
-		}
-		if tcpConn, ok := connection.(*net.TCPConn); ok {
-			_ = tcpConn.SetNoDelay(true)
-			_ = tcpConn.SetKeepAlive(true)
-			_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
-		}
-		logger.Debug("direct telegram dc connected", "stream_id", s.id, "target", targetAddress, "dc", hsRes.DCIdx)
-	}
-	s.connMu.Lock()
-	if s.ctx.Err() != nil {
-		s.connMu.Unlock()
-		_ = connection.Close()
-		return
-	}
-	s.conn = connection
-	s.connMu.Unlock()
-
-	// 5. Handshake + Initial Payload in one TCP write (Zero-overhead First Packet)
-	tgHandshake, tgEncryptor, tgDecryptor, err := CreateTelegramHandshake(hsRes.Tag, hsRes.DCIdx)
-	if err != nil {
-		s.close()
-		return
-	}
-
-	// Re-encrypt trailing payload in-place
-	if len(firstData) > 64 {
-		rem := firstData[64:]
-		hsRes.ClientDecryptor.XORKeyStream(rem, rem)
-		tgEncryptor.XORKeyStream(rem, rem)
-	}
-	// Place generated Telegram obfuscated2 handshake in first 64 bytes
-	copy(firstData[:64], tgHandshake)
-
-	_ = connection.SetWriteDeadline(time.Now().Add(s.session.timeouts.BackendDial.Value()))
-	totalToWrite := firstData
-	for len(totalToWrite) != 0 {
-		written, err := connection.Write(totalToWrite)
-		if written > 0 {
-			if !s.session.backendDrained(s.id, written) {
-				s.close()
-				return
-			}
-			totalToWrite = totalToWrite[written:]
-		}
-		if err != nil || written == 0 {
 			s.close()
 			return
 		}
+		s.connMu.Lock()
+		if s.ctx.Err() != nil {
+			s.connMu.Unlock()
+			_ = freshConn.Close()
+			return
+		}
+		s.conn = freshConn
+		connection = freshConn
+		s.connMu.Unlock()
+		logger.Debug("direct telegram dc connected", "stream_id", s.id, "target", targetAddress, "dc", hsRes.DCIdx)
+
+		tgEncryptor, tgDecryptor, err = sendFirstPacket(connection)
+		if err != nil {
+			logger.Warn("direct telegram dc first packet failed", "stream_id", s.id, "target", targetAddress, "err", err)
+			s.connMu.Lock()
+			_ = connection.Close()
+			s.conn = nil
+			s.connMu.Unlock()
+			s.close()
+			return
+		}
+	}
+
+	if !s.session.backendDrained(s.id, len(firstData)) {
+		s.close()
+		return
 	}
 	idleTimeout := s.session.timeouts.Idle.Value()
 	if idleTimeout <= 0 {
@@ -508,7 +596,6 @@ func (s *backendStream) runDirect() {
 			return
 		}
 	}
-
 	// 6. Start write loop and read loop
 	writeDone := make(chan struct{})
 	go func() {

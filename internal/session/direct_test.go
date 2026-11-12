@@ -9,8 +9,10 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -443,6 +445,10 @@ func TestDirectBackendStreamEndToEnd(t *testing.T) {
 			t.Fatalf("Poll failed: %v", err)
 		}
 		cursor = nextCursor
+		if len(downBatch) == 0 {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
 		frames, err := frame.ParseAll(downBatch, frame.MaxPayload)
 		if err != nil {
 			t.Fatalf("ParseAll downlink failed: %v", err)
@@ -786,6 +792,429 @@ func TestDirectWithWarmPoolEndToEnd(t *testing.T) {
 			t.Fatalf("Poll failed: %v", err)
 		}
 		cursor = nextCursor
+		if len(downBatch) == 0 {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		frames, err := frame.ParseAll(downBatch, frame.MaxPayload)
+		if err != nil {
+			t.Fatalf("ParseAll downlink failed: %v", err)
+		}
+		for _, f := range frames {
+			if f.Type == frame.Data && f.StreamID == 1 {
+				receivedCiphertext = append(receivedCiphertext, f.Payload...)
+			}
+		}
+		if len(receivedCiphertext) == 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if len(receivedCiphertext) == 0 {
+		t.Fatal("no DATA frames received in downlink")
+	}
+
+	encPrekeyIV := make([]byte, 48)
+	for i := range encPrekeyIV {
+		encPrekeyIV[i] = clientHandshakeHeader[55-i]
+	}
+	writeHash := sha256.Sum256(append(append([]byte(nil), encPrekeyIV[:32]...), secretBytes...))
+	clientRespBlock, _ := aes.NewCipher(writeHash[:])
+	clientRespStream := cipher.NewCTR(clientRespBlock, encPrekeyIV[32:48])
+
+	decryptedDownlink := make([]byte, len(receivedCiphertext))
+	clientRespStream.XORKeyStream(decryptedDownlink, receivedCiphertext)
+
+	if !bytes.Equal(decryptedDownlink, dcPlainResp) {
+		t.Fatalf("downlink decrypted payload mismatch: expected %q, got %q", dcPlainResp, decryptedDownlink)
+	}
+}
+
+func TestWarmDCPool_DialReuse(t *testing.T) {
+	dcListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer dcListener.Close()
+	dcAddr := dcListener.Addr().String()
+
+	clientPlainMsg := []byte("ping with warm fallback")
+	dcPlainResp := []byte("pong from telegram dc fallback")
+	dcDone := make(chan struct{}, 1)
+	var acceptedConns []net.Conn
+	var connsMu sync.Mutex
+	defer func() {
+		connsMu.Lock()
+		for _, c := range acceptedConns {
+			_ = c.Close()
+		}
+		connsMu.Unlock()
+	}()
+
+	go func() {
+		first := true
+		for {
+			conn, err := dcListener.Accept()
+			if err != nil {
+				return
+			}
+			if first {
+				first = false
+				_ = conn.Close()
+				continue
+			}
+			connsMu.Lock()
+			acceptedConns = append(acceptedConns, conn)
+			connsMu.Unlock()
+
+			go func(c net.Conn) {
+				tgHeader := make([]byte, 64)
+				_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+				if _, err := io.ReadFull(c, tgHeader); err != nil {
+					return
+				}
+				_ = c.SetReadDeadline(time.Time{})
+
+				decPrekey := tgHeader[8:40]
+				decIV := tgHeader[40:56]
+				encPrekeyIV := make([]byte, 48)
+				for i := range encPrekeyIV {
+					encPrekeyIV[i] = tgHeader[55-i]
+				}
+				encPrekey := encPrekeyIV[:32]
+				encIV := encPrekeyIV[32:48]
+
+				readBlock, _ := aes.NewCipher(decPrekey)
+				readStream := cipher.NewCTR(readBlock, decIV)
+				writeBlock, _ := aes.NewCipher(encPrekey)
+				writeStream := cipher.NewCTR(writeBlock, encIV)
+
+				dummy := make([]byte, 64)
+				readStream.XORKeyStream(dummy, dummy)
+
+				encPayload := make([]byte, len(clientPlainMsg))
+				if _, err := io.ReadFull(c, encPayload); err != nil {
+					return
+				}
+				decryptedClientMsg := make([]byte, len(encPayload))
+				readStream.XORKeyStream(decryptedClientMsg, encPayload)
+
+				if !bytes.Equal(decryptedClientMsg, clientPlainMsg) {
+					return
+				}
+
+				encResp := make([]byte, len(dcPlainResp))
+				writeStream.XORKeyStream(encResp, dcPlainResp)
+				_, _ = c.Write(encResp)
+				select {
+				case dcDone <- struct{}{}:
+				default:
+				}
+			}(conn)
+		}
+	}()
+
+	pool := NewWarmDCPool(WarmDCPoolOptions{
+		Targets:       []string{dcAddr},
+		SizePerTarget: 1,
+		MaxIdleAge:    5 * time.Second,
+		DialTimeout:   time.Second,
+		CheckInterval: time.Hour,
+		AllowLoopback: true,
+	})
+	if pool == nil {
+		t.Fatal("failed to initialize warm dc pool")
+	}
+	defer pool.Close()
+
+	// Wait for pool to establish warm connection to listener
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		pool.mu.Lock()
+		ch := pool.queues[dcAddr]
+		count := len(ch)
+		pool.mu.Unlock()
+		if count > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	secretHex := "000102030405060708090a0b0c0d0e0f"
+	secretBytes, _ := hex.DecodeString(secretHex)
+
+	cfg := testConfig(dcAddr)
+	cfg.Profiles[0].BackendType = config.BackendDirect
+	cfg.Profiles[0].Secret = secretHex
+	cfg.Profiles[0].Backend = dcAddr
+	cfg.Timeouts.BackendDial = config.Duration(5 * time.Second)
+
+	sess := newSession(sessionOptions{
+		profile:    &cfg.Profiles[0],
+		limits:     cfg.Limits,
+		timeouts:   cfg.Timeouts,
+		warmDCPool: pool,
+	})
+	defer sess.Close()
+
+	openFrame := frame.Encode(frame.Open, 1, nil)
+	if _, err := sess.ProcessUp(1, openFrame); err != nil {
+		t.Fatalf("ProcessUp OPEN failed: %v", err)
+	}
+
+	clientHandshakeHeader := createTestClientHandshake(TagIntermediate, 2, secretBytes)
+	cDecPrekey := clientHandshakeHeader[8:40]
+	cDecIV := clientHandshakeHeader[40:56]
+	readHash := sha256.Sum256(append(append([]byte(nil), cDecPrekey...), secretBytes...))
+	cBlock, _ := aes.NewCipher(readHash[:])
+	cStream := cipher.NewCTR(cBlock, cDecIV)
+	dummy := make([]byte, 64)
+	cStream.XORKeyStream(dummy, dummy)
+	encClientMsg := make([]byte, len(clientPlainMsg))
+	cStream.XORKeyStream(encClientMsg, clientPlainMsg)
+
+	uplinkPayload := append(append([]byte(nil), clientHandshakeHeader...), encClientMsg...)
+	dataFrame := frame.Encode(frame.Data, 1, uplinkPayload)
+	if _, err := sess.ProcessUp(2, dataFrame); err != nil {
+		t.Fatalf("ProcessUp DATA failed: %v", err)
+	}
+
+	select {
+	case <-dcDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("mock TG DC timed out")
+	}
+
+	// Poll downlink from session
+	cursor := uint64(0)
+	var receivedCiphertext []byte
+	pollDeadline := time.Now().Add(3 * time.Second)
+	for len(receivedCiphertext) == 0 && time.Now().Before(pollDeadline) {
+		downBatch, nextCursor, err := sess.Poll(context.Background(), cursor)
+		if err != nil {
+			t.Fatalf("Poll failed: %v", err)
+		}
+		cursor = nextCursor
+		if len(downBatch) == 0 {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		frames, err := frame.ParseAll(downBatch, frame.MaxPayload)
+		if err != nil {
+			t.Fatalf("ParseAll downlink failed: %v", err)
+		}
+		for _, f := range frames {
+			if f.Type == frame.Data && f.StreamID == 1 {
+				receivedCiphertext = append(receivedCiphertext, f.Payload...)
+			}
+		}
+		if len(receivedCiphertext) == 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if len(receivedCiphertext) == 0 {
+		t.Fatal("no DATA frames received in downlink")
+	}
+
+	encPrekeyIV := make([]byte, 48)
+	for i := range encPrekeyIV {
+		encPrekeyIV[i] = clientHandshakeHeader[55-i]
+	}
+	writeHash := sha256.Sum256(append(append([]byte(nil), encPrekeyIV[:32]...), secretBytes...))
+	clientRespBlock, _ := aes.NewCipher(writeHash[:])
+	clientRespStream := cipher.NewCTR(clientRespBlock, encPrekeyIV[32:48])
+
+	decryptedDownlink := make([]byte, len(receivedCiphertext))
+	clientRespStream.XORKeyStream(decryptedDownlink, receivedCiphertext)
+
+	if !bytes.Equal(decryptedDownlink, dcPlainResp) {
+		t.Fatalf("downlink decrypted payload mismatch: expected %q, got %q", dcPlainResp, decryptedDownlink)
+	}
+}
+
+type failFirstWriteConn struct {
+	net.Conn
+	writeCalled bool
+}
+
+func (f *failFirstWriteConn) Write(b []byte) (int, error) {
+	if !f.writeCalled {
+		f.writeCalled = true
+		return 0, fmt.Errorf("simulated warm socket write failure")
+	}
+	return f.Conn.Write(b)
+}
+
+func TestWarmDCPool_FirstWriteFailureFallback(t *testing.T) {
+	dcListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer dcListener.Close()
+	dcAddr := dcListener.Addr().String()
+
+	clientPlainMsg := []byte("ping with write failure fallback")
+	dcPlainResp := []byte("pong from telegram dc write failure fallback")
+	dcDone := make(chan struct{}, 1)
+	var acceptedConns []net.Conn
+	var connsMu sync.Mutex
+	defer func() {
+		connsMu.Lock()
+		for _, c := range acceptedConns {
+			_ = c.Close()
+		}
+		connsMu.Unlock()
+	}()
+
+	go func() {
+		for {
+			conn, err := dcListener.Accept()
+			if err != nil {
+				return
+			}
+			connsMu.Lock()
+			acceptedConns = append(acceptedConns, conn)
+			connsMu.Unlock()
+
+			go func(c net.Conn) {
+				tgHeader := make([]byte, 64)
+				_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+				if _, err := io.ReadFull(c, tgHeader); err != nil {
+					return
+				}
+				_ = c.SetReadDeadline(time.Time{})
+
+				decPrekey := tgHeader[8:40]
+				decIV := tgHeader[40:56]
+				encPrekeyIV := make([]byte, 48)
+				for i := range encPrekeyIV {
+					encPrekeyIV[i] = tgHeader[55-i]
+				}
+				encPrekey := encPrekeyIV[:32]
+				encIV := encPrekeyIV[32:48]
+
+				readBlock, _ := aes.NewCipher(decPrekey)
+				readStream := cipher.NewCTR(readBlock, decIV)
+				writeBlock, _ := aes.NewCipher(encPrekey)
+				writeStream := cipher.NewCTR(writeBlock, encIV)
+
+				dummy := make([]byte, 64)
+				readStream.XORKeyStream(dummy, dummy)
+
+				encPayload := make([]byte, len(clientPlainMsg))
+				if _, err := io.ReadFull(c, encPayload); err != nil {
+					return
+				}
+				decryptedClientMsg := make([]byte, len(encPayload))
+				readStream.XORKeyStream(decryptedClientMsg, encPayload)
+
+				if !bytes.Equal(decryptedClientMsg, clientPlainMsg) {
+					return
+				}
+
+				encResp := make([]byte, len(dcPlainResp))
+				writeStream.XORKeyStream(encResp, dcPlainResp)
+				_, _ = c.Write(encResp)
+				select {
+				case dcDone <- struct{}{}:
+				default:
+				}
+			}(conn)
+		}
+	}()
+
+	// Connect a live TCP connection to dcListener
+	rawConn, err := net.Dial("tcp", dcAddr)
+	if err != nil {
+		t.Fatalf("failed to dial listener: %v", err)
+	}
+
+	// Wrap in failFirstWriteConn: isConnAlive succeeds, but first Write fails!
+	failingConn := &failFirstWriteConn{Conn: rawConn}
+
+	pool := NewWarmDCPool(WarmDCPoolOptions{
+		Targets:       []string{dcAddr},
+		SizePerTarget: 1,
+		MaxIdleAge:    5 * time.Second,
+		DialTimeout:   time.Second,
+		CheckInterval: time.Hour,
+		AllowLoopback: true,
+	})
+	if pool == nil {
+		t.Fatal("failed to initialize warm dc pool")
+	}
+	defer pool.Close()
+
+	// Inject the failingConn directly into pool.queues[dcAddr]
+	pool.mu.Lock()
+	ch := make(chan *warmItem, 1)
+	ch <- &warmItem{conn: failingConn, createdAt: time.Now()}
+	pool.queues[dcAddr] = ch
+	pool.mu.Unlock()
+
+	secretHex := "000102030405060708090a0b0c0d0e0f"
+	secretBytes, _ := hex.DecodeString(secretHex)
+
+	cfg := testConfig(dcAddr)
+	cfg.Profiles[0].BackendType = config.BackendDirect
+	cfg.Profiles[0].Secret = secretHex
+	cfg.Profiles[0].Backend = dcAddr
+	cfg.Timeouts.BackendDial = config.Duration(5 * time.Second)
+
+	sess := newSession(sessionOptions{
+		profile:    &cfg.Profiles[0],
+		limits:     cfg.Limits,
+		timeouts:   cfg.Timeouts,
+		warmDCPool: pool,
+	})
+	defer sess.Close()
+
+	openFrame := frame.Encode(frame.Open, 1, nil)
+	if _, err := sess.ProcessUp(1, openFrame); err != nil {
+		t.Fatalf("ProcessUp OPEN failed: %v", err)
+	}
+
+	clientHandshakeHeader := createTestClientHandshake(TagIntermediate, 2, secretBytes)
+	cDecPrekey := clientHandshakeHeader[8:40]
+	cDecIV := clientHandshakeHeader[40:56]
+	readHash := sha256.Sum256(append(append([]byte(nil), cDecPrekey...), secretBytes...))
+	cBlock, _ := aes.NewCipher(readHash[:])
+	cStream := cipher.NewCTR(cBlock, cDecIV)
+	dummy := make([]byte, 64)
+	cStream.XORKeyStream(dummy, dummy)
+	encClientMsg := make([]byte, len(clientPlainMsg))
+	cStream.XORKeyStream(encClientMsg, clientPlainMsg)
+
+	uplinkPayload := append(append([]byte(nil), clientHandshakeHeader...), encClientMsg...)
+	dataFrame := frame.Encode(frame.Data, 1, uplinkPayload)
+	if _, err := sess.ProcessUp(2, dataFrame); err != nil {
+		t.Fatalf("ProcessUp DATA failed: %v", err)
+	}
+
+	select {
+	case <-dcDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("mock TG DC timed out waiting for fallback connection")
+	}
+
+	// Verify that warm pool recorded a hit (warm connection was popped and used)
+	if pool.Hits() != 1 {
+		t.Fatalf("expected warm dc pool hits == 1, got %d", pool.Hits())
+	}
+
+	// Poll downlink from session to verify response
+	cursor := uint64(0)
+	var receivedCiphertext []byte
+	pollDeadline := time.Now().Add(3 * time.Second)
+	for len(receivedCiphertext) == 0 && time.Now().Before(pollDeadline) {
+		downBatch, nextCursor, err := sess.Poll(context.Background(), cursor)
+		if err != nil {
+			t.Fatalf("Poll failed: %v", err)
+		}
+		cursor = nextCursor
+		if len(downBatch) == 0 {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
 		frames, err := frame.ParseAll(downBatch, frame.MaxPayload)
 		if err != nil {
 			t.Fatalf("ParseAll downlink failed: %v", err)

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -486,11 +487,43 @@ func TestStreamCDN_Superseded(t *testing.T) {
 
 	time.Sleep(30 * time.Millisecond)
 
-	// Start stream 2 (supersedes stream 1)
-	ctx2, cancel2 := context.WithCancel(context.Background())
-	defer cancel2()
+	// Since maxParallelCDNStreams = 4, streams 1..4 run concurrently in the worker pool.
+	// Starting stream 5 exceeds the pool and evicts the oldest stream (stream 1) via FIFO rotation.
+	cancels := make([]context.CancelFunc, 0, 4)
+	defer func() {
+		for _, cancel := range cancels {
+			cancel()
+		}
+	}()
+
+	// Launch streams 2..4 to fill up the pool to capacity
+	for i := 2; i <= 4; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancels = append(cancels, cancel)
+		go func() {
+			_ = sess.StreamCDN(ctx, 0, func(cur uint64, body []byte) error {
+				return nil
+			})
+		}()
+	}
+
+	// Wait until pool reaches maxParallelCDNStreams
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		sess.mu.Lock()
+		wCount := len(sess.streamWorkers)
+		sess.mu.Unlock()
+		if wCount == maxParallelCDNStreams {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Stream 5: exceeds the pool, evicting the oldest stream (stream 1)
+	ctx5, cancel5 := context.WithCancel(context.Background())
+	cancels = append(cancels, cancel5)
 	go func() {
-		_ = sess.StreamCDN(ctx2, 0, func(cur uint64, body []byte) error {
+		_ = sess.StreamCDN(ctx5, 0, func(cur uint64, body []byte) error {
 			return nil
 		})
 	}()
@@ -703,5 +736,299 @@ func TestProcessUpCDNErrLimitDoesNotCloseSession(t *testing.T) {
 	sess.mu.Unlock()
 	if isClosed {
 		t.Fatal("session was closed on ErrLimit; expected session to stay open for retry")
+	}
+}
+
+func TestSession_VIPPrioritization(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Profiles[0].CarrierMode = config.CarrierCDNAdaptive
+	configuration.Limits.CDNMaxDownBatchBytes = 131072
+	sess := newSession(sessionOptions{
+		profile:  &configuration.Profiles[0],
+		limits:   configuration.Limits,
+		timeouts: configuration.Timeouts,
+	})
+	defer sess.Close()
+
+	// Subtest 1: VIP frames (WINDOW, interactive DATA) advance ahead of bulk media DATA
+	sess.mu.Lock()
+	f1 := frame.Encode(frame.Data, 1, make([]byte, 64*1024))
+	f2 := frame.Encode(frame.Window, 2, frame.WindowPayload(104))
+	f3 := frame.Encode(frame.Data, 2, make([]byte, 500))
+	sess.pendingFrames = []queuedFrame{
+		{encoded: f1, typeCode: frame.Data, streamID: 1, cost: len(f1)},
+		{encoded: f2, typeCode: frame.Window, streamID: 2, cost: len(f2)},
+		{encoded: f3, typeCode: frame.Data, streamID: 2, cost: len(f3)},
+	}
+	batch := sess.takeDownBatchLimitLocked(131072)
+	sess.mu.Unlock()
+
+	frames, err := frame.ParseAll(batch.body, frame.MaxPayload)
+	if err != nil {
+		t.Fatalf("failed to parse batch: %v", err)
+	}
+	if len(frames) != 3 {
+		t.Fatalf("expected 3 frames, got %d", len(frames))
+	}
+	// Frame 0: WINDOW (stream 2)
+	if frames[0].Type != frame.Window || frames[0].StreamID != 2 {
+		t.Fatalf("expected frame 0 to be WINDOW (stream 2), got type=%v stream=%d", frames[0].Type, frames[0].StreamID)
+	}
+	// Frame 1: DATA (stream 2, 500 B)
+	if frames[1].Type != frame.Data || frames[1].StreamID != 2 || len(frames[1].Payload) != 500 {
+		t.Fatalf("expected frame 1 to be DATA (stream 2, 500 B), got type=%v stream=%d len=%d", frames[1].Type, frames[1].StreamID, len(frames[1].Payload))
+	}
+	// Frame 2: DATA (stream 1, 64 KiB)
+	if frames[2].Type != frame.Data || frames[2].StreamID != 1 || len(frames[2].Payload) != 64*1024 {
+		t.Fatalf("expected frame 2 to be DATA (stream 1, 64 KiB), got type=%v stream=%d len=%d", frames[2].Type, frames[2].StreamID, len(frames[2].Payload))
+	}
+
+	// Subtest 2: Size limit scenario (maxBytes = 4000)
+	// Bulk media frame does not fit in remaining budget; VIP frames are returned, bulk remains in queue.
+	sess.mu.Lock()
+	sess.pendingFrames = []queuedFrame{
+		{encoded: f1, typeCode: frame.Data, streamID: 1, cost: len(f1)},
+		{encoded: f2, typeCode: frame.Window, streamID: 2, cost: len(f2)},
+		{encoded: f3, typeCode: frame.Data, streamID: 2, cost: len(f3)},
+	}
+	batch = sess.takeDownBatchLimitLocked(4000)
+	remCount := len(sess.pendingFrames)
+	sess.mu.Unlock()
+
+	frames, err = frame.ParseAll(batch.body, frame.MaxPayload)
+	if err != nil {
+		t.Fatalf("failed to parse batch: %v", err)
+	}
+	if len(frames) != 2 {
+		t.Fatalf("expected 2 VIP frames in batch, got %d", len(frames))
+	}
+	if frames[0].Type != frame.Window || frames[0].StreamID != 2 {
+		t.Fatalf("expected frame 0 to be WINDOW, got %v", frames[0])
+	}
+	if frames[1].Type != frame.Data || frames[1].StreamID != 2 || len(frames[1].Payload) != 500 {
+		t.Fatalf("expected frame 1 to be interactive DATA, got %v", frames[1])
+	}
+	if remCount != 1 {
+		t.Fatalf("expected 1 remaining frame in pendingFrames, got %d", remCount)
+	}
+
+	// Subtest 3: Relative ordering within a single stream is strictly preserved
+	// Queue for stream 1: [DATA 64 KiB, DATA 500 B, CLOSE]
+	// DATA 500 B and CLOSE must NOT bypass earlier DATA 64 KiB of stream 1!
+	sess.mu.Lock()
+	f1Small := frame.Encode(frame.Data, 1, make([]byte, 500))
+	fc := frame.Encode(frame.Close, 1, nil)
+	sess.pendingFrames = []queuedFrame{
+		{encoded: f1, typeCode: frame.Data, streamID: 1, cost: len(f1)},
+		{encoded: f1Small, typeCode: frame.Data, streamID: 1, cost: len(f1Small)},
+		{encoded: fc, typeCode: frame.Close, streamID: 1, cost: len(fc)},
+	}
+	batch = sess.takeDownBatchLimitLocked(131072)
+	sess.mu.Unlock()
+
+	frames, err = frame.ParseAll(batch.body, frame.MaxPayload)
+	if err != nil {
+		t.Fatalf("failed to parse batch: %v", err)
+	}
+	if len(frames) != 3 {
+		t.Fatalf("expected 3 frames, got %d", len(frames))
+	}
+	if frames[0].Type != frame.Data || frames[0].StreamID != 1 || len(frames[0].Payload) != 64*1024 {
+		t.Fatalf("expected frame 0 to be DATA 64 KiB, got %v", frames[0])
+	}
+	if frames[1].Type != frame.Data || frames[1].StreamID != 1 || len(frames[1].Payload) != 500 {
+		t.Fatalf("expected frame 1 to be DATA 500 B, got %v", frames[1])
+	}
+	if frames[2].Type != frame.Close || frames[2].StreamID != 1 {
+		t.Fatalf("expected frame 2 to be CLOSE, got %v", frames[2])
+	}
+	// Subtest 4: When OPEN doesn't fit in budget (budget consumed by earlier frame),
+	// subsequent CLOSE of that stream must NOT bypass OPEN
+	sess.mu.Lock()
+	fo3 := frame.Encode(frame.Open, 3, nil)
+	fc3 := frame.Encode(frame.Close, 3, nil)
+	sess.pendingFrames = []queuedFrame{
+		{encoded: f2, typeCode: frame.Window, streamID: 2, cost: len(f2)}, // 104 bytes
+		{encoded: fo3, typeCode: frame.Open, streamID: 3, cost: len(fo3)},   // 8 bytes
+		{encoded: fc3, typeCode: frame.Close, streamID: 3, cost: len(fc3)},  // 8 bytes
+	}
+	// maxBytes = len(f2): f2 fills budget; fo3 doesn't fit; fc3 must not bypass fo3
+	batch = sess.takeDownBatchLimitLocked(len(f2))
+	remCount = len(sess.pendingFrames)
+	sess.mu.Unlock()
+
+	frames, err = frame.ParseAll(batch.body, frame.MaxPayload)
+	if err != nil {
+		t.Fatalf("failed to parse batch: %v", err)
+	}
+	if len(frames) != 1 || frames[0].Type != frame.Window || frames[0].StreamID != 2 {
+		t.Fatalf("expected only stream 2 WINDOW in batch, got %v", frames)
+	}
+	if remCount != 2 {
+		t.Fatalf("expected both OPEN and CLOSE of stream 3 to remain queued, got %d", remCount)
+	}
+
+	// Subtest 5: CLOSE of stream 1 is blocked behind heavy DATA 64K of stream 1,
+	// while VIP frames of stream 2 ARE picked
+	sess.mu.Lock()
+	sess.pendingFrames = []queuedFrame{
+		{encoded: f1, typeCode: frame.Data, streamID: 1, cost: len(f1)},
+		{encoded: fc, typeCode: frame.Close, streamID: 1, cost: len(fc)},
+		{encoded: f2, typeCode: frame.Window, streamID: 2, cost: len(f2)},
+		{encoded: f3, typeCode: frame.Data, streamID: 2, cost: len(f3)},
+	}
+	// maxBytes = 4000: f1 (64K) doesn't fit; fc (stream 1) must be blocked; f2 and f3 (stream 2) must be picked
+	batch = sess.takeDownBatchLimitLocked(4000)
+	remCount = len(sess.pendingFrames)
+	sess.mu.Unlock()
+
+	frames, err = frame.ParseAll(batch.body, frame.MaxPayload)
+	if err != nil {
+		t.Fatalf("failed to parse batch: %v", err)
+	}
+	if len(frames) != 2 {
+		t.Fatalf("expected 2 frames from stream 2, got %d", len(frames))
+	}
+	if frames[0].Type != frame.Window || frames[0].StreamID != 2 {
+		t.Fatalf("expected frame 0 to be WINDOW (stream 2), got %v", frames[0])
+	}
+	if frames[1].Type != frame.Data || frames[1].StreamID != 2 {
+		t.Fatalf("expected frame 1 to be DATA (stream 2), got %v", frames[1])
+	}
+	if remCount != 2 {
+		t.Fatalf("expected stream 1's DATA and CLOSE to remain queued, got %d", remCount)
+	}
+}
+
+func TestSession_ParallelStreamWorkers(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Profiles[0].CarrierMode = config.CarrierCDNAdaptive
+	configuration.Limits.CDNMaxDownBatchBytes = 524288 // 512 KiB
+	sess := newSession(sessionOptions{
+		profile:  &configuration.Profiles[0],
+		limits:   configuration.Limits,
+		timeouts: configuration.Timeouts,
+	})
+	defer sess.Close()
+
+	// 1. Single worker test: can consume batch > 128 KiB
+	sess.mu.Lock()
+	for i := 0; i < 4; i++ {
+		f := frame.Encode(frame.Data, uint32(i+1), make([]byte, 64*1024))
+		sess.pendingFrames = append(sess.pendingFrames, queuedFrame{
+			encoded:  f,
+			typeCode: frame.Data,
+			streamID: uint32(i + 1),
+			cost:     len(f),
+		})
+	}
+	sess.mu.Unlock()
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	singleBatchReceived := make(chan int, 1)
+	go func() {
+		_ = sess.StreamCDN(ctx1, 0, func(cur uint64, body []byte) error {
+			singleBatchReceived <- len(body)
+			return nil
+		})
+	}()
+
+	select {
+	case size := <-singleBatchReceived:
+		if size <= 131072 {
+			t.Fatalf("expected single worker batch > 128 KiB, got %d", size)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for single worker batch")
+	}
+	cancel1()
+	time.Sleep(30 * time.Millisecond)
+
+	// 2. Multi-worker test: each batch MUST be capped at 131072 bytes (128 KiB)
+	sess2 := newSession(sessionOptions{
+		profile:  &configuration.Profiles[0],
+		limits:   configuration.Limits,
+		timeouts: configuration.Timeouts,
+	})
+	defer sess2.Close()
+
+	ctxWorkers, cancelWorkers := context.WithCancel(context.Background())
+	defer cancelWorkers()
+
+	var maxObservedBatch int64
+	var mu sync.Mutex
+	recordBatch := func(size int) {
+		mu.Lock()
+		defer mu.Unlock()
+		if int64(size) > maxObservedBatch {
+			maxObservedBatch = int64(size)
+		}
+	}
+
+	workerDone := make(chan struct{}, 2)
+	for w := 0; w < 2; w++ {
+		go func() {
+			_ = sess2.StreamCDN(ctxWorkers, 0, func(cur uint64, body []byte) error {
+				recordBatch(len(body))
+				return nil
+			})
+			workerDone <- struct{}{}
+		}()
+	}
+
+	// Wait until both workers are registered in s.streamWorkers
+	regDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(regDeadline) {
+		sess2.mu.Lock()
+		wCount := len(sess2.streamWorkers)
+		sess2.mu.Unlock()
+		if wCount == 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Queue 8 frames of 64 KiB each and wake up workers
+	sess2.mu.Lock()
+	for i := 0; i < 8; i++ {
+		f := frame.Encode(frame.Data, uint32(i+1), make([]byte, 64*1024))
+		sess2.pendingFrames = append(sess2.pendingFrames, queuedFrame{
+			encoded:  f,
+			typeCode: frame.Data,
+			streamID: uint32(i + 1),
+			cost:     len(f),
+		})
+	}
+	signal(sess2.notify)
+	sess2.mu.Unlock()
+
+	time.Sleep(100 * time.Millisecond)
+	cancelWorkers()
+
+	for w := 0; w < 2; w++ {
+		select {
+		case <-workerDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("worker did not exit cleanly")
+		}
+	}
+
+	mu.Lock()
+	observed := maxObservedBatch
+	mu.Unlock()
+
+	if observed == 0 {
+		t.Fatal("no batches observed by parallel workers")
+	}
+	if observed > 131072 {
+		t.Fatalf("expected parallel worker batch <= 131072 bytes, got %d", observed)
+	}
+
+	sess2.mu.Lock()
+	workersCount := len(sess2.streamWorkers)
+	sess2.mu.Unlock()
+	if workersCount != 0 {
+		t.Fatalf("expected 0 active streamWorkers after cancellation, got %d", workersCount)
 	}
 }

@@ -700,36 +700,13 @@ func (s *Session) takeDownBatchLimitLocked(maxBytes int) downBatch {
 		return downBatch{}
 	}
 
-	// Fast path: check if all pending frames fit in maxBytes and frame.MaxBatchFrames
-	totalSize := 0
-	totalCost := 0
-	allFit := n <= frame.MaxBatchFrames
-	if allFit {
-		for i := 0; i < n; i++ {
-			totalSize += len(s.pendingFrames[i].encoded)
-			totalCost += s.pendingFrames[i].cost
-			if i != 0 && totalSize > maxBytes {
-				allFit = false
-				break
-			}
-		}
-	}
-	if allFit {
-		result := make([]byte, 0, totalSize)
-		for i := 0; i < n; i++ {
-			result = append(result, s.pendingFrames[i].encoded...)
-			s.pendingFrames[i] = queuedFrame{}
-		}
-		s.pendingFrames = nil
-		clear(s.pendingWindows)
-		return downBatch{body: result, cost: totalCost, items: n}
-	}
-
 	// Priority-aware selection preserving per-stream FIFO ordering:
-	// Pass 1 picks control frames (WINDOW, OPEN) and small interactive frames from streams
+	// Pass 1 picks control frames (WINDOW, OPEN, CLOSE) and small interactive frames from streams
 	// that haven't had a frame skipped yet.
 	// Pass 2 fills the remaining budget in normal FIFO order.
 	picked := make([]bool, n)
+	vipIndices := make([]int, 0, n)
+	bulkIndices := make([]int, 0, n)
 	blockedStream := make(map[uint32]bool)
 	size := 0
 	cost := 0
@@ -738,21 +715,23 @@ func (s *Session) takeDownBatchLimitLocked(maxBytes int) downBatch {
 	// Pass 1: VIP Control & Interactive frames
 	for i := 0; i < n && count < frame.MaxBatchFrames; i++ {
 		f := &s.pendingFrames[i]
-		isVIP := f.typeCode == frame.Window || f.typeCode == frame.Open ||
+		fLen := len(f.encoded)
+		isVIP := (f.typeCode == frame.Window) ||
+			(f.typeCode == frame.Open && !blockedStream[f.streamID]) ||
 			(f.typeCode == frame.Close && !blockedStream[f.streamID]) ||
-			(f.typeCode == frame.Data && len(f.encoded) <= frame.HeaderSize+interactiveDataLimit && !blockedStream[f.streamID])
+			(f.typeCode == frame.Data && fLen <= frame.HeaderSize+interactiveDataLimit && !blockedStream[f.streamID])
 
 		if isVIP {
-			fLen := len(f.encoded)
 			if count == 0 || size+fLen <= maxBytes {
 				picked[i] = true
+				vipIndices = append(vipIndices, i)
 				size += fLen
 				cost += f.cost
 				count++
 				continue
 			}
 		}
-		if f.typeCode == frame.Data || f.typeCode == frame.Close {
+		if f.typeCode == frame.Open || f.typeCode == frame.Data || f.typeCode == frame.Close {
 			blockedStream[f.streamID] = true
 		}
 	}
@@ -768,25 +747,33 @@ func (s *Session) takeDownBatchLimitLocked(maxBytes int) downBatch {
 			break
 		}
 		picked[i] = true
+		bulkIndices = append(bulkIndices, i)
 		size += fLen
 		cost += f.cost
 		count++
 	}
 
+	// Serialize VIP frames ahead of bulk frames in the output envelope
 	result := make([]byte, 0, size)
+	for _, idx := range vipIndices {
+		result = append(result, s.pendingFrames[idx].encoded...)
+	}
+	for _, idx := range bulkIndices {
+		result = append(result, s.pendingFrames[idx].encoded...)
+	}
+
+	// Compact remaining unpicked frames in pendingFrames and reindex pendingWindows
 	writeIdx := 0
 	clear(s.pendingWindows)
-
 	for i := 0; i < n; i++ {
 		if picked[i] {
-			result = append(result, s.pendingFrames[i].encoded...)
-		} else {
-			s.pendingFrames[writeIdx] = s.pendingFrames[i]
-			if s.pendingFrames[writeIdx].typeCode == frame.Window {
-				s.pendingWindows[s.pendingFrames[writeIdx].streamID] = writeIdx
-			}
-			writeIdx++
+			continue
 		}
+		s.pendingFrames[writeIdx] = s.pendingFrames[i]
+		if s.pendingFrames[writeIdx].typeCode == frame.Window {
+			s.pendingWindows[s.pendingFrames[writeIdx].streamID] = writeIdx
+		}
+		writeIdx++
 	}
 	for i := writeIdx; i < n; i++ {
 		s.pendingFrames[i] = queuedFrame{}
