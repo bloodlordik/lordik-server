@@ -1032,3 +1032,204 @@ func TestSession_ParallelStreamWorkers(t *testing.T) {
 		t.Fatalf("expected 0 active streamWorkers after cancellation, got %d", workersCount)
 	}
 }
+
+func TestProcessUpCDN_BackpressureDrainOrder(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Profiles[0].CarrierMode = config.CarrierCDNAdaptive
+	sess := newSession(sessionOptions{
+		profile:  &configuration.Profiles[0],
+		limits:   configuration.Limits,
+		timeouts: configuration.Timeouts,
+	})
+	defer sess.Close()
+
+	// Manually set pending frames representing a deferred frame from backpressure
+	deferredFrame := frame.Encode(frame.Open, 100, nil)
+	parsed, _ := frame.ParseAll(deferredFrame, 1024)
+	sess.mu.Lock()
+	sess.cdnPendingFrames = parsed
+	sess.mu.Unlock()
+
+	// Process chunk 1 containing frame 200
+	newFrame := frame.Encode(frame.Open, 200, nil)
+	ready, err := sess.ProcessUpCDN(1, newFrame)
+	if err != nil {
+		t.Fatalf("unexpected error processing chunk with pending frames: %v", err)
+	}
+	if ready != 2 {
+		t.Fatalf("expected 2 frames applied (1 pending + 1 new), got %d", ready)
+	}
+
+	sess.mu.Lock()
+	pendingLen := len(sess.cdnPendingFrames)
+	sess.mu.Unlock()
+	if pendingLen != 0 {
+		t.Fatalf("expected 0 pending frames, got %d", pendingLen)
+	}
+}
+
+func TestStreamCDN_DeadWorkerZeroDelayReplay(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Profiles[0].CarrierMode = config.CarrierCDNAdaptive
+	sess := newSession(sessionOptions{
+		profile:  &configuration.Profiles[0],
+		limits:   configuration.Limits,
+		timeouts: configuration.Timeouts,
+	})
+	defer sess.Close()
+
+	// Start Worker 1
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	batches1 := make(chan uint64, 5)
+	go func() {
+		_ = sess.StreamCDN(ctx1, 0, func(cur uint64, body []byte) error {
+			if len(body) > 0 {
+				batches1 <- cur
+			}
+			return nil
+		})
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+
+	// Queue batch 1
+	sess.mu.Lock()
+	sess.queueFrameLocked(frame.Data, 1, []byte("worker 1 payload"))
+	sess.mu.Unlock()
+
+	select {
+	case cur := <-batches1:
+		if cur != 1 {
+			t.Fatalf("expected cursor 1, got %d", cur)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for worker 1 batch")
+	}
+
+	// Cancel Worker 1 (simulating dead socket / dropped connection)
+	cancel1()
+	time.Sleep(20 * time.Millisecond)
+
+	// Worker 2 connects immediately (< 100ms, well below staleUnackedReplayAge 600ms)
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	batches2 := make(chan uint64, 5)
+	start := time.Now()
+	go func() {
+		_ = sess.StreamCDN(ctx2, 0, func(cur uint64, body []byte) error {
+			if len(body) > 0 {
+				batches2 <- cur
+			}
+			return nil
+		})
+	}()
+
+	select {
+	case cur := <-batches2:
+		elapsed := time.Since(start)
+		if cur != 1 {
+			t.Fatalf("expected replayed cursor 1, got %d", cur)
+		}
+		if elapsed >= 500*time.Millisecond {
+			t.Fatalf("replay took %v, expected near 0ms for dead worker", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for dead worker replay")
+	}
+}
+
+func TestPollCDNExt_DoesNotEvictStreamWorkersUnlessFallback(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	configuration.Profiles[0].CarrierMode = config.CarrierCDNAdaptive
+	sess := newSession(sessionOptions{
+		profile:  &configuration.Profiles[0],
+		limits:   configuration.Limits,
+		timeouts: configuration.Timeouts,
+	})
+	defer sess.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_ = sess.StreamCDN(ctx, 0, func(cur uint64, body []byte) error {
+			return nil
+		})
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+
+	sess.mu.Lock()
+	workersBefore := len(sess.streamWorkers)
+	downCur := sess.downCursor
+	sess.mu.Unlock()
+	if workersBefore != 1 {
+		t.Fatalf("expected 1 stream worker, got %d", workersBefore)
+	}
+
+	// Non-fallback poll at downCursor should return immediately without evicting stream workers
+	pollCtx, pollCancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer pollCancel()
+	body, cur, err := sess.PollCDNExt(pollCtx, downCur, 1*time.Second, false)
+	if err != nil {
+		t.Fatalf("unexpected error on non-fallback poll: %v", err)
+	}
+	if body != nil {
+		t.Fatalf("expected nil body on non-fallback poll, got %d bytes", len(body))
+	}
+	if cur != downCur {
+		t.Fatalf("expected cursor %d, got %d", downCur, cur)
+	}
+
+	sess.mu.Lock()
+	workersAfter := len(sess.streamWorkers)
+	sess.mu.Unlock()
+	if workersAfter != 1 {
+		t.Fatalf("stream workers were evicted by non-fallback poll: count = %d", workersAfter)
+	}
+
+	// Fallback poll at downCursor SHOULD evict stream workers
+	fallbackCtx, fallbackCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer fallbackCancel()
+	_, _, _ = sess.PollCDNExt(fallbackCtx, downCur, 50*time.Millisecond, true)
+
+	sess.mu.Lock()
+	workersAfterFallback := len(sess.streamWorkers)
+	sess.mu.Unlock()
+	if workersAfterFallback != 0 {
+		t.Fatalf("stream workers should have been evicted by fallback poll, got %d", workersAfterFallback)
+	}
+}
+
+func TestAckCursorLocked_InPlaceCompaction(t *testing.T) {
+	configuration := testConfig("127.0.0.1:1")
+	sess := newSession(sessionOptions{
+		profile:  &configuration.Profiles[0],
+		limits:   configuration.Limits,
+		timeouts: configuration.Timeouts,
+	})
+	defer sess.Close()
+
+	sess.mu.Lock()
+	sess.pendingCost = 100
+	sess.pendingItems = 10
+	// Fill 4 unacked batches
+	for i := uint64(1); i <= 4; i++ {
+		sess.unackedBatches = append(sess.unackedBatches, sentBatch{
+			cursor: i,
+			body:   []byte("test"),
+			cost:   10,
+			items:  1,
+		})
+	}
+	sess.downCursor = 4
+
+	// Ack up to cursor 2
+	sess.ackCursorLocked(2)
+	if len(sess.unackedBatches) != 2 {
+		t.Fatalf("expected 2 unacked batches left, got %d", len(sess.unackedBatches))
+	}
+	if sess.unackedBatches[0].cursor != 3 || sess.unackedBatches[1].cursor != 4 {
+		t.Fatalf("unexpected unacked batches remaining: %+v", sess.unackedBatches)
+	}
+	sess.mu.Unlock()
+}

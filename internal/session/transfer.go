@@ -305,7 +305,11 @@ func (s *Session) takeDownBatchLocked() downBatch {
 		result = append(result, s.pendingFrames[index].encoded...)
 		s.pendingFrames[index] = queuedFrame{}
 	}
-	s.pendingFrames = s.pendingFrames[count:]
+	remaining := copy(s.pendingFrames, s.pendingFrames[count:])
+	for i := remaining; i < len(s.pendingFrames); i++ {
+		s.pendingFrames[i] = queuedFrame{}
+	}
+	s.pendingFrames = s.pendingFrames[:remaining]
 	for id, index := range s.pendingWindows {
 		s.pendingWindows[id] = index - count
 	}

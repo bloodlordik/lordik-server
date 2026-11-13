@@ -651,3 +651,26 @@ lordik-server/
       - Полная очистка активных потоков `activeStreams` с отправкой кадров `CLOSE (0x03)` и управляющего сообщения `{t: 'close'}` при завершении.
     - **Сохранность функционала**:
       - Все существующие режимы (`https`, `https-lanes`, `websocket`, `websocket-lanes`, `cdn`, `cdn-adaptive`, `cdn-get`, `cdn-body`, `cdn-ws`, `yc-ws`) сохранены в неизменном виде.
+34. **Комплексные исправления стабильности, реплея и компактизации памяти (Code Review Fixes)**:
+    - **Компоненты**: `internal/session/cdn_session.go`, `internal/session/transfer.go`, `internal/session/subframe_test.go`, `internal/server/cdn.go`, `internal/bridge/templates/cdn_ws.html`, `docker/profiles.json`.
+    - **Устранение порчи состояния и дублирования кадров при `ErrBackpressure`**:
+      - В `ProcessUpCDN` и `ProcessUpCDNSubFrames` отложенные кадры `s.cdnPendingFrames` от предыдущего события противодавления гарантированно опустошаются и применяются в backend *до* вызова парсинга нового чанка (`Push`/`PushChunk`).
+      - Если противодавление сохраняется, метод немедленно возвращает `ErrBackpressure` без затягивания нового чанка в буфер сборки и без смешивания старых и новых кадров.
+      - Если противодавление возникает только на новых кадрах, в `cdnPendingFrames` сохраняются строго новые кадры, а клиент получает `ErrBackpressure` для стандартного ретрая без дублирования.
+    - **Детектирование мертвых воркеров и Zero-Delay Replay в `StreamCDN`**:
+      - Структура `sentBatch` расширена полем `worker chan struct{}`.
+      - При завершении воркера `StreamCDN` его индивидуальный канал `mine` гарантированно закрывается в `defer`.
+      - Функция `isWorkerDead(b.worker)` определяет завершение работы воркера, отправлявшего неподтвержденный батч.
+      - При подключении нового воркера батчи, отправленные умершим воркером, переотправляются мгновенно (0 мс задержки) без ожидания таймаута устаревания `staleUnackedReplayAge` (600 мс), предотвращая подвисание видеостриминга.
+    - **In-place компактизация срезов `unackedBatches` и `pendingFrames`**:
+      - В `ackCursorLocked` (`cdn_session.go`) и `takeDownBatchLocked` (`transfer.go`) срезка через простой слайсинг `[count:]` заменена на сдвиг через `copy(s[0:], s[count:])` с обнулением хвоста и усечением длины.
+      - Это фиксирует начало среза на индексе 0 базового массива, сохраняя его емкость и исключая постоянные переаллокации памяти в хипе во время непрерывного стриминга.
+    - **Изоляция `PollCDN` от сброса активных стримов `StreamCDN`**:
+      - В `cdn_session.go` добавлен метод `PollCDNExt` с флагом `isFallback`. При обращении с `cursor == downCursor` при наличии активных `streamWorkers` вызов без явного флага `isFallback: true` не закрывает воркеры стриминга, возвращая пустой ответ.
+      - В `cdn_ws.html` функция `scheduleGapHeal` вызывает `pollOnce(true)`, формируя NACK-запрос `?ack={cursor}&nack=1`, который обрабатывается сервером через `NackReplay` без прерывания стриминговых сокетов.
+    - **Zero-Copy упаковка glTF ответов**:
+      - В `writeCDNDownlinkResponse` (`server/cdn.go`) устранены промежуточные аллокации срезов `WrapGLTF`. Заголовок `[session.GLTFHeaderSize]byte` формируется на стеке и записывается напрямую в `http.ResponseWriter` системными вызовами `Write(hdr)` и `Write(batch)`.
+    - **Согласование модульной арифметики RFC 1982 в тестах субфреймов**:
+      - В `subframe_test.go` тестовый скачок sequence приведен в соответствие с увеличенным размером окна `maxStreamWindowSpan = 256` (`Seq = 300`) с проверкой возврата мягкого `ErrLimit`.
+    - **Профиль по умолчанию `direct-auto` в Docker**:
+      - В `docker/profiles.json` добавлен профиль прямого подключения `direct-auto` (`backend_type: direct`, `backend: auto`), работающий из коробки без зависимостей от Telemt Middle-End на порту 8888.

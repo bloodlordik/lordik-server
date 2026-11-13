@@ -22,6 +22,7 @@ type sentBatch struct {
 	cost   int
 	items  int
 	sentAt time.Time
+	worker chan struct{}
 }
 
 // AckDownCDN acknowledges client received bytes up to cursor.
@@ -50,12 +51,45 @@ func (s *Session) ProcessUpCDN(sequence uint64, chunk []byte) (int, error) {
 	}
 	s.lastActivity = time.Now()
 
-	var frames []frame.Frame
-	// If there were deferred frames from a previous backpressure event, apply them first
+	var allClosed []*backendStream
+	var allOpened []*backendStream
+	appliedPending := 0
+
+	// 1. Drain pending frames from previous backpressure event first
 	if len(s.cdnPendingFrames) != 0 {
-		frames = s.cdnPendingFrames
+		pending := s.cdnPendingFrames
+		s.cdnPendingFrames = nil
+		if !s.validateBatchLocked(pending) {
+			s.mu.Unlock()
+			s.protocolFailure()
+			return 0, ErrProtocol
+		}
+		reservedCost, reservedItems := s.backendWriteReservationLocked(pending)
+		if (reservedCost != 0 || reservedItems != 0) &&
+			!s.reservePendingLocked(reservedCost, reservedItems, pendingUplink) {
+			s.cdnPendingFrames = pending
+			s.mu.Unlock()
+			return 0, ErrBackpressure
+		}
+		opened, closed, unusedCost, unusedItems, applied := s.applyBatchLocked(
+			pending,
+			reservedCost,
+			reservedItems)
+		if unusedCost != 0 || unusedItems != 0 {
+			s.releasePendingLocked(unusedCost, unusedItems)
+		}
+		s.backendWG.Add(len(opened))
+		if !applied {
+			s.mu.Unlock()
+			s.Close()
+			return 0, ErrClosed
+		}
+		allClosed = append(allClosed, closed...)
+		allOpened = append(allOpened, opened...)
+		appliedPending = len(pending)
 	}
 
+	// 2. Only after pending frames are drained, parse the incoming chunk
 	if s.cdnReassembly == nil {
 		windowSize := uint64(s.limits.CDNUplinkWindowSize)
 		if windowSize == 0 {
@@ -70,53 +104,81 @@ func (s *Session) ProcessUpCDN(sequence uint64, chunk []byte) (int, error) {
 			s.protocolFailure()
 		}
 		s.mu.Unlock()
-		return 0, err
-	}
-	if len(pushedFrames) != 0 {
-		frames = append(frames, pushedFrames...)
-	}
-	if len(frames) == 0 {
-		s.mu.Unlock()
-		return 0, nil
+		for _, value := range allClosed {
+			value.close()
+		}
+		for _, value := range allOpened {
+			go s.runBackend(value)
+		}
+		return appliedPending, err
 	}
 
-	if !s.validateBatchLocked(frames) {
+	if len(pushedFrames) == 0 {
 		s.mu.Unlock()
-		s.protocolFailure()
-		return 0, ErrProtocol
+		for _, value := range allClosed {
+			value.close()
+		}
+		for _, value := range allOpened {
+			go s.runBackend(value)
+		}
+		if s.onUp != nil {
+			s.onUp(len(chunk))
+		}
+		return appliedPending, nil
 	}
-	reservedCost, reservedItems := s.backendWriteReservationLocked(frames)
+
+	if !s.validateBatchLocked(pushedFrames) {
+		s.mu.Unlock()
+		for _, value := range allClosed {
+			value.close()
+		}
+		for _, value := range allOpened {
+			go s.runBackend(value)
+		}
+		s.protocolFailure()
+		return appliedPending, ErrProtocol
+	}
+
+	reservedCost, reservedItems := s.backendWriteReservationLocked(pushedFrames)
 	if (reservedCost != 0 || reservedItems != 0) &&
 		!s.reservePendingLocked(reservedCost, reservedItems, pendingUplink) {
-		s.cdnPendingFrames = frames
+		s.cdnPendingFrames = pushedFrames
 		s.mu.Unlock()
-		return 0, ErrBackpressure
+		for _, value := range allClosed {
+			value.close()
+		}
+		for _, value := range allOpened {
+			go s.runBackend(value)
+		}
+		return appliedPending, ErrBackpressure
 	}
-	s.cdnPendingFrames = nil
+
 	opened, closed, unusedCost, unusedItems, applied := s.applyBatchLocked(
-		frames,
+		pushedFrames,
 		reservedCost,
 		reservedItems)
 	if unusedCost != 0 || unusedItems != 0 {
 		s.releasePendingLocked(unusedCost, unusedItems)
 	}
 	s.backendWG.Add(len(opened))
+	allClosed = append(allClosed, closed...)
+	allOpened = append(allOpened, opened...)
 	s.mu.Unlock()
 
-	for _, value := range closed {
+	for _, value := range allClosed {
 		value.close()
 	}
-	for _, value := range opened {
+	for _, value := range allOpened {
 		go s.runBackend(value)
 	}
 	if !applied {
 		s.Close()
-		return 0, ErrClosed
+		return appliedPending, ErrClosed
 	}
 	if s.onUp != nil {
 		s.onUp(len(chunk))
 	}
-	return len(frames), nil
+	return appliedPending + len(pushedFrames), nil
 }
 
 // ProcessUpCDNSubFrames processes an uplink chunk containing per-stream SubFrames.
@@ -129,12 +191,45 @@ func (s *Session) ProcessUpCDNSubFrames(chunk []byte) (int, error) {
 	}
 	s.lastActivity = time.Now()
 
-	var frames []frame.Frame
+	var allClosed []*backendStream
+	var allOpened []*backendStream
+	appliedPending := 0
+
+	// 1. Drain pending frames from previous backpressure event first
 	if len(s.cdnPendingFrames) != 0 {
-		frames = s.cdnPendingFrames
+		pending := s.cdnPendingFrames
 		s.cdnPendingFrames = nil
+		if !s.validateBatchLocked(pending) {
+			s.mu.Unlock()
+			s.protocolFailure()
+			return 0, ErrProtocol
+		}
+		reservedCost, reservedItems := s.backendWriteReservationLocked(pending)
+		if (reservedCost != 0 || reservedItems != 0) &&
+			!s.reservePendingLocked(reservedCost, reservedItems, pendingUplink) {
+			s.cdnPendingFrames = pending
+			s.mu.Unlock()
+			return 0, ErrBackpressure
+		}
+		opened, closed, unusedCost, unusedItems, applied := s.applyBatchLocked(
+			pending,
+			reservedCost,
+			reservedItems)
+		if unusedCost != 0 || unusedItems != 0 {
+			s.releasePendingLocked(unusedCost, unusedItems)
+		}
+		s.backendWG.Add(len(opened))
+		if !applied {
+			s.mu.Unlock()
+			s.Close()
+			return 0, ErrClosed
+		}
+		allClosed = append(allClosed, closed...)
+		allOpened = append(allOpened, opened...)
+		appliedPending = len(pending)
 	}
 
+	// 2. Only after pending frames are drained, parse the incoming chunk
 	if s.cdnQUICReassembly == nil {
 		s.cdnQUICReassembly = NewPerStreamReassembly()
 	}
@@ -142,60 +237,92 @@ func (s *Session) ProcessUpCDNSubFrames(chunk []byte) (int, error) {
 	pushedFrames, err := s.cdnQUICReassembly.PushChunk(chunk, s.closedStreams, s.limits.MaxStreamsPerSession)
 	if err != nil {
 		if errors.Is(err, ErrLimit) {
-			if len(frames) != 0 {
-				s.cdnPendingFrames = frames
-			}
 			s.mu.Unlock()
-			return 0, ErrBackpressure
+			for _, value := range allClosed {
+				value.close()
+			}
+			for _, value := range allOpened {
+				go s.runBackend(value)
+			}
+			return appliedPending, ErrBackpressure
 		}
 		s.protocolFailure()
 		s.mu.Unlock()
-		return 0, err
-	}
-	if len(pushedFrames) != 0 {
-		frames = append(frames, pushedFrames...)
-	}
-	if len(frames) == 0 {
-		s.mu.Unlock()
-		return 0, nil
+		for _, value := range allClosed {
+			value.close()
+		}
+		for _, value := range allOpened {
+			go s.runBackend(value)
+		}
+		return appliedPending, err
 	}
 
-	if !s.validateBatchLocked(frames) {
+	if len(pushedFrames) == 0 {
 		s.mu.Unlock()
-		s.protocolFailure()
-		return 0, ErrProtocol
+		for _, value := range allClosed {
+			value.close()
+		}
+		for _, value := range allOpened {
+			go s.runBackend(value)
+		}
+		if s.onUp != nil {
+			s.onUp(len(chunk))
+		}
+		return appliedPending, nil
 	}
-	reservedCost, reservedItems := s.backendWriteReservationLocked(frames)
+
+	if !s.validateBatchLocked(pushedFrames) {
+		s.mu.Unlock()
+		for _, value := range allClosed {
+			value.close()
+		}
+		for _, value := range allOpened {
+			go s.runBackend(value)
+		}
+		s.protocolFailure()
+		return appliedPending, ErrProtocol
+	}
+
+	reservedCost, reservedItems := s.backendWriteReservationLocked(pushedFrames)
 	if (reservedCost != 0 || reservedItems != 0) &&
 		!s.reservePendingLocked(reservedCost, reservedItems, pendingUplink) {
-		s.cdnPendingFrames = frames
+		s.cdnPendingFrames = pushedFrames
 		s.mu.Unlock()
-		return 0, ErrBackpressure
+		for _, value := range allClosed {
+			value.close()
+		}
+		for _, value := range allOpened {
+			go s.runBackend(value)
+		}
+		return appliedPending, ErrBackpressure
 	}
+
 	opened, closed, unusedCost, unusedItems, applied := s.applyBatchLocked(
-		frames,
+		pushedFrames,
 		reservedCost,
 		reservedItems)
 	if unusedCost != 0 || unusedItems != 0 {
 		s.releasePendingLocked(unusedCost, unusedItems)
 	}
 	s.backendWG.Add(len(opened))
+	allClosed = append(allClosed, closed...)
+	allOpened = append(allOpened, opened...)
 	s.mu.Unlock()
 
-	for _, value := range closed {
+	for _, value := range allClosed {
 		value.close()
 	}
-	for _, value := range opened {
+	for _, value := range allOpened {
 		go s.runBackend(value)
 	}
 	if !applied {
 		s.Close()
-		return 0, ErrClosed
+		return appliedPending, ErrClosed
 	}
 	if s.onUp != nil {
 		s.onUp(len(chunk))
 	}
-	return len(frames), nil
+	return appliedPending + len(pushedFrames), nil
 }
 
 // NackReplay returns the unacknowledged batch following cursor for Fast Retransmit (NACK).
@@ -247,7 +374,11 @@ func (s *Session) ackCursorLocked(ackCursor uint64) {
 	}
 	if freedCount > 0 {
 		s.releasePendingLocked(freedCost, freedItems)
-		s.unackedBatches = s.unackedBatches[freedCount:]
+		remaining := copy(s.unackedBatches, s.unackedBatches[freedCount:])
+		for i := remaining; i < len(s.unackedBatches); i++ {
+			s.unackedBatches[i] = sentBatch{}
+		}
+		s.unackedBatches = s.unackedBatches[:remaining]
 		if len(s.unackedBatches) == 0 {
 			s.unackedBatches = nil
 		}
@@ -379,6 +510,12 @@ func (s *Session) PiggybackDownWait(cursor uint64, coalesce bool) ([]byte, uint6
 
 // PollCDN waits for downlink frames up to timeout duration for CDN carriers.
 func (s *Session) PollCDN(ctx context.Context, cursor uint64, timeout time.Duration) ([]byte, uint64, error) {
+	return s.PollCDNExt(ctx, cursor, timeout, true)
+}
+
+// PollCDNExt waits for downlink frames up to timeout duration for CDN carriers,
+// with an option to avoid evicting active StreamCDN workers if this is not a fallback poll.
+func (s *Session) PollCDNExt(ctx context.Context, cursor uint64, timeout time.Duration, isFallback bool) ([]byte, uint64, error) {
 	if timeout <= 0 {
 		timeout = 12 * time.Second
 	}
@@ -423,6 +560,12 @@ func (s *Session) PollCDN(ctx context.Context, cursor uint64, timeout time.Durat
 		s.mu.Unlock()
 		return nil, next, nil
 	}
+	// If cursor == s.downCursor, this is a poll request for NEW frames.
+	// If multi-stream workers are active and this is NOT a fallback poll, do NOT evict active stream workers!
+	if len(s.streamWorkers) > 0 && !isFallback {
+		s.mu.Unlock()
+		return nil, s.downCursor, nil
+	}
 
 	// Evict any active PollCDN or StreamCDN workers when falling back to PollCDN
 	if s.downActive && s.superseded != nil {
@@ -437,7 +580,6 @@ func (s *Session) PollCDN(ctx context.Context, cursor uint64, timeout time.Durat
 	mine := make(chan struct{})
 	s.superseded = mine
 	s.downActive = true
-
 	maxBatch := s.limits.CDNMaxDownBatchBytes
 	if maxBatch <= 0 {
 		maxBatch = 524288
@@ -592,6 +734,11 @@ func (s *Session) StreamCDN(ctx context.Context, startCursor uint64, onBatch fun
 	s.downActive = true
 
 	defer func() {
+		select {
+		case <-mine:
+		default:
+			close(mine)
+		}
 		s.mu.Lock()
 		s.removeStreamWorkerLocked(mine)
 		if len(s.pendingFrames) > 0 && len(s.streamWorkers) > 0 {
@@ -600,8 +747,21 @@ func (s *Session) StreamCDN(ctx context.Context, startCursor uint64, onBatch fun
 		s.mu.Unlock()
 	}()
 
+	isWorkerDead := func(ch chan struct{}) bool {
+		if ch == nil {
+			return false
+		}
+		select {
+		case <-ch:
+			return true
+		default:
+			return false
+		}
+	}
+
 	// 1. Zero-Loss Replay:
 	// - If no other stream workers were active (!hadActiveWorkers), replay all unackedBatches > startCursor.
+	// - If a batch was sent by a dead worker (isWorkerDead), replay it IMMEDIATELY with 0ms delay!
 	// - If other stream workers ARE active, replay only stale unackedBatches (> 600ms old) so a dropped
 	//   turbo-stream is automatically healed without duplicating fresh in-flight chunks on sibling streams.
 	var toReplay []sentBatch
@@ -609,8 +769,9 @@ func (s *Session) StreamCDN(ctx context.Context, startCursor uint64, onBatch fun
 		for i := range s.unackedBatches {
 			b := &s.unackedBatches[i]
 			if b.cursor > startCursor {
-				if !hadActiveWorkers || b.sentAt.IsZero() || now.Sub(b.sentAt) >= staleUnackedReplayAge {
+				if !hadActiveWorkers || (b.worker != nil && isWorkerDead(b.worker)) || b.sentAt.IsZero() || now.Sub(b.sentAt) >= staleUnackedReplayAge {
 					b.sentAt = now
+					b.worker = mine
 					toReplay = append(toReplay, *b)
 				}
 			}
@@ -692,6 +853,7 @@ func (s *Session) StreamCDN(ctx context.Context, startCursor uint64, onBatch fun
 				cost:   batch.cost,
 				items:  batch.items,
 				sentAt: sentTime,
+				worker: mine,
 			}
 			s.unackedBatches = append(s.unackedBatches, sb)
 			cur := s.downCursor

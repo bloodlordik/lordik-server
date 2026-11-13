@@ -195,16 +195,16 @@ func TestStreamReassemblyModularArithmeticRFC1982(t *testing.T) {
 		t.Fatalf("old duplicate should be ignored: %v, %v", err, frames)
 	}
 
-	// Jump too far ahead (> 32)
+	// Jump too far ahead (> 256)
 	subFar := SubFrame{
 		Type:     frame.Data,
 		StreamID: 1,
-		Seq:      50,
+		Seq:      300,
 		Flags:    SubFlagFirst | SubFlagFin,
 		Payload:  []byte("too far"),
 	}
-	if _, err := st.Push(subFar); err != ErrProtocol {
-		t.Fatalf("expected ErrProtocol for jump > maxStreamWindowSpan, got: %v", err)
+	if _, err := st.Push(subFar); err != ErrLimit {
+		t.Fatalf("expected ErrLimit for jump > maxStreamWindowSpan, got: %v", err)
 	}
 }
 

@@ -21,6 +21,13 @@
       "backend": "127.0.0.1:2398",
       "backend_type": "mtproxy",
       "carrier_mode": "https"
+    },
+    {
+      "name": "direct-auto",
+      "secret": "303132333435363738393a3b3c3d3e3f",
+      "backend_type": "direct",
+      "backend": "auto",
+      "carrier_mode": "cdn-adaptive"
     }
   ]
 }

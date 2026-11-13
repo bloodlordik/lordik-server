@@ -151,8 +151,8 @@ function scheduleGapHeal(){
  reorderGapTimer=setTimeout(()=>{
   reorderGapTimer=0;
   if(!closed&&downReorderMap.size>0&&sessionToken){
-   // A sibling stream dropped a batch; pollOnce(downCursor) fetches the exact missing batch from unackedBatches
-   pollOnce();
+   // A sibling stream dropped a batch; pollOnce(true) fetches the exact missing batch via NACK
+   pollOnce(true);
   }
  },650);
 }
@@ -627,15 +627,23 @@ function createStreamAssembler(){
 
 async function pollOnce(){
  if(closed||!sessionToken)return;
+ const isNack=arguments[0]===true;
  try{
   pollController=new AbortController();
   const randHex=(Math.random()*0xffffffff>>>0).toString(16);
-  const pollUrl=relayBase+'assets/media/'+shortId+'/seg_'+downCursor+'_'+randHex+'.m4s';
+  let pollUrl=relayBase+'assets/media/'+shortId+'/seg_'+downCursor+'_'+randHex+'.m4s';
+  if(isNack){
+   pollUrl+='?ack='+downCursor+'&nack=1';
+  }
+  const headers={'X-Client-Key':sessionToken};
+  if(!isNack&&!streamSupported){
+   headers['X-Fallback-Poll']='1';
+  }
   const res=await fetch(pollUrl,{
    method:'GET',
    signal:pollController.signal,
    mode:'same-origin',credentials:'omit',cache:'no-store',
-   headers:{'X-Client-Key':sessionToken}
+   headers:headers
   });
   if(res.ok){
    const ct=res.headers.get('Content-Type');

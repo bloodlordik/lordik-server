@@ -407,7 +407,8 @@ func (s *Server) serveCDNMediaPoll(w http.ResponseWriter, r *http.Request, vhost
 		pollTimeout = 12 * time.Second
 	}
 
-	batch, nextCursor, err := sess.PollCDN(r.Context(), cursor, pollTimeout)
+	isFallback := r.Header.Get("X-Fallback-Poll") == "1"
+	batch, nextCursor, err := sess.PollCDNExt(r.Context(), cursor, pollTimeout, isFallback)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return
@@ -455,13 +456,15 @@ func (s *Server) writeCDNDownlinkResponse(w http.ResponseWriter, batch []byte, c
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.Header().Set("Pragma", "no-cache")
 	if len(batch) > 0 {
-		gltf := session.WrapGLTF(batch, cursor)
+		var hdr [session.GLTFHeaderSize]byte
+		session.FillGLTFHeader(hdr[:], cursor)
 		etag := fmt.Sprintf("\"W/%x-%x\"", cursor, len(batch))
 		w.Header().Set("Content-Type", "model/gltf-binary")
 		w.Header().Set("ETag", etag)
-		w.Header().Set("Content-Length", strconv.Itoa(len(gltf)))
+		w.Header().Set("Content-Length", strconv.Itoa(session.GLTFHeaderSize+len(batch)))
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(gltf)
+		_, _ = w.Write(hdr[:])
+		_, _ = w.Write(batch)
 		return
 	}
 	resp := fmt.Sprintf("{\"s\":1,\"c\":%d}", cursor)
