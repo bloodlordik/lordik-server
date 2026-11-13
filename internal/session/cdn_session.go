@@ -119,6 +119,104 @@ func (s *Session) ProcessUpCDN(sequence uint64, chunk []byte) (int, error) {
 	return len(frames), nil
 }
 
+// ProcessUpCDNSubFrames processes an uplink chunk containing per-stream SubFrames.
+// Returns readyFramesCount (number of complete frames applied), or an error.
+func (s *Session) ProcessUpCDNSubFrames(chunk []byte) (int, error) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return 0, ErrClosed
+	}
+	s.lastActivity = time.Now()
+
+	var frames []frame.Frame
+	if len(s.cdnPendingFrames) != 0 {
+		frames = s.cdnPendingFrames
+	}
+
+	if s.cdnQUICReassembly == nil {
+		s.cdnQUICReassembly = NewPerStreamReassembly()
+	}
+
+	pushedFrames, err := s.cdnQUICReassembly.PushChunk(chunk, s.closedStreams, s.limits.MaxStreamsPerSession)
+	if err != nil {
+		if !errors.Is(err, ErrLimit) {
+			s.protocolFailure()
+		}
+		s.mu.Unlock()
+		return 0, err
+	}
+	if len(pushedFrames) != 0 {
+		frames = append(frames, pushedFrames...)
+	}
+	if len(frames) == 0 {
+		s.mu.Unlock()
+		return 0, nil
+	}
+
+	if !s.validateBatchLocked(frames) {
+		s.mu.Unlock()
+		s.protocolFailure()
+		return 0, ErrProtocol
+	}
+	reservedCost, reservedItems := s.backendWriteReservationLocked(frames)
+	if (reservedCost != 0 || reservedItems != 0) &&
+		!s.reservePendingLocked(reservedCost, reservedItems, pendingUplink) {
+		s.cdnPendingFrames = frames
+		s.mu.Unlock()
+		return 0, ErrBackpressure
+	}
+	s.cdnPendingFrames = nil
+	opened, closed, unusedCost, unusedItems, applied := s.applyBatchLocked(
+		frames,
+		reservedCost,
+		reservedItems)
+	if unusedCost != 0 || unusedItems != 0 {
+		s.releasePendingLocked(unusedCost, unusedItems)
+	}
+	s.backendWG.Add(len(opened))
+	s.mu.Unlock()
+
+	for _, value := range closed {
+		value.close()
+	}
+	for _, value := range opened {
+		go s.runBackend(value)
+	}
+	if !applied {
+		s.Close()
+		return 0, ErrClosed
+	}
+	if s.onUp != nil {
+		s.onUp(len(chunk))
+	}
+	return len(frames), nil
+}
+
+// NackReplay returns the unacknowledged batch following cursor for Fast Retransmit (NACK).
+// It updates the batch sentAt time without killing streamWorkers or resetting downActive.
+func (s *Session) NackReplay(cursor uint64) ([]byte, uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, cursor, ErrClosed
+	}
+	s.lastActivity = time.Now()
+	if cursor > s.downCursor {
+		s.closeLocked()
+		return nil, cursor, ErrProtocol
+	}
+	s.ackCursorLocked(cursor)
+
+	for i := range s.unackedBatches {
+		if s.unackedBatches[i].cursor > cursor {
+			s.unackedBatches[i].sentAt = time.Now()
+			return s.unackedBatches[i].body, s.unackedBatches[i].cursor, nil
+		}
+	}
+	return nil, s.downCursor, nil
+}
+
 // PiggybackDown attempts a non-blocking harvest of available downlink frames to bundle
 // in an uplink response.
 func (s *Session) PiggybackDown(cursor uint64) ([]byte, uint64, error) {
@@ -213,7 +311,9 @@ func (s *Session) PiggybackDownWait(cursor uint64, coalesce bool) ([]byte, uint6
 	// 5. Adaptive micro-wait when requested by client and no poll is active:
 	// wait for backend DATA/CLOSE frame to bundle with WINDOW ack.
 	// For direct backend, TCP dial + MTProto resPQ takes ~30-100ms.
-	if coalesce && !s.hasPendingDataOrCloseLocked() && (s.cdnReassembly == nil || !s.cdnReassembly.HasHoles()) {
+	hasHoles := (s.cdnReassembly != nil && s.cdnReassembly.HasHoles()) ||
+		(s.cdnQUICReassembly != nil && s.cdnQUICReassembly.HasHoles())
+	if coalesce && !s.hasPendingDataOrCloseLocked() && !hasHoles {
 		waitDur := 40 * time.Millisecond
 		if s.profile != nil && s.profile.BackendType == config.BackendDirect {
 			waitDur = 150 * time.Millisecond

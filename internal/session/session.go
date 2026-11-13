@@ -66,6 +66,7 @@ type Session struct {
 	carrierLanes          map[uint32]*carrierLane
 	cdnReassembly         *ReassemblyBuffer
 	cdnPendingFrames      []frame.Frame
+	cdnQUICReassembly     *PerStreamReassembly
 	tokenHash             [sha256.Size]byte
 	bootstrapHash         [sha256.Size]byte
 	shortID               string
@@ -268,6 +269,10 @@ func (s *Session) closeLocked() {
 	s.unackedBatches = nil
 
 	s.cdnReassembly = nil
+	if s.cdnQUICReassembly != nil {
+		s.cdnQUICReassembly.Clear()
+		s.cdnQUICReassembly = nil
+	}
 	s.cdnPendingFrames = nil
 	signal(s.notify)
 	s.finishOnce.Do(func() {

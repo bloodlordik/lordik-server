@@ -69,6 +69,18 @@
       "trusted_host_header": "X-Forwarded-Host",
       "trusted_ip_header": "X-Forwarded-For",
       "disable_ip_rate_limit": true
+    },
+    {
+      "name": "cdn-quic-dual-lane",
+      "secret": "808182838485868788898a8b8c8d8e8f",
+      "carrier_mode": "cdn-quic",
+      "backend_type": "direct",
+      "backend": "auto",
+      "hostname": "quic.example.com",
+      "base_path": "assets",
+      "public_dir": "/var/www/cdn_decoy",
+      "trusted_ip_header": "CF-Connecting-IP",
+      "disable_ip_rate_limit": true
     }
   ]
 }

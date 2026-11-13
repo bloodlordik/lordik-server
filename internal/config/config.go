@@ -47,6 +47,8 @@ const (
 	CarrierCDNGet         CarrierMode = "cdn-get"
 	CarrierCDNBody        CarrierMode = "cdn-body"
 	CarrierCDNWS          CarrierMode = "cdn-ws"
+	CarrierCDNQUIC        CarrierMode = "cdn-quic"
+	CarrierCDNQuik        CarrierMode = "cdn-quik"
 	CarrierYCWS           CarrierMode = "yc-ws"
 )
 
@@ -60,7 +62,13 @@ func (m CarrierMode) Valid() bool {
 		m == CarrierCDNGet ||
 		m == CarrierCDNBody ||
 		m == CarrierCDNWS ||
+		m == CarrierCDNQUIC ||
+		m == CarrierCDNQuik ||
 		m == CarrierYCWS
+}
+
+func (m CarrierMode) IsQUIC() bool {
+	return m == CarrierCDNQUIC || m == CarrierCDNQuik
 }
 
 func (m CarrierMode) IsYC() bool {
@@ -72,7 +80,9 @@ func (m CarrierMode) IsCDN() bool {
 		m == CarrierCDNAdaptive ||
 		m == CarrierCDNGet ||
 		m == CarrierCDNBody ||
-		m == CarrierCDNWS
+		m == CarrierCDNWS ||
+		m == CarrierCDNQUIC ||
+		m == CarrierCDNQuik
 }
 
 func (m CarrierMode) WithDefault() CarrierMode {
@@ -956,7 +966,7 @@ func loadProfiles(path, host, basePath string, limits Limits, defaultBackendType
 		}
 		carrierMode := input.CarrierMode.WithDefault()
 		if !carrierMode.Valid() {
-			return nil, fmt.Errorf("profile %q carrier_mode must be https, https-lanes, websocket, websocket-lanes, cdn, cdn-adaptive, cdn-get, cdn-body, cdn-ws, or yc-ws", input.Name)
+			return nil, fmt.Errorf("profile %q carrier_mode must be https, https-lanes, websocket, websocket-lanes, cdn, cdn-adaptive, cdn-get, cdn-body, cdn-ws, cdn-quic, or yc-ws", input.Name)
 		}
 		if err := validateProfileLimits(input.Limits, limits); err != nil {
 			return nil, fmt.Errorf("profile %q: %w", input.Name, err)

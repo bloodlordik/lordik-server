@@ -185,6 +185,9 @@ func TestProfileCarrierModeDefaultsAndValidation(t *testing.T) {
 		CarrierCDNGet,
 		CarrierCDNBody,
 		CarrierCDNWS,
+		CarrierCDNQUIC,
+		CarrierCDNQuik,
+		CarrierYCWS,
 	} {
 		writeProfiles(`,"carrier_mode":"` + string(carrier) + `"`)
 		loaded, err := Load(configPath)

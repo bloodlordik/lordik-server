@@ -419,3 +419,79 @@ func TestRenderYCWSBridge(t *testing.T) {
 		}
 	}
 }
+
+func TestRenderCDNQUICBridge(t *testing.T) {
+	for _, mode := range []string{"cdn-quic", "cdn-quik"} {
+		page, err := Render("cdn.example.com", "", "bootstrap-token", mode, 2*1024*1024)
+		if err != nil {
+			t.Fatalf("failed to render %s bridge: %v", mode, err)
+		}
+		body := string(page.Body)
+		if page.Nonce == "" || !strings.Contains(body, `script nonce="`+page.Nonce+`"`) {
+			t.Fatalf("rendered %s bridge missing nonce binding", mode)
+		}
+
+		// Verify pure GET Handshake (no POST)
+		if strings.Contains(body, "tryPostInit") {
+			t.Fatalf("rendered %s bridge must not contain tryPostInit", mode)
+		}
+
+		// Verify key snippets and architectural components
+		for _, expected := range []string{
+			"X-Sub-Frames",
+			"vipQueue",
+			"bulkQueue",
+			"streamBytes",
+			"streamSeqMap",
+			"encodeSubFrame",
+			"sendNackRequest",
+			"onReorderGapTimeout",
+			"reorderGapTimer",
+			"lanes",
+			"navigator.locks",
+			"X-SSE-Stream",
+			"text/event-stream",
+			"model/gltf-binary",
+			"status('connected')",
+			"status('failed')",
+			"globalThis.TelegramWebProxy",
+			"tproxy-android-init",
+			"tproxy-init",
+			"keepalive:true",
+		} {
+			if !strings.Contains(body, expected) {
+				t.Fatalf("rendered %s bridge lacks expected snippet %q", mode, expected)
+			}
+		}
+
+		// Verify placeholder replacement
+		for _, placeholder := range []string{
+			"__NONCE__",
+			"__BOOTSTRAP__",
+			"__BATCH_LIMIT__",
+			"__CARRIER_MODE__",
+			"__BUILD_ID__",
+			"__RELAY_BASE__",
+		} {
+			if strings.Contains(body, placeholder) {
+				t.Fatalf("rendered %s bridge retained unreplaced placeholder %q", mode, placeholder)
+			}
+		}
+
+		// Verify policy and prohibited substrings
+		for _, unwanted := range [][]byte{
+			[]byte("pause(0)"),
+			[]byte(".slice(0)"),
+			[]byte("localStorage"),
+			[]byte("sessionStorage"),
+			[]byte("indexedDB"),
+			[]byte("serviceWorker"),
+			[]byte("new Worker"),
+			[]byte("document.cookie"),
+		} {
+			if bytes.Contains(page.Body, unwanted) {
+				t.Fatalf("rendered %s bridge retained unwanted snippet %q", mode, unwanted)
+			}
+		}
+	}
+}

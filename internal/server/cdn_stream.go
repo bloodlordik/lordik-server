@@ -2,12 +2,14 @@ package server
 
 import (
 	"bufio"
+	"encoding/base64"
 	"encoding/binary"
+	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
-
 	"github.com/telegramdesktop/tproxy-server/internal/session"
 )
 
@@ -47,6 +49,52 @@ func (s *Server) serveCDNStreamDown(w http.ResponseWriter, r *http.Request, vhos
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		s.serveCDNMediaPoll(w, r, vhost, sessionShortID, file)
+		return
+	}
+
+	isSSE := r.Header.Get("X-SSE-Stream") == "1" || strings.Contains(r.Header.Get("Accept"), "text/event-stream")
+	if isSSE {
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.Header().Set("Cache-Control", "private, no-store, no-cache, no-transform, max-age=0, must-revalidate")
+		w.Header().Set("CDN-Cache-Control", "no-store")
+		w.Header().Set("Cloudflare-CDN-Cache-Control", "no-store")
+		w.Header().Set("Surrogate-Control", "no-store")
+		w.Header().Set("Pragma", "no-cache")
+		w.WriteHeader(http.StatusOK)
+
+		rc := http.NewResponseController(w)
+		_ = rc.SetWriteDeadline(time.Now().Add(15 * time.Second))
+
+		if _, err := io.WriteString(w, ": ok\n\n"); err != nil {
+			return
+		}
+		flusher.Flush()
+
+		bw := bufio.NewWriterSize(w, 64*1024)
+		onBatch := func(cur uint64, body []byte) error {
+			_ = rc.SetWriteDeadline(time.Now().Add(15 * time.Second))
+			if len(body) == 0 {
+				if _, err := fmt.Fprintf(bw, ": hb %d\n\n", cur); err != nil {
+					return err
+				}
+			} else {
+				env := make([]byte, 4+len(body))
+				binary.BigEndian.PutUint32(env[:4], uint32(cur))
+				copy(env[4:], body)
+				enc := base64.RawURLEncoding.EncodeToString(env)
+				if _, err := fmt.Fprintf(bw, "data: %s\n\n", enc); err != nil {
+					return err
+				}
+			}
+			if err := bw.Flush(); err != nil {
+				return err
+			}
+			flusher.Flush()
+			return nil
+		}
+
+		_ = sess.StreamCDN(r.Context(), cursor, onBatch)
 		return
 	}
 

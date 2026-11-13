@@ -1,8 +1,10 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -620,5 +622,163 @@ func TestServer_CDNStreamDown_ProbingResistance(t *testing.T) {
 		if !strings.Contains(string(body), "Operator Site") {
 			t.Fatalf("%s: expected decoy body, got %q", urlPath, string(body))
 		}
+	}
+}
+
+func TestServer_CDNQUIC_SubFramesAndSSEAndNack(t *testing.T) {
+	backend := startEchoBackend(t)
+	application, _ := newConfiguredTestServer(t, backend, func(value *config.Config) {
+		value.Profiles[0].CarrierMode = config.CarrierCDNQUIC
+	})
+	defer application.Shutdown()
+
+	hosted := httptest.NewServer(application.Handler())
+	defer hosted.Close()
+
+	buildID := application.BuildID()
+	clientIP := "198.51.100.99"
+	bootstrapToken, err := application.manager.IssueBootstrap(&application.config.Profiles[0], clientIP)
+	if err != nil {
+		t.Fatalf("IssueBootstrap failed: %v", err)
+	}
+	// 1. GET Init
+	helloFrame := frame.Encode(frame.Hello, 0, []byte{1})
+	helloB64 := base64.RawURLEncoding.EncodeToString(helloFrame)
+	initURL := hosted.URL + "/_next/data/" + buildID + "/init/" + bootstrapToken + "/" + helloB64 + ".json"
+	initReq := request(t, http.MethodGet, initURL, nil, "")
+	initReq.Header.Set("X-Forwarded-For", clientIP)
+	initRes := perform(t, hosted.Client(), initReq)
+	if initRes.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", initRes.StatusCode)
+	}
+	var initJSON struct {
+		Token   string `json:"token"`
+		ShortID string `json:"short_id"`
+		Welcome string `json:"welcome"`
+	}
+	if err := json.Unmarshal(readResponse(t, initRes), &initJSON); err != nil {
+		t.Fatalf("decode init json failed: %v", err)
+	}
+
+	// 2. Open SSE Downlink: GET /assets/media/{short_id}/stream_0_sse.m4s with X-SSE-Stream: 1
+	streamURL := hosted.URL + "/assets/media/" + initJSON.ShortID + "/stream_0_sse.m4s"
+	streamReq := request(t, http.MethodGet, streamURL, nil, "")
+	streamReq.Header.Set("X-Client-Key", initJSON.Token)
+	streamReq.Header.Set("X-Forwarded-For", clientIP)
+	streamReq.Header.Set("X-SSE-Stream", "1")
+	streamReq.Header.Set("Accept", "text/event-stream")
+
+	streamRes, err := hosted.Client().Do(streamReq)
+	if err != nil {
+		t.Fatalf("stream GET failed: %v", err)
+	}
+	defer streamRes.Body.Close()
+
+	if streamRes.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", streamRes.StatusCode)
+	}
+	if !strings.Contains(streamRes.Header.Get("Content-Type"), "text/event-stream") {
+		t.Fatalf("expected text/event-stream, got %q", streamRes.Header.Get("Content-Type"))
+	}
+	if streamRes.Header.Get("X-Accel-Buffering") != "no" {
+		t.Fatalf("expected X-Accel-Buffering no, got %q", streamRes.Header.Get("X-Accel-Buffering"))
+	}
+
+	reader := bufio.NewReader(streamRes.Body)
+	// Read initial SSE line: ": ok\n\n"
+	line, err := reader.ReadString('\n')
+	if err != nil || !strings.HasPrefix(line, ": ok") {
+		t.Fatalf("expected initial : ok comment, got %q, err %v", line, err)
+	}
+	_, _ = reader.ReadString('\n') // empty line
+
+	// 3. Uplink subframes via GET chunk: OPEN (seq=1) + DATA (seq=2)
+	streamID := uint32(888)
+	sub1 := make([]byte, session.SubFrameHeaderSize)
+	sub1[0] = byte(frame.Open)
+	sub1[1] = byte(streamID >> 16)
+	sub1[2] = byte(streamID >> 8)
+	sub1[3] = byte(streamID)
+	binary.BigEndian.PutUint16(sub1[4:6], 1)
+	sub1[6] = session.SubFlagFirst | session.SubFlagFin
+	binary.BigEndian.PutUint16(sub1[7:9], 0)
+
+	dataPayload := []byte("quic_dual_lane_test")
+	sub2 := make([]byte, session.SubFrameHeaderSize+len(dataPayload))
+	sub2[0] = byte(frame.Data)
+	sub2[1] = byte(streamID >> 16)
+	sub2[2] = byte(streamID >> 8)
+	sub2[3] = byte(streamID)
+	binary.BigEndian.PutUint16(sub2[4:6], 2)
+	sub2[6] = session.SubFlagFirst | session.SubFlagFin
+	binary.BigEndian.PutUint16(sub2[7:9], uint16(len(dataPayload)))
+	copy(sub2[session.SubFrameHeaderSize:], dataPayload)
+
+	combined := append(sub1, sub2...)
+	chunkB64 := base64.RawURLEncoding.EncodeToString(combined)
+
+	chunkURL := hosted.URL + "/assets/chunks/" + initJSON.ShortID + "/1.bin?p=" + chunkB64
+	chunkReq := request(t, http.MethodGet, chunkURL, nil, "")
+	chunkReq.Header.Set("X-Client-Key", initJSON.Token)
+	chunkReq.Header.Set("X-Sub-Frames", "1")
+	chunkReq.Header.Set("X-Forwarded-For", clientIP)
+	chunkRes := perform(t, hosted.Client(), chunkReq)
+	if chunkRes.StatusCode != http.StatusOK {
+		t.Fatalf("chunk GET failed: %d", chunkRes.StatusCode)
+	}
+
+	// 4. Read SSE event on the open downlink stream: "data: <base64>\n\n"
+	var foundEcho bool
+	for i := 0; i < 5 && !foundEcho; i++ {
+		dataLine, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("failed to read SSE event: %v", err)
+		}
+		dataLine = strings.TrimSpace(dataLine)
+		if strings.HasPrefix(dataLine, ":") || dataLine == "" {
+			continue // comment or separator
+		}
+		if !strings.HasPrefix(dataLine, "data: ") {
+			continue
+		}
+		b64Payload := strings.TrimPrefix(dataLine, "data: ")
+		rawEnvelope, err := base64.RawURLEncoding.DecodeString(b64Payload)
+		if err != nil {
+			t.Fatalf("failed to decode SSE base64: %v", err)
+		}
+		if len(rawEnvelope) < 4 {
+			t.Fatalf("envelope too short: %d", len(rawEnvelope))
+		}
+		frames, err := frame.ParseAll(rawEnvelope[4:], 1024*1024)
+		if err != nil {
+			t.Fatalf("failed to parse frames from SSE: %v", err)
+		}
+		for _, f := range frames {
+			if f.StreamID == streamID && f.Type == frame.Data && bytes.Equal(f.Payload, dataPayload) {
+				foundEcho = true
+				break
+			}
+		}
+	}
+	if !foundEcho {
+		t.Fatal("did not receive echoed DATA frame over SSE downlink")
+	}
+
+	// 5. Test NACK fast retransmit: GET /assets/media/{shortID}/seg_0_nack.m4s?nack=1
+	nackURL := hosted.URL + "/assets/media/" + initJSON.ShortID + "/seg_0_nack.m4s?nack=1"
+	nackReq := request(t, http.MethodGet, nackURL, nil, "")
+	nackReq.Header.Set("X-Client-Key", initJSON.Token)
+	nackReq.Header.Set("X-Forwarded-For", clientIP)
+	nackRes := perform(t, hosted.Client(), nackReq)
+	if nackRes.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for NACK, got %d", nackRes.StatusCode)
+	}
+	nackBody := readResponse(t, nackRes)
+	if len(nackBody) < 12 {
+		t.Fatalf("expected glTF response for replayed batch, got %d bytes: %q", len(nackBody), string(nackBody))
+	}
+	// glTF header check
+	if !bytes.Equal(nackBody[:4], []byte("glTF")) {
+		t.Fatalf("invalid glTF magic in NACK reply: %q", nackBody[:4])
 	}
 }

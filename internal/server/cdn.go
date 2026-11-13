@@ -307,10 +307,14 @@ func (s *Server) serveCDNChunkGet(w http.ResponseWriter, r *http.Request, vhost 
 		vhost.servePublic(w, r)
 		return
 	}
-
-	_, err = sess.ProcessUpCDN(seq, chunk)
-	if err != nil {
-		s.handleCDNSessionError(w, r, vhost, err)
+	var upErr error
+	if r.Header.Get("X-Sub-Frames") == "1" || sess.CarrierMode().IsQUIC() {
+		_, upErr = sess.ProcessUpCDNSubFrames(chunk)
+	} else {
+		_, upErr = sess.ProcessUpCDN(seq, chunk)
+	}
+	if upErr != nil {
+		s.handleCDNSessionError(w, r, vhost, upErr)
 		return
 	}
 
@@ -343,10 +347,14 @@ func (s *Server) serveCDNSyncPost(w http.ResponseWriter, r *http.Request, vhost 
 		vhost.servePublic(w, r)
 		return
 	}
-
-	_, err = sess.ProcessUpCDN(seq, body)
-	if err != nil {
-		s.handleCDNSessionError(w, r, vhost, err)
+	var upErr error
+	if r.Header.Get("X-Sub-Frames") == "1" || sess.CarrierMode().IsQUIC() {
+		_, upErr = sess.ProcessUpCDNSubFrames(body)
+	} else {
+		_, upErr = sess.ProcessUpCDN(seq, body)
+	}
+	if upErr != nil {
+		s.handleCDNSessionError(w, r, vhost, upErr)
 		return
 	}
 
@@ -381,6 +389,16 @@ func (s *Server) serveCDNMediaPoll(w http.ResponseWriter, r *http.Request, vhost
 	sess := s.resolveSession(r, sessionShortID, vhost)
 	if sess == nil {
 		vhost.servePublic(w, r)
+		return
+	}
+
+	if r.URL.Query().Get("nack") == "1" {
+		batch, nextCursor, nackErr := sess.NackReplay(cursor)
+		if nackErr != nil {
+			s.handleCDNSessionError(w, r, vhost, nackErr)
+			return
+		}
+		s.writeCDNDownlinkResponse(w, batch, nextCursor)
 		return
 	}
 

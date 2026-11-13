@@ -208,3 +208,16 @@ func TestFactoryCDNModesResolutionAndContent(t *testing.T) {
 		t.Fatal("cdn-adaptive template must not contain streaming components")
 	}
 }
+
+func TestFactoryCDNQUICTemplateResolution(t *testing.T) {
+	factory := NewFactory(nil)
+	factory.RegisterTemplate("cdn_quic.html", `<!doctype html><html><script nonce="__NONCE__">/* cdn-quic */</script></html>`)
+	factory.RegisterTemplate("cdn.html", `<!doctype html><html><script nonce="__NONCE__">/* cdn-fallback */</script></html>`)
+
+	for _, mode := range []string{"cdn-quic", "cdn-quik", "cdn_quic", "cdn_quik"} {
+		resolved := factory.ResolveTemplateName(Options{CarrierMode: mode})
+		if resolved != "cdn_quic.html" {
+			t.Fatalf("expected cdn_quic.html for %s, got %q", mode, resolved)
+		}
+	}
+}

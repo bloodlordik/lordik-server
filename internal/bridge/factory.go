@@ -119,9 +119,11 @@ func (f *Factory) ResolveTemplateName(opts Options) string {
 
 	platform := strings.ToLower(strings.TrimSpace(opts.Platform))
 	mode := strings.ToLower(strings.TrimSpace(opts.CarrierMode))
+	if mode == "cdn-quik" || mode == "cdn_quik" {
+		mode = "cdn-quic"
+	}
 	modeUnder := strings.ReplaceAll(mode, "-", "_")
 	modeHyphen := strings.ReplaceAll(mode, "_", "-")
-
 	if platform != "" && mode != "" {
 		candidates := []string{
 			platform + "_" + mode + ".html",
