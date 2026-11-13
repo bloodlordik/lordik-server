@@ -19,10 +19,12 @@ const (
 	SubFlagFin uint8 = 0x02
 
 	// maxStreamWindowSpan limits the sliding window for out-of-order subframes per stream.
-	maxStreamWindowSpan uint16 = 32
+	// 256 subframes (~1.5 MiB) prevents false ErrProtocol when 8 parallel CDN GET requests
+	// experience edge jitter during large media uploads.
+	maxStreamWindowSpan uint16 = 256
 
-	// maxStreamBufferSize limits total buffered out-of-order and partial frame bytes per stream (256 KiB).
-	maxStreamBufferSize = 256 * 1024
+	// maxStreamBufferSize limits total buffered out-of-order and partial frame bytes per stream (2 MiB).
+	maxStreamBufferSize = 2 * 1024 * 1024
 
 	// maxSubFramePayload is the maximum payload per subframe (6000 - 9 = 5991).
 	maxSubFramePayload = 5991
@@ -60,7 +62,9 @@ func ParseSubFrames(data []byte) ([]SubFrame, error) {
 		if subLen > maxSubFramePayload || len(data) < SubFrameHeaderSize+subLen {
 			return nil, ErrProtocol
 		}
-		payload := data[SubFrameHeaderSize : SubFrameHeaderSize+subLen]
+		// Copy slice to decouple from temporary HTTP request buffer when stored out-of-order
+		payload := make([]byte, subLen)
+		copy(payload, data[SubFrameHeaderSize:SubFrameHeaderSize+subLen])
 		result = append(result, SubFrame{
 			Type:     t,
 			StreamID: streamID,
@@ -163,17 +167,18 @@ func (r *StreamReassembly) Push(sub SubFrame) ([]frame.Frame, error) {
 	}
 	if diff > 0 {
 		if diff > maxStreamWindowSpan {
-			return nil, ErrProtocol
+			// Return ErrLimit (backpressure/retryable) instead of killing the session with ErrProtocol
+			return nil, ErrLimit
 		}
 		if _, exists := r.outOfOrder[sub.Seq]; exists {
 			// In-window duplicate; ignore
 			return nil, nil
 		}
-		r.outOfOrder[sub.Seq] = sub
-		r.bufferedBytes += len(sub.Payload)
-		if r.bufferedBytes > maxStreamBufferSize {
+		if r.bufferedBytes+len(sub.Payload) > maxStreamBufferSize {
 			return nil, ErrLimit
 		}
+		r.outOfOrder[sub.Seq] = sub
+		r.bufferedBytes += len(sub.Payload)
 		return nil, nil
 	}
 
@@ -256,7 +261,7 @@ func (p *PerStreamReassembly) PushChunk(chunk []byte, closedStreams map[uint32]s
 
 		st, exists := p.streams[sub.StreamID]
 		if !exists {
-			if len(p.streams) >= maxStreams+32 {
+			if maxStreams > 0 && len(p.streams) >= maxStreams+64 {
 				return nil, ErrLimit
 			}
 			st = NewStreamReassembly()

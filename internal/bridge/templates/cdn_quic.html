@@ -23,12 +23,18 @@ let queuedBytes=0,queuedItems=0;
 const streamControllers=new Set();
 const lanes=new Map();
 let currentStreamId=0;
+let turboStreamsActive=0;
+const maxTurboStreams=2;
+let lastHeavyMediaTime=0;
 let probeConsecutiveTimeouts=0;
+let useSSEFallback=false;
 
 // Dual-Lane QoS Uplink Queues
 const vipQueue=[],bulkQueue=[];
 const streamBytes=new Map();
 const streamSeqMap=new Map();
+const streamInflightMap=new Map();
+const maxStreamInflightSubframes=40;
 
 const queueLimit=33554432,queueItemLimit=16384,batchLimit=__BATCH_LIMIT__;
 let upSeq=1,downCursor=0,upInflight=0,maxInflight=8;
@@ -47,7 +53,7 @@ let nackInflight=false;
 
 // Multi-Stream Downlink Reorder Buffer & NACK
 const downReorderMap=new Map();
-const maxDownReorderWindow=24;
+const maxDownReorderWindow=32;
 let reorderGapTimer=0;
 
 function abortInflightUplinks(){
@@ -161,6 +167,7 @@ function deliver(batchBuf){
    activeStreams.delete(frame.id);
    streamBytes.delete(frame.id);
    streamSeqMap.delete(frame.id);
+   streamInflightMap.delete(frame.id);
   }
   port.postMessage(frame.data,[frame.data]);
  }
@@ -201,7 +208,7 @@ function onReorderGapTimeout(){
    slowestLane=lane;
   }
  }
- if(slowestLane&&lanes.size>1){
+ if(slowestLane&&(lanes.size>1||(Date.now()-oldestTime>1200))){
   try{slowestLane.ctrl.abort()}catch(e){}
  }
  sendNackRequest(downCursor);
@@ -218,6 +225,12 @@ function deliverOrdered(cursor,payloadBuf){
  if(diff<=0&&downCursor!==0)return;
 
  const byteLen=payloadBuf?payloadBuf.byteLength:0;
+ if(byteLen>=16384){
+  lastHeavyMediaTime=Date.now();
+  if(turboStreamsActive<maxTurboStreams){
+   spawnTurboStream();
+  }
+ }
 
  if(cursor===downCursor+1||(downCursor===0&&cursor===1)){
   downCursor=cursor;
@@ -263,10 +276,10 @@ function deliverOrdered(cursor,payloadBuf){
 
 function maybeSendDownAck(){
  const unackedCount=(downCursor-lastSentAckCursor)|0;
- if(unackedCount>=4){
+ if(unackedCount>=3){
   if(hasPendingUplink()&&upInflight<maxInflight){
    flushUplink();
-  }else if(!hasPendingUplink()||unackedCount>=10){
+  }else if(!hasPendingUplink()||unackedCount>=6){
    sendAckOnly();
   }
  }
@@ -370,11 +383,11 @@ function queueCarrier(buf){
  for(const f of frames){
   const sid=f.id;
   const type=f.type;
-  if(type===0x01)activeStreams.add(sid);
-  else if(type===0x03){
-   activeStreams.delete(sid);
-   streamBytes.delete(sid);
-   streamSeqMap.delete(sid);
+  if(type===0x01){
+   activeStreams.add(sid);
+   streamSeqMap.set(sid,1);
+   streamBytes.set(sid,0);
+   streamInflightMap.set(sid,0);
   }
   const curBytes=streamBytes.get(sid)||0;
   streamBytes.set(sid,curBytes+f.length);
@@ -408,7 +421,7 @@ function queueCarrier(buf){
   // Fragment frame into subframes of at most maxSubLen (5991) bytes:
   const plen=f.payload.byteLength;
   if(plen<=maxSubLen){
-   const seq=streamSeqMap.get(sid)||1;
+   const seq=streamSeqMap.get(sid)??1;
    streamSeqMap.set(sid,(seq+1)&0xffff);
    const sub=encodeSubFrame(type,sid,seq,0x03,f.payload);
    queue.push(sub);
@@ -419,7 +432,7 @@ function queueCarrier(buf){
    while(off<plen){
     const chunkLen=Math.min(maxSubLen,plen-off);
     const flags=(off===0?0x01:0)|(off+chunkLen===plen?0x02:0);
-    const seq=streamSeqMap.get(sid)||1;
+    const seq=streamSeqMap.get(sid)??1;
     streamSeqMap.set(sid,(seq+1)&0xffff);
     const sub=encodeSubFrame(type,sid,seq,flags,f.payload.subarray(off,off+chunkLen));
     queue.push(sub);
@@ -427,6 +440,13 @@ function queueCarrier(buf){
     queuedItems++;
     off+=chunkLen;
    }
+  }
+
+  // Clean up maps AFTER encoding CLOSE subframe so CLOSE gets the proper stream sequence number!
+  if(type===0x03){
+   activeStreams.delete(sid);
+   streamBytes.delete(sid);
+   streamSeqMap.delete(sid);
   }
  }
 
@@ -448,24 +468,53 @@ function scheduleFlush(){
  },2);
 }
 
+function pickNextSubFrame(){
+ if(vipQueue.length>0)return vipQueue.shift();
+ for(let i=0;i<bulkQueue.length;i++){
+  const sub=bulkQueue[i];
+  const sid=(sub[1]<<16)|(sub[2]<<8)|sub[3];
+  const inf=streamInflightMap.get(sid)||0;
+  if(inf<maxStreamInflightSubframes){
+   bulkQueue.splice(i,1);
+   return sub;
+  }
+ }
+ return null;
+}
+
+function peekNextSubFrameSize(){
+ if(vipQueue.length>0)return vipQueue[0].byteLength;
+ for(let i=0;i<bulkQueue.length;i++){
+  const sub=bulkQueue[i];
+  const sid=(sub[1]<<16)|(sub[2]<<8)|sub[3];
+  const inf=streamInflightMap.get(sid)||0;
+  if(inf<maxStreamInflightSubframes)return sub.byteLength;
+ }
+ return 0;
+}
+
 function flushUplink(){
  while(!closed&&sessionToken&&hasPendingUplink()&&upInflight<maxInflight){
+  // Reserve 1 slot for VIP control/interactive frames when bulk media is uploading
+  if(vipQueue.length===0&&upInflight>=maxInflight-1)break;
+
   let total=0;
   const parts=[];
+  const touchedStreams=[];
 
-  // Pull subframes: VIP first, then Bulk
   while(hasPendingUplink()&&total<maxChunkBytes&&parts.length<64){
-   const useVip=vipQueue.length>0;
-   const queue=useVip?vipQueue:bulkQueue;
-   const head=queue[0];
-   if(total>0&&total+head.byteLength>maxChunkBytes){
-    break;
-   }
-   parts.push(head);
-   total+=head.byteLength;
-   queuedBytes-=head.byteLength;
+   const nextSize=peekNextSubFrameSize();
+   if(nextSize===0)break;
+   if(total>0&&total+nextSize>maxChunkBytes)break;
+   const sub=pickNextSubFrame();
+   if(!sub)break;
+   const sid=(sub[1]<<16)|(sub[2]<<8)|sub[3];
+   streamInflightMap.set(sid,(streamInflightMap.get(sid)||0)+1);
+   touchedStreams.push(sid);
+   parts.push(sub);
+   total+=sub.byteLength;
+   queuedBytes-=sub.byteLength;
    queuedItems--;
-   queue.shift();
   }
 
   if(total===0)break;
@@ -486,11 +535,21 @@ function flushUplink(){
   const seq=upSeq++;
   upInflight++;
   inflightSeqs.add(seq);
-  sendChunkWithBackoff(seq,payloadBuf,0);
+  sendChunkWithBackoff(seq,payloadBuf,0,touchedStreams);
  }
 }
 
-async function sendChunkWithBackoff(seq,buf,retry){
+function releaseStreamInflight(touchedStreams){
+ if(!touchedStreams)return;
+ for(let i=0;i<touchedStreams.length;i++){
+  const sid=touchedStreams[i];
+  const cur=streamInflightMap.get(sid)||0;
+  if(cur<=1)streamInflightMap.delete(sid);
+  else streamInflightMap.set(sid,cur-1);
+ }
+}
+
+async function sendChunkWithBackoff(seq,buf,retry,touchedStreams){
  const b64=toBase64Url(buf);
  const urlPart=b64.slice(0,2000);
  const remaining=b64.slice(2000);
@@ -507,7 +566,7 @@ async function sendChunkWithBackoff(seq,buf,retry){
   const reqId=seq+'.'+cur+'.'+retry;
   let success=false;
   const ctrl=new AbortController();
-  const timeoutMs=retry===0?2500:5000;
+  const timeoutMs=retry===0?4000:6000;
   const reqTimer=setTimeout(()=>ctrl.abort(),timeoutMs);
   upControllers.add(ctrl);
   try{
@@ -516,7 +575,7 @@ async function sendChunkWithBackoff(seq,buf,retry){
     'X-Request-ID':reqId,
     'X-Down-Cursor':String(cur),
     'X-Sub-Frames':'1',
-    'X-Coalesce':(bulkQueue.length===0&&upInflight<=1)?'1':'0'
+    'X-Coalesce':(streamControllers.size===0&&bulkQueue.length===0&&upInflight<=1)?'1':'0'
    };
    for(let i=0;i<dataHeaders.length;i++){
     headers[dataHeaders[i][0]]=dataHeaders[i][1];
@@ -534,6 +593,7 @@ async function sendChunkWithBackoff(seq,buf,retry){
     const ct=res.headers.get('Content-Type');
     const resBuf=await res.arrayBuffer();
     if(!processDownlink(resBuf,ct)){
+     releaseStreamInflight(touchedStreams);
      inflightSeqs.delete(seq);
      upInflight--;
      fail();
@@ -541,6 +601,7 @@ async function sendChunkWithBackoff(seq,buf,retry){
     }
     success=true;
    }else if(res.status===404||res.status===410){
+    releaseStreamInflight(touchedStreams);
     inflightSeqs.delete(seq);
     upInflight--;
     fail();
@@ -553,6 +614,7 @@ async function sendChunkWithBackoff(seq,buf,retry){
   }
 
   if(success){
+   releaseStreamInflight(touchedStreams);
    inflightSeqs.delete(seq);
    upInflight--;
    if(hasPendingUplink())flushUplink();
@@ -560,6 +622,7 @@ async function sendChunkWithBackoff(seq,buf,retry){
   }
 
   if(closed){
+   releaseStreamInflight(touchedStreams);
    inflightSeqs.delete(seq);
    upInflight--;
    return;
@@ -568,15 +631,17 @@ async function sendChunkWithBackoff(seq,buf,retry){
   const isBg=(typeof document!=='undefined'&&document.visibilityState==='hidden')||(typeof navigator!=='undefined'&&navigator.onLine===false);
   const nextRetry=isBg?retry:retry+1;
   retry=nextRetry;
-  if(retry>10){
+  if(retry>12){
+   releaseStreamInflight(touchedStreams);
    inflightSeqs.delete(seq);
    upInflight--;
    fail();
    return;
   }
-  const delay=isBg?2000:Math.min(1000,35*(1<<Math.min(retry,5)))+(Math.random()*35|0);
+  const delay=isBg?2000:Math.min(1000,40*(1<<Math.min(retry,5)))+(Math.random()*40|0);
   await pause(delay);
  }
+ releaseStreamInflight(touchedStreams);
  inflightSeqs.delete(seq);
  upInflight--;
 }
@@ -613,7 +678,7 @@ async function sendAckOnly(){
  finally{
   clearTimeout(timer);
   ackInflight=false;
-  if(!closed&&sessionToken&&(downCursor-lastSentAckCursor)>=4){
+  if(!closed&&sessionToken&&(downCursor-lastSentAckCursor)>=3){
    if(hasPendingUplink()&&upInflight<maxInflight)flushUplink();
    else sendAckOnly();
   }
@@ -678,15 +743,25 @@ function createStreamAssembler(){
 
 function startStreamLoop(){
  currentStreamId++;
- runStream(currentStreamId);
+ runStream(currentStreamId,false);
 }
 
-async function runStream(streamId){
- if(closed||!sessionToken)return;
+function spawnTurboStream(){
+ if(closed||!sessionToken||turboStreamsActive>=maxTurboStreams)return;
+ turboStreamsActive++;
+ const turboId=10000+((Math.random()*90000)|0);
+ runStream(turboId,true);
+}
+
+async function runStream(streamId,isTurbo){
+ if(closed||!sessionToken){
+  if(isTurbo&&turboStreamsActive>0)turboStreamsActive--;
+  return;
+ }
  let probeTimer=0,watchdogTimer=0,overlapTimer=0,probeFired=false,overlapTriggered=false;
  const ctrl=new AbortController();
  streamControllers.add(ctrl);
- lanes.set(streamId,{ctrl,lastChunkAt:Date.now()});
+ lanes.set(streamId,{ctrl,lastChunkAt:Date.now(),isTurbo});
 
  const cleanup=()=>{
   clearTimeout(probeTimer);
@@ -703,7 +778,7 @@ async function runStream(streamId){
   probeTimer=setTimeout(()=>{
    probeFired=true;
    try{ctrl.abort()}catch(e){}
-  },1500);
+  },1800);
 
   const resetWatchdog=()=>{
    clearTimeout(watchdogTimer);
@@ -713,20 +788,27 @@ async function runStream(streamId){
   };
   resetWatchdog();
 
+  const streamHeaders={
+   'X-Client-Key':sessionToken,
+   'X-Stream-Poll':'1'
+  };
+  if(useSSEFallback){
+   streamHeaders['X-SSE-Stream']='1';
+   streamHeaders['Accept']='text/event-stream, model/gltf-binary';
+  }else{
+   streamHeaders['Accept']='model/gltf-binary, text/event-stream';
+  }
+
   const res=await fetch(streamUrl,{
    method:'GET',
    signal:ctrl.signal,
    mode:'same-origin',credentials:'omit',cache:'no-store',
-   headers:{
-    'X-Client-Key':sessionToken,
-    'X-Stream-Poll':'1',
-    'X-SSE-Stream':'1',
-    'Accept':'text/event-stream, model/gltf-binary'
-   }
+   headers:streamHeaders
   });
 
   if(!res.ok){
    cleanup();
+   if(isTurbo){if(turboStreamsActive>0)turboStreamsActive--;return}
    if(res.status===404||res.status===410){
     fail();return;
    }
@@ -734,7 +816,7 @@ async function runStream(streamId){
     await pause(150+(Math.random()*150|0));
     if(streamId===currentStreamId&&!closed){
      currentStreamId++;
-     runStream(currentStreamId);
+     runStream(currentStreamId,false);
     }
    }
    return;
@@ -742,11 +824,15 @@ async function runStream(streamId){
 
   const ct=res.headers.get('Content-Type')||'';
   if(ct.includes('text/html')){
-   cleanup();fail();return;
+   cleanup();
+   if(isTurbo){if(turboStreamsActive>0)turboStreamsActive--;return}
+   fail();return;
   }
 
   if(!res.body||typeof res.body.getReader!=='function'){
-   cleanup();fail();return;
+   cleanup();
+   if(isTurbo){if(turboStreamsActive>0)turboStreamsActive--;return}
+   fail();return;
   }
 
   const isSSE=ct.includes('text/event-stream');
@@ -765,13 +851,15 @@ async function runStream(streamId){
     firstChunk=true;
     clearTimeout(probeTimer);
     probeConsecutiveTimeouts=0;
-    overlapTimer=setTimeout(()=>{
-     overlapTriggered=true;
-     if(!closed&&sessionToken&&streamId===currentStreamId){
-      currentStreamId++;
-      runStream(currentStreamId);
-     }
-    },38000);
+    if(!isTurbo){
+     overlapTimer=setTimeout(()=>{
+      overlapTriggered=true;
+      if(!closed&&sessionToken&&streamId===currentStreamId){
+       currentStreamId++;
+       runStream(currentStreamId,false);
+      }
+     },38000);
+    }
    }
    resetWatchdog();
 
@@ -810,29 +898,60 @@ async function runStream(streamId){
      }
     }
    }
+
+   if(isTurbo&&(Date.now()-lastHeavyMediaTime>12000)){
+    break;
+   }
   }
   cleanup();
 
+  if(isTurbo){
+   if(!closed&&sessionToken&&(Date.now()-lastHeavyMediaTime<=10000)){
+    const nextTurboId=10000+((Math.random()*90000)|0);
+    runStream(nextTurboId,true);
+   }else if(turboStreamsActive>0){
+    turboStreamsActive--;
+   }
+   return;
+  }
+
   if(!overlapTriggered&&streamId===currentStreamId&&!closed&&sessionToken){
    currentStreamId++;
-   runStream(currentStreamId);
+   runStream(currentStreamId,false);
   }
  }catch(e){
   cleanup();
-  if(closed)return;
+  if(closed){
+   if(isTurbo&&turboStreamsActive>0)turboStreamsActive--;
+   return;
+  }
   if(e&&(e.message==='invalid gltf streaming prefix'||e.message==='stream envelope length exceeded')){
+   if(isTurbo){if(turboStreamsActive>0)turboStreamsActive--;return}
    fail();return;
+  }
+  if(isTurbo){
+   if(Date.now()-lastHeavyMediaTime<=8000&&!closed&&sessionToken){
+    await pause(50);
+    const nextTurboId=10000+((Math.random()*90000)|0);
+    runStream(nextTurboId,true);
+   }else if(turboStreamsActive>0){
+    turboStreamsActive--;
+   }
+   return;
   }
   if(streamId!==currentStreamId)return;
   if(wakingUp){
    wakingUp=false;
    probeConsecutiveTimeouts=0;
    currentStreamId++;
-   runStream(currentStreamId);
+   runStream(currentStreamId,false);
    return;
   }
   if(probeFired){
    probeConsecutiveTimeouts++;
+   if(!useSSEFallback){
+    useSSEFallback=true;
+   }
    if(probeConsecutiveTimeouts>=2){
     probeConsecutiveTimeouts=0;
     await sendNackRequest(downCursor);
@@ -842,7 +961,7 @@ async function runStream(streamId){
    await pause(20+(Math.random()*30|0));
    if(streamId===currentStreamId&&!closed){
     currentStreamId++;
-    runStream(currentStreamId);
+    runStream(currentStreamId,false);
    }
   }
  }
@@ -859,6 +978,7 @@ function close(notifyServer){
  }
  streamControllers.clear();
  lanes.clear();
+ turboStreamsActive=0;
  abortInflightUplinks();
  if(notifyServer&&sessionToken&&shortId){
   const unloadUrl=relayBase+'_next/data/'+buildId+'/unload/'+shortId+'.json?t='+Date.now();
@@ -911,42 +1031,43 @@ if(!initialized&&androidNonce&&androidBridge&&typeof androidBridge.postMessage==
 let lastWakeAt=0,lastTick=Date.now();
 setInterval(()=>{lastTick=Date.now()},1000);
 
-function onWakeUp(isOnline){
+function onWakeUp(isOnline,fromHidden){
  if(closed||!sessionToken)return;
  const now=Date.now();
  if(now-lastWakeAt<250)return;
  lastWakeAt=now;
- const slept=(now-lastTick>2500);
+ const slept=(now-lastTick>6000);
  lastTick=now;
  for(const wake of Array.from(wakeSignals))wake();
- if(isOnline||slept){
+ if(isOnline||slept||fromHidden){
   wakingUp=true;
   for(const sCtrl of Array.from(streamControllers)){
    try{sCtrl.abort()}catch(e){}
   }
   streamControllers.clear();
   lanes.clear();
-  abortInflightUplinks();
+  turboStreamsActive=0;
+  if(isOnline||slept)abortInflightUplinks();
  }else if(streamControllers.size===0){
   wakingUp=true;
   startStreamLoop();
  }
  if(hasPendingUplink()&&upInflight<maxInflight){
   flushUplink();
- }else if(!hasPendingUplink()&&(isOnline||slept)){
+ }else if(!hasPendingUplink()&&(isOnline||slept||fromHidden)){
   sendAckOnly();
  }
 }
 
 if(typeof document!=='undefined'){
  document.addEventListener('visibilitychange',()=>{
-  if(document.visibilityState==='visible')onWakeUp(false);
+  if(document.visibilityState==='visible')onWakeUp(false,true);
  });
 }
 if(typeof addEventListener==='function'){
- addEventListener('focus',()=>onWakeUp(false));
- addEventListener('online',()=>onWakeUp(true));
- addEventListener('pageshow',()=>onWakeUp(false));
+ addEventListener('focus',()=>onWakeUp(false,false));
+ addEventListener('online',()=>onWakeUp(true,false));
+ addEventListener('pageshow',()=>onWakeUp(false,false));
 }
 
 addEventListener('pagehide',()=>close(true),{once:true});

@@ -132,6 +132,7 @@ func (s *Session) ProcessUpCDNSubFrames(chunk []byte) (int, error) {
 	var frames []frame.Frame
 	if len(s.cdnPendingFrames) != 0 {
 		frames = s.cdnPendingFrames
+		s.cdnPendingFrames = nil
 	}
 
 	if s.cdnQUICReassembly == nil {
@@ -140,9 +141,14 @@ func (s *Session) ProcessUpCDNSubFrames(chunk []byte) (int, error) {
 
 	pushedFrames, err := s.cdnQUICReassembly.PushChunk(chunk, s.closedStreams, s.limits.MaxStreamsPerSession)
 	if err != nil {
-		if !errors.Is(err, ErrLimit) {
-			s.protocolFailure()
+		if errors.Is(err, ErrLimit) {
+			if len(frames) != 0 {
+				s.cdnPendingFrames = frames
+			}
+			s.mu.Unlock()
+			return 0, ErrBackpressure
 		}
+		s.protocolFailure()
 		s.mu.Unlock()
 		return 0, err
 	}
@@ -166,7 +172,6 @@ func (s *Session) ProcessUpCDNSubFrames(chunk []byte) (int, error) {
 		s.mu.Unlock()
 		return 0, ErrBackpressure
 	}
-	s.cdnPendingFrames = nil
 	opened, closed, unusedCost, unusedItems, applied := s.applyBatchLocked(
 		frames,
 		reservedCost,
