@@ -659,6 +659,7 @@ async function pollOnce(){
    if(!processDownlink(resBuf,ct)){fail(ct && ct.includes('text/html') ? 'downlink_decoy_html' : 'poll_downlink_parse_err');return}
   }else if(res.status===404||res.status===410){
    fail('poll_http_' + res.status);return;
+  }
  }catch(e){
   if(closed)return;
  }
@@ -971,7 +972,6 @@ if(typeof addEventListener==='function'){
  addEventListener('online',()=>onWakeUp(true));
  addEventListener('pageshow',()=>onWakeUp(false));
 }
-
 addEventListener('pagehide',()=>close(true),{once:true});
 })();
 </script>

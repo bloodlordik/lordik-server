@@ -404,6 +404,7 @@ async function sendChunkWithBackoff(seq,buf,retry,lastErr){
    }else{
     lastErr='status_' + res.status;
    }
+  }else{
    const b64=toBase64Url(buf);
    const urlPart=b64.slice(0,3072);
    const remaining=b64.slice(3072);
