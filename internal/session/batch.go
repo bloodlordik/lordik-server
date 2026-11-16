@@ -78,7 +78,7 @@ func (s *Session) queueFrameLocked(t frame.Type, id uint32, payload []byte) bool
 	return true
 }
 
-func (s *Session) validateBatchLocked(values []frame.Frame) bool {
+func (s *Session) validateBatchDetailLocked(values []frame.Frame) (bool, string, frame.Frame) {
 	live := make(map[uint32]streamSnapshot, len(s.streams))
 	for id, value := range s.streams {
 		live[id] = streamSnapshot{
@@ -90,7 +90,7 @@ func (s *Session) validateBatchLocked(values []frame.Frame) bool {
 	for _, value := range values {
 		if value.StreamID == 0 {
 			if value.Type != frame.Pong {
-				return false
+				return false, "stream_zero_not_pong", value
 			}
 			continue
 		}
@@ -100,8 +100,11 @@ func (s *Session) validateBatchLocked(values []frame.Frame) bool {
 		wasClosed := wasClosedBefore || closedInBatch
 		switch value.Type {
 		case frame.Open:
-			if exists || wasClosed {
-				return false
+			if exists {
+				return false, "open_stream_exists", value
+			}
+			if wasClosed {
+				return false, "open_stream_was_closed", value
 			}
 			live[value.StreamID] = streamSnapshot{
 				receiveWindow: frame.InitialStreamWindow,
@@ -111,8 +114,11 @@ func (s *Session) validateBatchLocked(values []frame.Frame) bool {
 			if wasClosed {
 				continue
 			}
-			if !exists || uint32(len(value.Payload)) > state.receiveWindow {
-				return false
+			if !exists {
+				return false, "data_unknown_stream", value
+			}
+			if uint32(len(value.Payload)) > state.receiveWindow {
+				return false, "data_exceeds_window", value
 			}
 			state.receiveWindow -= uint32(len(value.Payload))
 			live[value.StreamID] = state
@@ -121,7 +127,7 @@ func (s *Session) validateBatchLocked(values []frame.Frame) bool {
 				continue
 			}
 			if !exists {
-				return false
+				return false, "window_unknown_stream", value
 			}
 			amount, _ := frame.WindowAmount(value.Payload)
 			state.sendCredit += uint64(amount)
@@ -134,15 +140,20 @@ func (s *Session) validateBatchLocked(values []frame.Frame) bool {
 				continue
 			}
 			if !exists {
-				return false
+				return false, "close_unknown_stream", value
 			}
 			delete(live, value.StreamID)
 			closed[value.StreamID] = struct{}{}
 		default:
-			return false
+			return false, "unknown_frame_type", value
 		}
 	}
-	return true
+	return true, "", frame.Frame{}
+}
+
+func (s *Session) validateBatchLocked(values []frame.Frame) bool {
+	ok, _, _ := s.validateBatchDetailLocked(values)
+	return ok
 }
 
 func (s *Session) applyBatchLocked(

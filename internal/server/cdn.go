@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/telegramdesktop/tproxy-server/internal/logger"
 	"github.com/telegramdesktop/tproxy-server/internal/session"
 )
 
@@ -279,11 +280,13 @@ func (s *Server) serveCDNChunkGet(w http.ResponseWriter, r *http.Request, vhost 
 		urlPayloadB64 = qp
 	}
 	if seqStr == "" {
+		logger.Warn(fmt.Sprintf("[CDN CHUNK SEQ ERR] shortID=%s raw=%q", sessionShortID, cleanFile), "short_id", sessionShortID, "file", cleanFile)
 		vhost.servePublic(w, r)
 		return
 	}
 	seq, err := strconv.ParseUint(seqStr, 10, 64)
 	if err != nil {
+		logger.Warn(fmt.Sprintf("[CDN CHUNK SEQ ERR] shortID=%s seqStr=%q err=%v", sessionShortID, seqStr, err), "short_id", sessionShortID, "seq_str", seqStr, "err", err)
 		vhost.servePublic(w, r)
 		return
 	}
@@ -298,12 +301,16 @@ func (s *Server) serveCDNChunkGet(w http.ResponseWriter, r *http.Request, vhost 
 
 	chunk, err := session.DecodeCDNPayload(urlPayloadB64, headerParts)
 	if err != nil {
+		logger.Warn(fmt.Sprintf("[CDN DECODE ERR] shortID=%s seq=%d urlLen=%d hdrCount=%d err=%v", sessionShortID, seq, len(urlPayloadB64), len(headerParts), err),
+			"short_id", sessionShortID, "seq", seq, "url_len", len(urlPayloadB64), "hdr_count", len(headerParts), "err", err)
 		vhost.servePublic(w, r)
 		return
 	}
 
 	sess := s.resolveSession(r, sessionShortID, vhost)
 	if sess == nil {
+		logger.Warn(fmt.Sprintf("[CDN UPLINK MISS] shortID=%s seq=%d: session not found or expired", sessionShortID, seq),
+			"short_id", sessionShortID, "seq", seq, "remote_ip", r.RemoteAddr)
 		vhost.servePublic(w, r)
 		return
 	}
@@ -314,6 +321,8 @@ func (s *Server) serveCDNChunkGet(w http.ResponseWriter, r *http.Request, vhost 
 		_, upErr = sess.ProcessUpCDN(seq, chunk)
 	}
 	if upErr != nil {
+		logger.Warn(fmt.Sprintf("[CDN PROCESS UP ERR] shortID=%s seq=%d chunkLen=%d err=%v", sessionShortID, seq, len(chunk), upErr),
+			"short_id", sessionShortID, "seq", seq, "chunk_len", len(chunk), "err", upErr)
 		s.handleCDNSessionError(w, r, vhost, upErr)
 		return
 	}
@@ -338,6 +347,8 @@ func (s *Server) serveCDNSyncPost(w http.ResponseWriter, r *http.Request, vhost 
 
 	sess := s.resolveSession(r, sessionShortID, vhost)
 	if sess == nil {
+		logger.Warn(fmt.Sprintf("[CDN UPLINK MISS] shortID=%s seq=%d: session not found or expired", sessionShortID, seq),
+			"short_id", sessionShortID, "seq", seq, "remote_ip", r.RemoteAddr)
 		vhost.servePublic(w, r)
 		return
 	}
@@ -354,6 +365,8 @@ func (s *Server) serveCDNSyncPost(w http.ResponseWriter, r *http.Request, vhost 
 		_, upErr = sess.ProcessUpCDN(seq, body)
 	}
 	if upErr != nil {
+		logger.Warn(fmt.Sprintf("[CDN PROCESS UP ERR] shortID=%s seq=%d chunkLen=%d err=%v", sessionShortID, seq, len(body), upErr),
+			"short_id", sessionShortID, "seq", seq, "chunk_len", len(body), "err", upErr)
 		s.handleCDNSessionError(w, r, vhost, upErr)
 		return
 	}
@@ -382,12 +395,16 @@ func (s *Server) serveCDNMediaPoll(w http.ResponseWriter, r *http.Request, vhost
 	}
 	cursor, err := strconv.ParseUint(parts[0], 10, 64)
 	if err != nil {
+		logger.Warn(fmt.Sprintf("[CDN POLL PARSE ERR] shortID=%s cursor=%q err=%v", sessionShortID, parts[0], err),
+			"short_id", sessionShortID, "cursor_raw", parts[0], "err", err)
 		vhost.servePublic(w, r)
 		return
 	}
 
 	sess := s.resolveSession(r, sessionShortID, vhost)
 	if sess == nil {
+		logger.Warn(fmt.Sprintf("[CDN POLL MISS] shortID=%s cursor=%d: session not found or expired", sessionShortID, cursor),
+			"short_id", sessionShortID, "cursor", cursor, "remote_ip", r.RemoteAddr)
 		vhost.servePublic(w, r)
 		return
 	}
@@ -421,6 +438,18 @@ func (s *Server) serveCDNMediaPoll(w http.ResponseWriter, r *http.Request, vhost
 }
 
 func (s *Server) serveCDNUnload(w http.ResponseWriter, r *http.Request, vhost *VHost, sessionShortID string) {
+	reason := r.URL.Query().Get("r")
+	if reason == "" {
+		reason = r.URL.Query().Get("reason")
+	}
+	if reason == "" {
+		reason = "normal"
+	}
+	logger.Info(fmt.Sprintf("[CDN UNLOAD] shortID=%s reason=%q remoteIP=%s", sessionShortID, reason, r.RemoteAddr),
+		"short_id", sessionShortID,
+		"reason", reason,
+		"remote_ip", r.RemoteAddr,
+	)
 	if key := r.Header.Get("X-Client-Key"); key != "" {
 		if sess, err := s.manager.Get(key); err == nil && sess != nil {
 			if sess.Profile() == nil || strings.EqualFold(sess.Profile().Hostname, vhost.Hostname) {

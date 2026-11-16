@@ -674,3 +674,23 @@ lordik-server/
       - В `subframe_test.go` тестовый скачок sequence приведен в соответствие с увеличенным размером окна `maxStreamWindowSpan = 256` (`Seq = 300`) с проверкой возврата мягкого `ErrLimit`.
     - **Профиль по умолчанию `direct-auto` в Docker**:
       - В `docker/profiles.json` добавлен профиль прямого подключения `direct-auto` (`backend_type: direct`, `backend: auto`), работающий из коробки без зависимостей от Telemt Middle-End на порту 8888.
+35. **Система диагностического логирования ошибок и событий CDN (`logger`, `cdn_quic`, `cdn_ws`, `cdn`)**:
+    - **Компоненты**: `internal/bridge/templates/cdn_quic.html`, `internal/bridge/templates/cdn_ws.html`, `internal/bridge/templates/cdn.html`, `internal/server/cdn.go`, `internal/server/cdn_stream.go`, `internal/session/subframe.go`, `internal/session/batch.go`, `internal/session/cdn_session.go`, `internal/server/cdn_test.go`, `internal/bridge/page_test.go`.
+    - **Клиентская классификация причин сбоев и передача в unload (`failReason`)**:
+      - В клиентских шаблонах `cdn_quic.html`, `cdn_ws.html` и `cdn.html` введена глобальная переменная `let failReason = 'normal'`.
+      - Функция `fail(reason)` защищена от каскадного перезаписывания первопричины сбоя (`if(failReason==='normal') failReason = reason || 'unknown'`) и логирует событие в консоль браузера (`console.error('[BRIDGE FAIL]', failReason)`).
+      - Запрос выгрузки страницы `GET /_next/data/{build_id}/unload/{short_id}.json` передает точную причину закрытия в параметре URL `&r=<reason>`.
+      - Классифицированы все точки отказа клиента: `create_session_failed`, `queue_overflow`, `downlink_decoy_html`, `uplink_downlink_parse_err_seq_N`, `uplink_http_404_seq_N`, `uplink_max_retries_seq_N_last_err_X`, `stream_http_404`, `stream_decoy_html`, `stream_reader_unsupported`, `stream_parse_err_X`, `poll_downlink_parse_err`, `poll_http_X`, `android_split_frames_err`.
+    - **Серверное структурированное логирование обработчиков CDN (`internal/server/`)**:
+      - В `serveCDNUnload` логируется `[CDN UNLOAD]` с `short_id`, причиной `reason` и `remote_ip`.
+      - В `serveCDNChunkGet` и `serveCDNSyncPost` логируются предупреждения `[CDN CHUNK SEQ ERR]`, `[CDN DECODE ERR]`, `[CDN UPLINK MISS]` и `[CDN PROCESS UP ERR]`.
+      - В `serveCDNMediaPoll` логируются `[CDN POLL PARSE ERR]` и `[CDN POLL MISS]`.
+      - В `serveCDNStreamDown` логируются `[CDN STREAM MISS]` и фатальные аномалии курсора `[CDN STREAM FATAL] client cursor > server downCursor`.
+    - **Диагностика субфреймов и ограничений очередей (`internal/session/subframe.go`)**:
+      - В `ParseSubFrames` логируются ошибки усечения заголовка, недопустимого типа кадра и выхода за лимиты длины нагрузки под тегом `[QUIC SUBFRAME PROTOCOL]`.
+      - В `StreamReassembly` и `PerStreamReassembly` логируются нарушения протокола фрагментации (FIN/middle без FIRST, повторный FIRST) и мягкие ограничения буферов (`[QUIC SUBFRAME LIMIT]` при превышении `maxStreamWindowSpan`, `maxStreamBufferSize` или лимита стримов).
+    - **Детализированная валидация батчей и аномалии курсоров (`internal/session/`)**:
+      - Реализован метод `validateBatchDetailLocked(values) (bool, string, frame.Frame)`, возвращающий точную причину невалидности кадра (`open_stream_exists`, `data_unknown_stream`, `data_exceeds_window`, `unknown_frame_type` и др.).
+      - В `ProcessUpCDN` и `ProcessUpCDNSubFrames` ошибки валидации логируются со всеми реквизитами под тегами `[CDN VALIDATE FATAL]` и `[QUIC VALIDATE FATAL]`.
+      - При вытеснении стрим-воркеров в `PollCDNExt` логируется событие `[CDN POLL EVICT]`.
+      - Все операции со счетчиками курсоров (`AckDownCDN`, `NackReplay`, `ackCursorLocked`, `PiggybackDownWait`, `PollCDNExt`, `StreamCDN`) при получении опережающего клиентского курсора (`cursor > downCursor`) логируют структурированные предупреждения с идентификатором сессии и значениями курсоров.

@@ -17,6 +17,7 @@ history.replaceState(null,'',location.pathname);
 if(typeof navigator!=='undefined'&&navigator.locks&&typeof navigator.locks.request==='function'){
  navigator.locks.request('tproxy_active_session',{mode:'shared'},()=>new Promise(()=>{})).catch(()=>{});
 }
+let failReason = 'normal';
 
 let initialized=false,closed=false,port=null,sessionToken='',resumeToken='',shortId='',createStarted=false;
 let queuedBytes=0,queuedItems=0;
@@ -142,8 +143,11 @@ function encodeSubFrame(type,sid,seq,flags,payloadBytes){
  return arr;
 }
 
-function fail(){
- if(failing||closed)return;
+function fail(reason){
+ if(closed)return;
+ if(failReason==='normal')failReason=reason||'unknown';
+ console.error('[BRIDGE FAIL]',failReason);
+ if(failing)return;
  failing=true;
  if(reorderGapTimer){clearTimeout(reorderGapTimer);reorderGapTimer=0}
  downReorderMap.clear();
@@ -363,7 +367,7 @@ async function createSession(helloBuf){
  }
 
  if(!ok||closed){
-  fail();
+  fail('create_session_failed');
   return;
  }
 
@@ -379,7 +383,7 @@ function hasPendingUplink(){
 function queueCarrier(buf){
  if(closed)return;
  let frames;
- try{frames=splitFrames(buf)}catch(e){fail();return}
+ try{frames=splitFrames(buf)}catch(e){fail('create_split_frames_err');return}
  for(const f of frames){
   const sid=f.id;
   const type=f.type;
@@ -450,7 +454,7 @@ function queueCarrier(buf){
   }
  }
 
- if(queuedBytes>queueLimit||queuedItems>queueItemLimit){fail();return}
+ if(queuedBytes>queueLimit||queuedItems>queueItemLimit){fail('queue_overflow');return}
 
  // Immediate First Dispatch: 0 ms delay when upInflight === 0
  if(sessionToken&&upInflight===0&&!debounceTimer){
@@ -560,6 +564,7 @@ async function sendChunkWithBackoff(seq,buf,retry,touchedStreams){
   roff+=3000;hidx++;
  }
 
+ let lastErr='unknown';
  while(!closed){
   const cur=downCursor;
   lastSentAckCursor=cur;
@@ -596,7 +601,7 @@ async function sendChunkWithBackoff(seq,buf,retry,touchedStreams){
      releaseStreamInflight(touchedStreams);
      inflightSeqs.delete(seq);
      upInflight--;
-     fail();
+     fail(ct && ct.includes('text/html') ? 'downlink_decoy_html' : 'uplink_downlink_parse_err_seq_' + seq);
      return;
     }
     success=true;
@@ -604,10 +609,13 @@ async function sendChunkWithBackoff(seq,buf,retry,touchedStreams){
     releaseStreamInflight(touchedStreams);
     inflightSeqs.delete(seq);
     upInflight--;
-    fail();
+    fail('uplink_http_' + res.status + '_seq_' + seq);
     return;
+   }else{
+    lastErr='status_' + res.status;
    }
   }catch(e){
+   lastErr=ctrl.signal.aborted ? (retry === 0 ? 'timeout_4s' : 'timeout_6s') : 'net_err';
   }finally{
    clearTimeout(reqTimer);
    upControllers.delete(ctrl);
@@ -635,7 +643,7 @@ async function sendChunkWithBackoff(seq,buf,retry,touchedStreams){
    releaseStreamInflight(touchedStreams);
    inflightSeqs.delete(seq);
    upInflight--;
-   fail();
+   fail('uplink_max_retries_seq_' + seq + '_last_err_' + lastErr);
    return;
   }
   const delay=isBg?2000:Math.min(1000,40*(1<<Math.min(retry,5)))+(Math.random()*40|0);
@@ -670,9 +678,9 @@ async function sendAckOnly(){
   if(res.ok){
    const ct=res.headers.get('Content-Type');
    const resBuf=await res.arrayBuffer();
-   if(!processDownlink(resBuf,ct))fail();
+   if(!processDownlink(resBuf,ct))fail(ct && ct.includes('text/html') ? 'downlink_decoy_html' : 'ack_downlink_parse_err');
   }else if(res.status===404||res.status===410){
-   fail();
+   fail('ack_http_' + res.status);
   }
  }catch(e){}
  finally{
@@ -810,7 +818,7 @@ async function runStream(streamId,isTurbo){
    cleanup();
    if(isTurbo){if(turboStreamsActive>0)turboStreamsActive--;return}
    if(res.status===404||res.status===410){
-    fail();return;
+    fail('stream_http_' + res.status);return;
    }
    if(streamId===currentStreamId&&!closed){
     await pause(150+(Math.random()*150|0));
@@ -826,13 +834,13 @@ async function runStream(streamId,isTurbo){
   if(ct.includes('text/html')){
    cleanup();
    if(isTurbo){if(turboStreamsActive>0)turboStreamsActive--;return}
-   fail();return;
+   fail('stream_decoy_html');return;
   }
 
   if(!res.body||typeof res.body.getReader!=='function'){
    cleanup();
    if(isTurbo){if(turboStreamsActive>0)turboStreamsActive--;return}
-   fail();return;
+   fail('stream_reader_unsupported');return;
   }
 
   const isSSE=ct.includes('text/event-stream');
@@ -927,7 +935,7 @@ async function runStream(streamId,isTurbo){
   }
   if(e&&(e.message==='invalid gltf streaming prefix'||e.message==='stream envelope length exceeded')){
    if(isTurbo){if(turboStreamsActive>0)turboStreamsActive--;return}
-   fail();return;
+   fail('stream_parse_err_' + (e.message ? e.message.replace(/\s+/g, '_') : 'unknown'));return;
   }
   if(isTurbo){
    if(Date.now()-lastHeavyMediaTime<=8000&&!closed&&sessionToken){
@@ -981,7 +989,7 @@ function close(notifyServer){
  turboStreamsActive=0;
  abortInflightUplinks();
  if(notifyServer&&sessionToken&&shortId){
-  const unloadUrl=relayBase+'_next/data/'+buildId+'/unload/'+shortId+'.json?t='+Date.now();
+  const unloadUrl=relayBase+'_next/data/'+buildId+'/unload/'+shortId+'.json?t='+Date.now()+'&r='+encodeURIComponent(failReason);
   fetch(unloadUrl,{
    method:'GET',
    keepalive:true,
@@ -1017,7 +1025,7 @@ const androidBridge=globalThis.TelegramWebProxy;
 if(!initialized&&androidNonce&&androidBridge&&typeof androidBridge.postMessage==='function'){
  const androidPort={onmessage:null,start(){},close(){androidBridge.onmessage=null},postMessage(value){
   if(value instanceof ArrayBuffer){
-   let frames;try{frames=splitFrames(value)}catch(error){fail();return}
+   let frames;try{frames=splitFrames(value)}catch(error){fail('android_split_frames_err');return}
    for(const frame of frames)androidBridge.postMessage(frame.data);
   }else androidBridge.postMessage(JSON.stringify(value));
  }};

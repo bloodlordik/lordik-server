@@ -782,3 +782,61 @@ func TestServer_CDNQUIC_SubFramesAndSSEAndNack(t *testing.T) {
 		t.Fatalf("invalid glTF magic in NACK reply: %q", nackBody[:4])
 	}
 }
+
+func TestServer_CDNUnload_WithReason(t *testing.T) {
+	backend := startEchoBackend(t)
+	application, _ := newConfiguredTestServer(t, backend, func(value *config.Config) {
+		value.Profiles[0].CarrierMode = config.CarrierCDNAdaptive
+	})
+	defer application.Shutdown()
+
+	hosted := httptest.NewServer(application.Handler())
+	defer hosted.Close()
+
+	buildID := application.BuildID()
+	clientIP := "198.51.100.101"
+	bootstrapToken, err := application.manager.IssueBootstrap(&application.config.Profiles[0], clientIP)
+	if err != nil {
+		t.Fatalf("IssueBootstrap failed: %v", err)
+	}
+
+	helloFrame := frame.Encode(frame.Hello, 0, []byte{1})
+	helloB64 := base64.RawURLEncoding.EncodeToString(helloFrame)
+	initURL := hosted.URL + "/_next/data/" + buildID + "/init/" + bootstrapToken + "/" + helloB64 + ".json"
+	initReq := request(t, http.MethodGet, initURL, nil, "")
+	initReq.Header.Set("X-Forwarded-For", clientIP)
+	initRes := perform(t, hosted.Client(), initReq)
+	if initRes.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", initRes.StatusCode)
+	}
+	var initJSON struct {
+		Token   string `json:"token"`
+		ShortID string `json:"short_id"`
+	}
+	if err := json.Unmarshal(readResponse(t, initRes), &initJSON); err != nil {
+		t.Fatalf("decode init json failed: %v", err)
+	}
+
+	sess, err := application.manager.Get(initJSON.Token)
+	if err != nil || sess == nil {
+		t.Fatalf("session should exist: %v", err)
+	}
+
+	unloadURL := hosted.URL + "/_next/data/" + buildID + "/unload/" + initJSON.ShortID + ".json?t=123&r=uplink_http_404_seq_1"
+	unloadReq := request(t, http.MethodGet, unloadURL, nil, "")
+	unloadReq.Header.Set("X-Client-Key", initJSON.Token)
+	unloadReq.Header.Set("X-Forwarded-For", clientIP)
+	unloadRes := perform(t, hosted.Client(), unloadReq)
+	if unloadRes.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for unload, got %d", unloadRes.StatusCode)
+	}
+	unloadBody := string(readResponse(t, unloadRes))
+	if !strings.Contains(unloadBody, `{"s":1}`) {
+		t.Fatalf("expected {\"s\":1}, got %q", unloadBody)
+	}
+
+	sessAfter, _ := application.manager.Get(initJSON.Token)
+	if sessAfter != nil {
+		t.Fatalf("session should have been closed/removed after unload")
+	}
+}

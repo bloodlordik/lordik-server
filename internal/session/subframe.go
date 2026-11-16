@@ -3,8 +3,10 @@ package session
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 
 	"github.com/telegramdesktop/tproxy-server/internal/frame"
+	"github.com/telegramdesktop/tproxy-server/internal/logger"
 )
 
 const (
@@ -48,10 +50,12 @@ func ParseSubFrames(data []byte) ([]SubFrame, error) {
 	result := make([]SubFrame, 0, 4)
 	for len(data) > 0 {
 		if len(data) < SubFrameHeaderSize {
+			logger.Warn(fmt.Sprintf("[QUIC SUBFRAME PROTOCOL] subframe truncated header: len=%d < %d", len(data), SubFrameHeaderSize), "len", len(data))
 			return nil, ErrProtocol
 		}
 		t := frame.Type(data[0])
 		if t != frame.Open && t != frame.Data && t != frame.Close && t != frame.Window && t != frame.Pong {
+			logger.Warn(fmt.Sprintf("[QUIC SUBFRAME PROTOCOL] invalid subframe type: 0x%02x", data[0]), "type", data[0])
 			return nil, ErrProtocol
 		}
 		streamID := uint32(data[1])<<16 | uint32(data[2])<<8 | uint32(data[3])
@@ -60,6 +64,7 @@ func ParseSubFrames(data []byte) ([]SubFrame, error) {
 		subLen := int(binary.BigEndian.Uint16(data[7:9]))
 
 		if subLen > maxSubFramePayload || len(data) < SubFrameHeaderSize+subLen {
+			logger.Warn(fmt.Sprintf("[QUIC SUBFRAME PROTOCOL] invalid subframe payload len: streamID=%d seq=%d subLen=%d max=%d available=%d", streamID, seq, subLen, maxSubFramePayload, len(data)-SubFrameHeaderSize), "stream_id", streamID, "seq", seq, "sub_len", subLen, "max", maxSubFramePayload)
 			return nil, ErrProtocol
 		}
 		// Copy slice to decouple from temporary HTTP request buffer when stored out-of-order
@@ -98,6 +103,7 @@ func (r *StreamReassembly) appendSub(sub SubFrame) ([]frame.Frame, error) {
 	switch sub.Flags & (SubFlagFirst | SubFlagFin) {
 	case SubFlagFirst | SubFlagFin:
 		if len(r.accumulated) > 0 {
+			logger.Warn(fmt.Sprintf("[QUIC SUBFRAME PROTOCOL] FIRST fragment arrived with non-empty accumulated buffer: streamID=%d seq=%d acc_len=%d", sub.StreamID, sub.Seq, len(r.accumulated)), "stream_id", sub.StreamID, "seq", sub.Seq, "accumulated_len", len(r.accumulated))
 			return nil, ErrProtocol
 		}
 		f := frame.Frame{
@@ -106,28 +112,33 @@ func (r *StreamReassembly) appendSub(sub SubFrame) ([]frame.Frame, error) {
 			Payload:  sub.Payload,
 		}
 		if err := frame.ValidateClientShape(f); err != nil {
+			logger.Warn(fmt.Sprintf("[QUIC SUBFRAME PROTOCOL] ValidateClientShape failed: streamID=%d seq=%d err=%v", sub.StreamID, sub.Seq, err), "stream_id", sub.StreamID, "seq", sub.Seq, "err", err)
 			return nil, ErrProtocol
 		}
 		return []frame.Frame{f}, nil
 
 	case SubFlagFirst:
 		if len(r.accumulated) > 0 {
+			logger.Warn(fmt.Sprintf("[QUIC SUBFRAME PROTOCOL] FIRST fragment arrived with non-empty accumulated buffer: streamID=%d seq=%d acc_len=%d", sub.StreamID, sub.Seq, len(r.accumulated)), "stream_id", sub.StreamID, "seq", sub.Seq, "accumulated_len", len(r.accumulated))
 			return nil, ErrProtocol
 		}
 		r.accumulated = append([]byte(nil), sub.Payload...)
 		r.accumulatedType = sub.Type
 		r.bufferedBytes += len(sub.Payload)
 		if r.bufferedBytes > maxStreamBufferSize {
+			logger.Warn(fmt.Sprintf("[QUIC SUBFRAME LIMIT] stream buffer exceeded on FIRST: streamID=%d seq=%d buffered=%d > max=%d", sub.StreamID, sub.Seq, r.bufferedBytes, maxStreamBufferSize), "stream_id", sub.StreamID, "seq", sub.Seq, "buffered", r.bufferedBytes, "max", maxStreamBufferSize)
 			return nil, ErrLimit
 		}
 		return nil, nil
 
 	case SubFlagFin:
 		if len(r.accumulated) == 0 {
+			logger.Warn(fmt.Sprintf("[QUIC SUBFRAME PROTOCOL] FIN fragment without preceding FIRST: streamID=%d seq=%d", sub.StreamID, sub.Seq), "stream_id", sub.StreamID, "seq", sub.Seq)
 			return nil, ErrProtocol
 		}
 		r.accumulated = append(r.accumulated, sub.Payload...)
 		if len(r.accumulated) > frame.MaxPayload {
+			logger.Warn(fmt.Sprintf("[QUIC SUBFRAME LIMIT] accumulated frame exceeded MaxPayload on FIN: streamID=%d seq=%d len=%d > max=%d", sub.StreamID, sub.Seq, len(r.accumulated), frame.MaxPayload), "stream_id", sub.StreamID, "seq", sub.Seq, "len", len(r.accumulated), "max", frame.MaxPayload)
 			return nil, ErrLimit
 		}
 		f := frame.Frame{
@@ -136,6 +147,7 @@ func (r *StreamReassembly) appendSub(sub SubFrame) ([]frame.Frame, error) {
 			Payload:  r.accumulated,
 		}
 		if err := frame.ValidateClientShape(f); err != nil {
+			logger.Warn(fmt.Sprintf("[QUIC SUBFRAME PROTOCOL] ValidateClientShape failed: streamID=%d seq=%d err=%v", sub.StreamID, sub.Seq, err), "stream_id", sub.StreamID, "seq", sub.Seq, "err", err)
 			return nil, ErrProtocol
 		}
 		r.bufferedBytes -= len(r.accumulated) - len(sub.Payload)
@@ -147,11 +159,13 @@ func (r *StreamReassembly) appendSub(sub SubFrame) ([]frame.Frame, error) {
 
 	default: // middle fragment
 		if len(r.accumulated) == 0 {
+			logger.Warn(fmt.Sprintf("[QUIC SUBFRAME PROTOCOL] middle fragment without preceding FIRST: streamID=%d seq=%d", sub.StreamID, sub.Seq), "stream_id", sub.StreamID, "seq", sub.Seq)
 			return nil, ErrProtocol
 		}
 		r.accumulated = append(r.accumulated, sub.Payload...)
 		r.bufferedBytes += len(sub.Payload)
 		if r.bufferedBytes > maxStreamBufferSize || len(r.accumulated) > frame.MaxPayload {
+			logger.Warn(fmt.Sprintf("[QUIC SUBFRAME LIMIT] stream buffer or MaxPayload exceeded on middle fragment: streamID=%d seq=%d buffered=%d acc_len=%d", sub.StreamID, sub.Seq, r.bufferedBytes, len(r.accumulated)), "stream_id", sub.StreamID, "seq", sub.Seq, "buffered", r.bufferedBytes, "acc_len", len(r.accumulated))
 			return nil, ErrLimit
 		}
 		return nil, nil
@@ -168,6 +182,7 @@ func (r *StreamReassembly) Push(sub SubFrame) ([]frame.Frame, error) {
 	if diff > 0 {
 		if diff > maxStreamWindowSpan {
 			// Return ErrLimit (backpressure/retryable) instead of killing the session with ErrProtocol
+			logger.Warn(fmt.Sprintf("[QUIC SUBFRAME LIMIT] stream window span exceeded: streamID=%d seq=%d expected=%d diff=%d max=%d", sub.StreamID, sub.Seq, r.expectedSeq, diff, maxStreamWindowSpan), "stream_id", sub.StreamID, "seq", sub.Seq, "expected", r.expectedSeq, "diff", diff, "max", maxStreamWindowSpan)
 			return nil, ErrLimit
 		}
 		if _, exists := r.outOfOrder[sub.Seq]; exists {
@@ -175,6 +190,7 @@ func (r *StreamReassembly) Push(sub SubFrame) ([]frame.Frame, error) {
 			return nil, nil
 		}
 		if r.bufferedBytes+len(sub.Payload) > maxStreamBufferSize {
+			logger.Warn(fmt.Sprintf("[QUIC SUBFRAME LIMIT] stream buffer exceeded: streamID=%d buffered=%d payload=%d max=%d", sub.StreamID, r.bufferedBytes, len(sub.Payload), maxStreamBufferSize), "stream_id", sub.StreamID, "buffered", r.bufferedBytes, "payload", len(sub.Payload), "max", maxStreamBufferSize)
 			return nil, ErrLimit
 		}
 		r.outOfOrder[sub.Seq] = sub
@@ -262,6 +278,7 @@ func (p *PerStreamReassembly) PushChunk(chunk []byte, closedStreams map[uint32]s
 		st, exists := p.streams[sub.StreamID]
 		if !exists {
 			if maxStreams > 0 && len(p.streams) >= maxStreams+64 {
+				logger.Warn(fmt.Sprintf("[QUIC SUBFRAME LIMIT] max streams per session exceeded: streamID=%d active=%d limit=%d", sub.StreamID, len(p.streams), maxStreams+64), "stream_id", sub.StreamID, "active_streams", len(p.streams), "limit", maxStreams+64)
 				return nil, ErrLimit
 			}
 			st = NewStreamReassembly()

@@ -495,3 +495,23 @@ func TestRenderCDNQUICBridge(t *testing.T) {
 		}
 	}
 }
+
+func TestRenderCDNErrorLogging(t *testing.T) {
+	modes := []string{"cdn-quic", "cdn-quik", "cdn-ws", "cdn-adaptive", "cdn"}
+	for _, mode := range modes {
+		page, err := Render("cdn.example.com", "", "bootstrap-token", mode, 2*1024*1024)
+		if err != nil {
+			t.Fatalf("Render(%q) failed: %v", mode, err)
+		}
+		body := string(page.Body)
+		for _, expected := range []string{
+			"failReason",
+			"console.error('[BRIDGE FAIL]'",
+			"&r=",
+		} {
+			if !strings.Contains(body, expected) {
+				t.Fatalf("rendered %q bridge lacks expected error logging snippet %q", mode, expected)
+			}
+		}
+	}
+}

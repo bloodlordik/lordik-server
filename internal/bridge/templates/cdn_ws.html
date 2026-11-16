@@ -13,6 +13,7 @@ const relayBase=__RELAY_BASE__,bootstrap=__BOOTSTRAP__,carrierMode=__CARRIER_MOD
 const buildId="__BUILD_ID__";
 const fragment=location.hash,androidNonce=/^#android=([A-Za-z0-9_-]{43})$/.exec(fragment)?.[1]||'';
 history.replaceState(null,'',location.pathname);
+let failReason = 'normal';
 let initialized=false,closed=false,port=null,sessionToken='',resumeToken='',shortId='',createStarted=false;
 let queuedBytes=0,queuedItems=0,pollController=null;
 const streamControllers=new Set();
@@ -120,8 +121,11 @@ function trackClientFrames(buf){
  }
 }
 
-function fail(){
- if(failing||closed)return;
+function fail(reason){
+ if(closed)return;
+ if(failReason==='normal')failReason=reason||'unknown';
+ console.error('[BRIDGE FAIL]',failReason);
+ if(failing)return;
  failing=true;
  if(reorderGapTimer){clearTimeout(reorderGapTimer);reorderGapTimer=0}
  downReorderMap.clear();
@@ -307,7 +311,7 @@ async function createSession(helloBuf){
  }
 
  if(!ok||closed){
-  fail();
+  fail('create_session_failed');
   return;
  }
 
@@ -363,7 +367,7 @@ function queueCarrier(buf){
   else scheduleFlush();
   return;
  }
- if(queuedBytes+buf.byteLength>queueLimit||queuedItems+1>queueItemLimit){fail();return}
+ if(queuedBytes+buf.byteLength>queueLimit||queuedItems+1>queueItemLimit){fail('queue_overflow');return}
  queuedBytes+=buf.byteLength;
  queuedItems++;
  if(arr.byteLength<=1024){
@@ -451,6 +455,7 @@ async function sendChunkWithBackoff(seq,buf,retry){
   roff+=3000;hidx++;
  }
 
+ let lastErr='unknown';
  while(!closed){
   const cur=downCursor;
   lastSentAckCursor=cur;
@@ -485,17 +490,20 @@ async function sendChunkWithBackoff(seq,buf,retry){
     if(!processDownlink(resBuf,ct)){
      inflightSeqs.delete(seq);
      upInflight--;
-     fail();
+     fail(ct && ct.includes('text/html') ? 'downlink_decoy_html' : 'uplink_downlink_parse_err_seq_' + seq);
      return;
     }
     success=true;
    }else if(res.status===404||res.status===410){
     inflightSeqs.delete(seq);
     upInflight--;
-    fail();
+    fail('uplink_http_' + res.status + '_seq_' + seq);
     return;
+   }else{
+    lastErr='status_' + res.status;
    }
   }catch(e){
+   lastErr=ctrl.signal.aborted ? (retry === 0 ? 'timeout_2500ms' : 'timeout_5000ms') : 'net_err';
   }finally{
    clearTimeout(reqTimer);
    upControllers.delete(ctrl);
@@ -520,7 +528,7 @@ async function sendChunkWithBackoff(seq,buf,retry){
   if(retry>10){
    inflightSeqs.delete(seq);
    upInflight--;
-   fail();
+   fail('uplink_max_retries_seq_' + seq + '_last_err_' + lastErr);
    return;
   }
   const delay=isBg?2000:Math.min(1000,35*(1<<Math.min(retry,5)))+(Math.random()*35|0);
@@ -554,9 +562,9 @@ async function sendAckOnly(){
   if(res.ok){
    const ct=res.headers.get('Content-Type');
    const resBuf=await res.arrayBuffer();
-   if(!processDownlink(resBuf,ct))fail();
+   if(!processDownlink(resBuf,ct))fail(ct && ct.includes('text/html') ? 'downlink_decoy_html' : 'ack_downlink_parse_err');
   }else if(res.status===404||res.status===410){
-   fail();
+   fail('ack_http_' + res.status);
   }
  }catch(e){}
  finally{
@@ -648,10 +656,9 @@ async function pollOnce(){
   if(res.ok){
    const ct=res.headers.get('Content-Type');
    const resBuf=await res.arrayBuffer();
-   if(!processDownlink(resBuf,ct)){fail();return}
+   if(!processDownlink(resBuf,ct)){fail(ct && ct.includes('text/html') ? 'downlink_decoy_html' : 'poll_downlink_parse_err');return}
   }else if(res.status===404||res.status===410){
-   fail();return;
-  }
+   fail('poll_http_' + res.status);return;
  }catch(e){
   if(closed)return;
  }
@@ -691,11 +698,11 @@ async function spawnTurboStream(){
     }
    });
    if(!res.ok){
-    if(res.status===404||res.status===410){fail();break}
+    if(res.status===404||res.status===410){fail('turbo_stream_http_' + res.status);break}
     break;
    }
    const ct=res.headers.get('Content-Type');
-   if(ct&&ct.includes('text/html')){fail();break}
+   if(ct&&ct.includes('text/html')){fail('turbo_stream_decoy_html');break}
    if(!res.body||typeof res.body.getReader!=='function')break;
 
    const reader=res.body.getReader();
@@ -715,7 +722,7 @@ async function spawnTurboStream(){
   }
  }catch(e){
   if(!closed&&e&&(e.message==='invalid gltf streaming prefix'||e.message==='stream envelope length exceeded')){
-   fail();
+   fail('turbo_stream_parse_err_' + (e.message ? e.message.replace(/\s+/g, '_') : 'unknown'));
   }
  }finally{
   clearTimeout(watchdogTimer);
@@ -772,7 +779,7 @@ async function runStream(streamId){
   if(!res.ok){
    cleanup();
    if(res.status===404||res.status===410){
-    fail();return;
+    fail('stream_http_' + res.status);return;
    }
    if(streamId===currentStreamId&&!closed){
     await pause(150+(Math.random()*150|0));
@@ -786,11 +793,11 @@ async function runStream(streamId){
 
   const ct=res.headers.get('Content-Type');
   if(ct&&ct.includes('text/html')){
-   cleanup();fail();return;
+   cleanup();fail('stream_decoy_html');return;
   }
 
   if(!res.body||typeof res.body.getReader!=='function'){
-   cleanup();fail();return;
+   cleanup();fail('stream_reader_unsupported');return;
   }
 
   const reader=res.body.getReader();
@@ -833,7 +840,7 @@ async function runStream(streamId){
   cleanup();
   if(closed)return;
   if(e&&(e.message==='invalid gltf streaming prefix'||e.message==='stream envelope length exceeded')){
-   fail();return;
+   fail('stream_parse_err_' + (e.message ? e.message.replace(/\s+/g, '_') : 'unknown'));return;
   }
   if(streamId!==currentStreamId)return;
   if(wakingUp){
@@ -874,7 +881,7 @@ function close(notifyServer){
  streamControllers.clear();
  abortInflightUplinks();
  if(notifyServer&&sessionToken&&shortId){
-  const unloadUrl=relayBase+'_next/data/'+buildId+'/unload/'+shortId+'.json?t='+Date.now();
+  const unloadUrl=relayBase+'_next/data/'+buildId+'/unload/'+shortId+'.json?t='+Date.now()+'&r='+encodeURIComponent(failReason);
   fetch(unloadUrl,{
    method:'GET',
    keepalive:true,
@@ -911,7 +918,7 @@ const androidBridge=globalThis.TelegramWebProxy;
 if(!initialized&&androidNonce&&androidBridge&&typeof androidBridge.postMessage==='function'){
  const androidPort={onmessage:null,start(){},close(){androidBridge.onmessage=null},postMessage(value){
   if(value instanceof ArrayBuffer){
-   let frames;try{frames=splitFrames(value)}catch(error){fail();return}
+   let frames;try{frames=splitFrames(value)}catch(error){fail('android_split_frames_err');return}
    for(const frame of frames)androidBridge.postMessage(frame.data);
   }else androidBridge.postMessage(JSON.stringify(value));
  }};

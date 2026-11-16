@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"github.com/telegramdesktop/tproxy-server/internal/logger"
 	"github.com/telegramdesktop/tproxy-server/internal/session"
 )
 
@@ -37,11 +38,15 @@ func (s *Server) serveCDNStreamDown(w http.ResponseWriter, r *http.Request, vhos
 
 	sess := s.resolveSession(r, sessionShortID, vhost)
 	if sess == nil {
+		logger.Warn(fmt.Sprintf("[CDN STREAM MISS] shortID=%s cursor=%d: session not found or expired", sessionShortID, cursor),
+			"short_id", sessionShortID, "cursor", cursor, "remote_ip", r.RemoteAddr)
 		vhost.servePublic(w, r)
 		return
 	}
 
 	if cursor > sess.DownCursor() {
+		logger.Warn(fmt.Sprintf("[CDN STREAM FATAL] client cursor=%d > server downCursor=%d", cursor, sess.DownCursor()),
+			"short_id", sessionShortID, "client_cursor", cursor, "server_cursor", sess.DownCursor())
 		s.handleCDNSessionError(w, r, vhost, session.ErrProtocol)
 		return
 	}

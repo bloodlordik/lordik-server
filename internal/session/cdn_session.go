@@ -3,10 +3,12 @@ package session
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/telegramdesktop/tproxy-server/internal/config"
 	"github.com/telegramdesktop/tproxy-server/internal/frame"
+	"github.com/telegramdesktop/tproxy-server/internal/logger"
 )
 
 const (
@@ -33,6 +35,8 @@ func (s *Session) AckDownCDN(cursor uint32) error {
 		return ErrClosed
 	}
 	if uint64(cursor) > s.downCursor {
+		logger.Warn(fmt.Sprintf("[CDN ACK FATAL] ack cursor=%d > server downCursor=%d", cursor, s.downCursor),
+			"short_id", s.shortID, "cursor", cursor, "down_cursor", s.downCursor)
 		s.protocolFailure()
 		return ErrProtocol
 	}
@@ -59,7 +63,10 @@ func (s *Session) ProcessUpCDN(sequence uint64, chunk []byte) (int, error) {
 	if len(s.cdnPendingFrames) != 0 {
 		pending := s.cdnPendingFrames
 		s.cdnPendingFrames = nil
-		if !s.validateBatchLocked(pending) {
+		if ok, reason, badFrame := s.validateBatchDetailLocked(pending); !ok {
+			logger.Warn(fmt.Sprintf("[CDN VALIDATE FATAL] shortID=%s reason=%s bad_stream_id=%d bad_type=0x%02x bad_len=%d active_streams=%d total_frames=%d",
+				s.shortID, reason, badFrame.StreamID, badFrame.Type, len(badFrame.Payload), len(s.streams), len(pending)),
+				"short_id", s.shortID, "reason", reason, "stream_id", badFrame.StreamID, "type", badFrame.Type, "len", len(badFrame.Payload), "active_streams", len(s.streams), "frames", len(pending))
 			s.mu.Unlock()
 			s.protocolFailure()
 			return 0, ErrProtocol
@@ -127,7 +134,10 @@ func (s *Session) ProcessUpCDN(sequence uint64, chunk []byte) (int, error) {
 		return appliedPending, nil
 	}
 
-	if !s.validateBatchLocked(pushedFrames) {
+	if ok, reason, badFrame := s.validateBatchDetailLocked(pushedFrames); !ok {
+		logger.Warn(fmt.Sprintf("[CDN VALIDATE FATAL] shortID=%s reason=%s bad_stream_id=%d bad_type=0x%02x bad_len=%d active_streams=%d total_frames=%d",
+			s.shortID, reason, badFrame.StreamID, badFrame.Type, len(badFrame.Payload), len(s.streams), len(pushedFrames)),
+			"short_id", s.shortID, "reason", reason, "stream_id", badFrame.StreamID, "type", badFrame.Type, "len", len(badFrame.Payload), "active_streams", len(s.streams), "frames", len(pushedFrames))
 		s.mu.Unlock()
 		for _, value := range allClosed {
 			value.close()
@@ -199,7 +209,10 @@ func (s *Session) ProcessUpCDNSubFrames(chunk []byte) (int, error) {
 	if len(s.cdnPendingFrames) != 0 {
 		pending := s.cdnPendingFrames
 		s.cdnPendingFrames = nil
-		if !s.validateBatchLocked(pending) {
+		if ok, reason, badFrame := s.validateBatchDetailLocked(pending); !ok {
+			logger.Warn(fmt.Sprintf("[QUIC VALIDATE FATAL] shortID=%s reason=%s bad_stream_id=%d bad_type=0x%02x bad_len=%d active_streams=%d total_frames=%d",
+				s.shortID, reason, badFrame.StreamID, badFrame.Type, len(badFrame.Payload), len(s.streams), len(pending)),
+				"short_id", s.shortID, "reason", reason, "stream_id", badFrame.StreamID, "type", badFrame.Type, "len", len(badFrame.Payload), "active_streams", len(s.streams), "frames", len(pending))
 			s.mu.Unlock()
 			s.protocolFailure()
 			return 0, ErrProtocol
@@ -271,7 +284,10 @@ func (s *Session) ProcessUpCDNSubFrames(chunk []byte) (int, error) {
 		return appliedPending, nil
 	}
 
-	if !s.validateBatchLocked(pushedFrames) {
+	if ok, reason, badFrame := s.validateBatchDetailLocked(pushedFrames); !ok {
+		logger.Warn(fmt.Sprintf("[QUIC VALIDATE FATAL] shortID=%s reason=%s bad_stream_id=%d bad_type=0x%02x bad_len=%d active_streams=%d total_frames=%d",
+			s.shortID, reason, badFrame.StreamID, badFrame.Type, len(badFrame.Payload), len(s.streams), len(pushedFrames)),
+			"short_id", s.shortID, "reason", reason, "stream_id", badFrame.StreamID, "type", badFrame.Type, "len", len(badFrame.Payload), "active_streams", len(s.streams), "frames", len(pushedFrames))
 		s.mu.Unlock()
 		for _, value := range allClosed {
 			value.close()
@@ -335,6 +351,8 @@ func (s *Session) NackReplay(cursor uint64) ([]byte, uint64, error) {
 	}
 	s.lastActivity = time.Now()
 	if cursor > s.downCursor {
+		logger.Warn(fmt.Sprintf("[CDN NACK FATAL] cursor=%d > server downCursor=%d", cursor, s.downCursor),
+			"short_id", s.shortID, "cursor", cursor, "down_cursor", s.downCursor)
 		s.closeLocked()
 		return nil, cursor, ErrProtocol
 	}
@@ -357,6 +375,8 @@ func (s *Session) PiggybackDown(cursor uint64) ([]byte, uint64, error) {
 
 func (s *Session) ackCursorLocked(ackCursor uint64) {
 	if ackCursor > s.downCursor {
+		logger.Warn(fmt.Sprintf("[CDN ACK WARN] client cursor=%d > server downCursor=%d", ackCursor, s.downCursor),
+			"short_id", s.shortID, "client_cursor", ackCursor, "server_cursor", s.downCursor)
 		return
 	}
 	freedCount := 0
@@ -426,6 +446,8 @@ func (s *Session) PiggybackDownWait(cursor uint64, coalesce bool) ([]byte, uint6
 
 	// 1. Future cursor is an invariant violation.
 	if cursor > s.downCursor {
+		logger.Warn(fmt.Sprintf("[CDN PIGGYBACK FATAL] cursor=%d > server downCursor=%d", cursor, s.downCursor),
+			"short_id", s.shortID, "cursor", cursor, "down_cursor", s.downCursor)
 		s.closeLocked()
 		return nil, cursor, ErrProtocol
 	}
@@ -530,6 +552,8 @@ func (s *Session) PollCDNExt(ctx context.Context, cursor uint64, timeout time.Du
 	s.lastActivity = time.Now()
 
 	if cursor > s.downCursor {
+		logger.Warn(fmt.Sprintf("[CDN POLL FATAL] cursor=%d > downCursor=%d", cursor, s.downCursor),
+			"short_id", s.shortID, "cursor", cursor, "down_cursor", s.downCursor)
 		s.mu.Unlock()
 		s.protocolFailure()
 		return nil, cursor, ErrProtocol
@@ -571,6 +595,10 @@ func (s *Session) PollCDNExt(ctx context.Context, cursor uint64, timeout time.Du
 	if s.downActive && s.superseded != nil {
 		close(s.superseded)
 		s.superseded = nil
+	}
+	if len(s.streamWorkers) > 0 {
+		logger.Info(fmt.Sprintf("[CDN POLL EVICT] evicting %d active stream workers for fallback poll: shortID=%s", len(s.streamWorkers), s.shortID),
+			"short_id", s.shortID, "stream_workers_count", len(s.streamWorkers))
 	}
 	for _, ch := range s.streamWorkers {
 		close(ch)
@@ -703,6 +731,8 @@ func (s *Session) StreamCDN(ctx context.Context, startCursor uint64, onBatch fun
 		return ErrClosed
 	}
 	if startCursor > s.downCursor {
+		logger.Warn(fmt.Sprintf("[CDN STREAM FATAL] startCursor=%d > downCursor=%d", startCursor, s.downCursor),
+			"short_id", s.shortID, "start_cursor", startCursor, "down_cursor", s.downCursor)
 		s.mu.Unlock()
 		s.protocolFailure()
 		return ErrProtocol
